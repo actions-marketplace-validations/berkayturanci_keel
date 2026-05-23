@@ -85,34 +85,61 @@ Ask the user: "Push these N changed files to ai-infra? [y/N]"
 
 If user says no, exit.
 
-## Step 3 — Push to ai-infra
+## Step 3 — Push to ai-infra (sequential per branch)
 
-For each changed/new file:
+**Writes MUST be sequential per target branch.** The GitHub Contents API requires the `sha` field to match the file's current SHA on the target branch; every successful PUT advances the branch tip, which invalidates any other in-flight PUT's pre-fetched SHA. Parallel PUTs to the same branch race on the branch tip and the late-arriving ones return HTTP 409 (`is at <new> but expected <stale>`). Step 1 reads stay parallel; Step 3 writes do not.
 
-1. Get current SHA (for updates): `gh api repos/berkayturanci/ai-infra/contents/<path> --jq .sha`
-2. Base64-encode local content: `base64 -i <local-path>`
-3. Push:
+For each changed/new file, in a sequential loop:
 
-```bash
-gh api --method PUT repos/berkayturanci/ai-infra/contents/<path> \
-  --field message="sync: update <path> from SmartInventory" \
-  --field content="<base64>" \
-  --field sha="<sha-or-empty-for-new>"
+1. Get current SHA fresh, immediately before each PUT (do NOT reuse the SHA fetched during Step 1's diff scan — even a few seconds of latency between scan and push can be enough for a third party to update the file):
+   ```bash
+   sha=$(gh api repos/berkayturanci/ai-infra/contents/<path> --jq .sha 2>/dev/null)
+   ```
+2. Base64-encode local content: `base64 -i <local-path>`.
+3. Push. Use `${sha:+--field sha="$sha"}` so the `sha` field is omitted entirely for new files — passing `--field sha=""` (an empty string) is rejected by the GitHub API with HTTP 422, the `sha` field must be ABSENT (not empty) when creating a file:
+   ```bash
+   gh api --method PUT repos/berkayturanci/ai-infra/contents/<path> \
+     --field message="sync: update <path> from SmartInventory" \
+     --field content="<base64>" \
+     ${sha:+--field sha="$sha"}
+   ```
+
+Reference Python pattern (mirrors the Step 1 async snippet but runs serially):
+
+```python
+# `*_` swallows any extra tuple elements — Step 1's async fetch returns
+# 4-tuples (local, remote, content, sha) while the older diff list shape
+# is 3-tuples (local, remote, sha). Either works without arity drift.
+for local, remote, *_ in modified:
+    sha = subprocess.run(
+        ["gh", "api", f"repos/berkayturanci/ai-infra/contents/{remote}", "--jq", ".sha"],
+        capture_output=True, text=True
+    ).stdout.strip()
+    content = subprocess.check_output(["git", "show", f"origin/develop:{local}"])
+    args = ["gh", "api", "--method", "PUT",
+            f"repos/berkayturanci/ai-infra/contents/{remote}",
+            "--field", f"message=sync: update {remote} from SmartInventory",
+            "--field", f"content={base64.b64encode(content).decode()}"]
+    if sha:
+        args += ["--field", f"sha={sha}"]
+    subprocess.run(args, check=True)
 ```
 
-Report each file: `✓ PUSHED commands/ship.md` or `✗ FAILED commands/ship.md: <error>`
+Report each file: `✓ PUSHED commands/ship.md` or `✗ FAILED commands/ship.md: <error>`.
 
-## Step 4 — Optionally propagate to downstream projects
+## Step 4 — Optionally propagate to downstream projects (sequential per repo)
 
 After pushing to ai-infra, ask:
 "Propagate to downstream projects (ingreview)? [y/N]"
 
 If yes, for each project in `berkayturanci/ai-infra/projects/*.json`:
-- Skip `smartinventory.json` (this is the source)
-- For each pushed file, push the same content to the target project's corresponding path
-- Use the same base64 + gh api PUT pattern, with the target project's owner/repo
+- Skip `smartinventory.json` (this is the source).
+- For each pushed file, push the same content to the target project's corresponding path.
+- Use the same base64 + `gh api` PUT pattern, with the target project's owner/repo.
 
-Report: `✓ ingreview: 3 files updated, 0 failed`
+**Same sequential-per-branch rule as Step 3 applies inside each downstream repo** — writes inside one repo's branch must be sequential and re-fetch the SHA immediately before each PUT. Different repos may be processed in parallel across each other (e.g. `ingreview` and a future `foo` can run concurrently as long as their internal loops are sequential), but inside one repo's main branch the PUTs must serialise.
+
+Report: `✓ ingreview: 3 files updated, 0 failed`.
 
 ## Step 5 — Summary
 
