@@ -28,7 +28,7 @@ GitHub Actions runs are not available via the MCP server tools we have today. In
 ## Step 1 — Read priorities, last session, and overnight `/ship` deferrals
 - Read `.claude/priorities.md` and the last entry in `.claude/sessions.md`
 - If priorities.md hasn't been updated in 5+ days, flag it as stale.
-- Read `docs/reports/morning-merge-queue-<DATE>.md` (where `<DATE>` is today in UTC+3, e.g. `morning-merge-queue-2026-05-19.md`) if it exists. This file is written by `/ship` when issues are deferred outside the UTC+3 09:00–23:59 merge window. Surface its contents at the **top** of the morning brief so deferred work is visible before anything else. Use the Bash tool to resolve the date (`TZ='Etc/GMT-3' date +%Y-%m-%d`) and to test for existence (`test -f …`).
+- Read `docs/reports/morning-merge-queue-<DATE>.md` (where `<DATE>` is today in UTC+3, e.g. `morning-merge-queue-2026-05-19.md`) if it exists. This file is written by `/ship` when issues are deferred inside the UTC+3 night no-merge window (01:30–07:00; merge window is 07:00–01:30). Surface its contents at the **top** of the morning brief so deferred work is visible before anything else. Use the Bash tool to resolve the date (`TZ='Etc/GMT-3' date +%Y-%m-%d`) and to test for existence (`test -f …`).
 
 ## Step 2 — Pull live signals (run in parallel)
 
