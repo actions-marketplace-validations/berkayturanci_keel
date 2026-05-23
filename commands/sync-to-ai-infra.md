@@ -20,14 +20,46 @@ These files are generic enough to live in ai-infra as the canonical version:
 - `docs/development/claude-code-global-setup.md`
 - `docs/development/parallel-agents.md`
 
-## Step 1 — Detect changed files
+## Step 1 — Detect changed files (parallel)
 
-For each portable file, compare local content with the current ai-infra version:
+For each portable file, compare local content with the current ai-infra version. The list contains ~74 files; **running `gh api` sequentially is too slow** (4-5 minutes and often times out — observed during the #1127 sync). Parallelise the reads.
+
+Recommended pattern — Python `asyncio.gather` with bounded concurrency (8 workers is a sensible default):
+
+```python
+import asyncio, subprocess, base64, json
+
+async def fetch(local, remote):
+    proc = await asyncio.create_subprocess_exec(
+        "gh", "api", f"repos/berkayturanci/ai-infra/contents/{remote}",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return local, remote, None, None  # NEW (file not on ai-infra)
+    data = json.loads(out)
+    return local, remote, base64.b64decode(data["content"]), data["sha"]
+
+async def main(pairs, concurrency=8):
+    # `pairs` is a list of (local_path, remote_path) tuples; we thread BOTH
+    # through the return value so the caller can correlate each result back
+    # to the local file without re-deriving from the remote path.
+    sem = asyncio.Semaphore(concurrency)
+    async def guarded(p):
+        async with sem:
+            return await fetch(p[0], p[1])
+    return await asyncio.gather(*[guarded(p) for p in pairs])
+```
+
+Alternative — `xargs -P 8` if you prefer pure shell. `mkdir -p` the output dir first; BSD xargs on macOS does not surface per-child exit codes, so a missing directory would fail every worker silently:
 
 ```bash
-gh api repos/berkayturanci/ai-infra/contents/<path> 2>/dev/null \
-  | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['content']).decode())"
+mkdir -p /tmp/sync
+printf '%s\n' "${REMOTE_PATHS[@]}" | xargs -P 8 -I {} sh -c \
+  'gh api "repos/berkayturanci/ai-infra/contents/{}" > "/tmp/sync/$(echo {} | tr / _).json"'
 ```
+
+The diff scan MUST complete in under 60 seconds for the full 74-file list. If it takes longer, the parallelism is wrong — diagnose before pushing.
 
 Map local paths to ai-infra paths:
 - `.claude/commands/<name>.md` → `commands/<name>.md`
