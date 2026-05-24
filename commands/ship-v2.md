@@ -113,7 +113,7 @@ When BLOCKERS or SUGGESTIONS need addressing:
 All of the following carry over from `/ship` (v1) **verbatim**, with no v2-specific behavior:
 
 - Step 0 (argument parsing — except v2 ignores `--reviewers`; see S3)
-- Step 1 (time-window detection, UTC+3 09:00–23:59)
+- Step 1 (time-window detection, UTC+3 07:00–01:30 merge window; night no-merge window 01:30–07:00)
 - Step 2 (queue build, watch-mode rules)
 - Step 3 (blocker auto-detection rules 1–5)
 - Step 4 (window gate semantics — merge-only)
