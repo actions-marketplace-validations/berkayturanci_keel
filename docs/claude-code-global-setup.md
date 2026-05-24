@@ -11,6 +11,8 @@ fresh clone or worktree.
 
 ## Recommended global settings
 
+### Claude Code — `~/.claude/settings.json`
+
 Merge the following into `~/.claude/settings.json`:
 
 ```json
@@ -18,13 +20,137 @@ Merge the following into `~/.claude/settings.json`:
   "permissions": {
     "allow": [
       "Bash(~/.claude/statusline.sh)",
-      "Bash(brew install *)"
+      "Bash(brew install *)",
+      "Bash(codex *)",
+      "Bash(codex)",
+      "Bash(agy *)",
+      "Bash(agy)"
     ]
   },
   "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": ["github"]
 }
 ```
+
+The `codex *` and `agy *` rules allow Claude Code to invoke Codex CLI and Antigravity
+CLI without a permission prompt in any project. The project-level deny list in
+`.claude/settings.json` still guards destructive operations regardless of this global
+allow.
+
+### Codex CLI — `~/.codex/config.toml`
+
+Add the following top-level keys to your existing `~/.codex/config.toml`. These set
+auto-approve mode and a shell-level deny list that mirrors the Claude Code guard:
+
+```toml
+approval = "never"
+sandbox  = "workspace-write"
+
+shell_deny = [
+  "git push --force",
+  "git push -f ",
+  "git push --force-with-lease",
+  "git push origin :",
+  "git push origin --delete",
+  "git push --delete",
+  "git reset --hard",
+  "git clean -fdx",
+  "git filter-branch",
+  "git branch -D develop",
+  "git branch -D main",
+  "rm -rf /",
+  "rm -rf ~",
+  "rm -rf $HOME",
+  "rm -rf --no-preserve-root",
+  "sudo rm",
+  "sudo ",
+  "gh repo delete",
+  "gh release delete",
+  "gh secret delete",
+  "gh secret set",
+  "gh auth logout",
+  "npm publish",
+  "npm unpublish",
+  "firebase deploy",
+  "firebase projects:delete",
+  "firebase database:remove",
+  "firebase functions:delete",
+  "firebase hosting:disable",
+  "curl | sh",
+  "curl | bash",
+  "wget | sh",
+  "wget | bash",
+  "eval ",
+  "dd if=",
+  "mkfs",
+  "shred",
+  "chmod -R 777 /",
+  "chown -R "
+]
+```
+
+`approval = "never"` makes Codex auto-approve all model-generated commands. The
+`workspace-write` sandbox restricts writes to the project directory and `/tmp` — it is
+the primary security boundary. `shell_deny` adds an explicit blocklist on top for the
+most destructive operations.
+
+### Antigravity CLI (agy) — `~/.gemini/antigravity-cli/settings.json`
+
+Add a `permissions.deny` block to your existing settings. agy does not support a
+config-level bypass flag, so also add a shell alias (see next section):
+
+```json
+{
+  "permissions": {
+    "allow": ["...existing entries..."],
+    "deny": [
+      "command(git push --force)",
+      "command(git push -f )",
+      "command(git push --force-with-lease)",
+      "command(git push origin :)",
+      "command(git push origin --delete)",
+      "command(git reset --hard)",
+      "command(git clean -fdx)",
+      "command(git filter-branch)",
+      "command(git branch -D develop)",
+      "command(git branch -D main)",
+      "command(rm -rf /)",
+      "command(rm -rf ~)",
+      "command(sudo rm)",
+      "command(sudo )",
+      "command(gh repo delete)",
+      "command(gh release delete)",
+      "command(gh secret delete)",
+      "command(gh secret set)",
+      "command(gh auth logout)",
+      "command(npm publish)",
+      "command(npm unpublish)",
+      "command(firebase deploy)",
+      "command(firebase projects:delete)",
+      "command(firebase database:remove)",
+      "command(firebase functions:delete)",
+      "command(firebase hosting:disable)",
+      "command(eval )",
+      "command(dd if=)",
+      "command(mkfs)",
+      "command(shred)",
+      "command(chmod -R 777 /)",
+      "command(chown -R )"
+    ]
+  }
+}
+```
+
+### Shell alias for agy — `~/.zshrc`
+
+agy has no config-level permission bypass. Add this alias so the flag is always applied:
+
+```zsh
+# agy: always skip permission prompts (security guard is in settings.json deny list)
+alias agy='/Users/berkayturanci/.local/bin/agy --dangerously-skip-permissions'
+```
+
+After editing `~/.zshrc`, run `source ~/.zshrc` to activate.
 
 ## What NOT to migrate
 
