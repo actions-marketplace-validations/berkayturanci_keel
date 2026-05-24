@@ -68,6 +68,53 @@ if [ -n "$(git status --short)" ]; then
 fi
 ```
 
+### Step 0.5 — Canonical-scan worktree (mandatory)
+
+The scan target is **`origin/develop`**, not the operator's local checkout. Without this, scans run from long-lived feature branches (e.g. `claude/new-web-design`) flag patterns that are present in stale local files but already fixed on develop — every finding becomes a false positive. (Surfaced by REGRESSION-20260524-002000: 13 of 13 findings were stale, all closed not-planned.)
+
+```bash
+git fetch origin develop --quiet
+
+# Lag check — warn loudly if the operator is well behind develop. Scan still
+# proceeds against canonical via the worktree below, but the lag is a useful
+# signal that the operator should also rebase/merge develop into their branch.
+LAG_COMMITS=$(git rev-list --count "$(git rev-parse --abbrev-ref HEAD)..origin/develop" 2>/dev/null || echo 0)
+if (( LAG_COMMITS > 20 )); then
+  printf '/regression: WARNING — current checkout lags origin/develop by %s commits. Scan will run against origin/develop (canonical) via an ephemeral worktree; consider merging develop into your branch separately.\n' "$LAG_COMMITS" >&2
+fi
+
+# Ephemeral worktree off origin/develop — module agents scan THIS path, not
+# the operator's checkout. The Read tool naturally targets canonical content
+# inside the worktree.
+SCAN_ROOT="${TMPDIR:-/tmp}/regression-${CODENAME}"
+# `--detach` (not `-b <name>`) because this is a read-only scan worktree; no
+# branch ref is needed, no branch cleanup step on exit. Do NOT "align" to the
+# AGENTS.md `git worktree add -b ...` pattern — that's for implementer
+# worktrees that need to push.
+git worktree add --detach "$SCAN_ROOT" origin/develop
+
+# Cleanup must compose across all later traps (notably the Step 4 mutex
+# trap). Bash `trap ... EXIT` REPLACES rather than chains, so define a single
+# cleanup function up front and let Step 4 APPEND to it. The Step 4 trap
+# block calls `register_cleanup '<command>'` instead of issuing a fresh trap.
+__CLEANUP_CMDS=()
+register_cleanup() { __CLEANUP_CMDS+=("$1"); }
+__run_cleanups() {
+  local cmd
+  for cmd in "${__CLEANUP_CMDS[@]}"; do
+    eval "$cmd" 2>/dev/null || true
+  done
+}
+trap __run_cleanups EXIT INT TERM
+register_cleanup "git worktree remove \"$SCAN_ROOT\" --force"
+
+# State the canonical scan root in the first user-facing line alongside CODENAME.
+printf '/regression: canonical scan root = %s (origin/develop HEAD = %s)\n' \
+  "$SCAN_ROOT" "$(git -C "$SCAN_ROOT" rev-parse HEAD)"
+```
+
+Module agents in Step 1 MUST receive their module path prefixed by `$SCAN_ROOT` (e.g. `path: $SCAN_ROOT/android`). The agent's prompt explicitly states the canonical scan root so the agent cannot accidentally drift back to the operator's checkout via implicit relative-path reads.
+
 ## Step 1 — Module fan-out (parallel)
 
 Spawn one `code-reviewer` subagent per module in **a single Agent tool message** so they run concurrently. Modules:
@@ -81,16 +128,26 @@ Spawn one `code-reviewer` subagent per module in **a single Agent tool message**
 
 The four module paths are disjoint by construction (`web/` minus `web/functions/`, plus `web/functions/` itself, plus `android/`, plus `shared/`). No two module agents see the same path.
 
-Each module agent receives this prompt block (substitute `<MODULE>` and `<PATH>`):
+Each module agent receives this prompt block. The orchestrator MUST substitute `<MODULE>` and `<PATH>` so that `<PATH>` is the absolute path under `$SCAN_ROOT` from Step 0.5 (e.g. `/tmp/regression-REGRESSION-20260524-002000/android`), NOT a path under the operator's checkout. Every `Read`, `Grep`, and `Glob` call the agent makes resolves against canonical develop content this way.
 
 ```
-Task: Regression scan for SmartInventory module `<MODULE>` (path: `<PATH>`).
+Task: Regression scan for SmartInventory module `<MODULE>` (canonical path: `<PATH>`).
 Agent run codename: <CODENAME>-<MODULE>
 
+CANONICAL SCAN ROOT: `<PATH>` is an ABSOLUTE path inside an ephemeral
+worktree checked out from `origin/develop` (the canonical base). Do NOT
+read files under the operator's primary checkout — those may be stale.
+All `Read`/`Grep`/`Glob` calls MUST target paths under this scan root.
+Verify via Bash: `git -C <PATH> rev-parse HEAD` — the SHA must match
+`origin/develop`. (Do not try to read `<PATH>/.git/HEAD` directly; in a
+worktree, `.git` is a file containing a `gitdir:` pointer to the main
+repo's `worktrees/` subdirectory, not the HEAD ref itself.)
+
 Read `AGENTS.md` and the relevant platform context (`android/CLAUDE.md`,
-`web/CLAUDE.md`, or `shared/README.md`) before scanning. Honour the
-do-not-touch list: report findings, but do NOT propose fixes that would
-require touching files on that list without a dedicated issue.
+`web/CLAUDE.md`, or `shared/README.md`) FROM THE CANONICAL SCAN ROOT
+(`<PATH>/../AGENTS.md`, etc.), not from the operator's checkout. Honour
+the do-not-touch list: report findings, but do NOT propose fixes that
+would require touching files on that list without a dedicated issue.
 
 For the `web` module ONLY: explicitly EXCLUDE `web/functions/` from your
 scan — that path is owned by the `functions` agent and double-scanning
@@ -341,7 +398,10 @@ if [ "$ACQUIRED" != "true" ]; then
 fi
 
 # Release MUST clear `owner` first — rmdir fails on non-empty dirs.
-trap 'rm -f "$LOCK_DIR/owner" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+# Use register_cleanup (defined in Step 0.5) instead of a fresh `trap` —
+# bash `trap ... EXIT` REPLACES rather than chains, so issuing a new trap
+# here would silently drop the Step 0.5 worktree-cleanup callback.
+register_cleanup "rm -f \"$LOCK_DIR/owner\"; rmdir \"$LOCK_DIR\" 2>/dev/null"
 
 # … run Step 3 dedup queries AND every per-finding Step 4 `gh issue create` here …
 ```
