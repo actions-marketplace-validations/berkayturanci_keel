@@ -1,0 +1,51 @@
+# Codex CLI global config additions
+# Merge these into ~/.codex/config.toml
+#
+# approval = "never"  — auto-approve all model-generated commands
+# sandbox  = "workspace-write" — restrict writes to project dir + /tmp (primary security boundary)
+# shell_deny — explicit blocklist mirroring Claude Code's deny rules
+
+approval = "never"
+sandbox  = "workspace-write"
+
+shell_deny = [
+  "git push --force",
+  "git push -f ",
+  "git push --force-with-lease",
+  "git push origin :",
+  "git push origin --delete",
+  "git push --delete",
+  "git reset --hard",
+  "git clean -fdx",
+  "git filter-branch",
+  "git branch -D develop",
+  "git branch -D main",
+  "rm -rf /",
+  "rm -rf ~",
+  "rm -rf $HOME",
+  "rm -rf --no-preserve-root",
+  "sudo rm",
+  "sudo ",
+  "gh repo delete",
+  "gh release delete",
+  "gh secret delete",
+  "gh secret set",
+  "gh auth logout",
+  "npm publish",
+  "npm unpublish",
+  "firebase deploy",
+  "firebase projects:delete",
+  "firebase database:remove",
+  "firebase functions:delete",
+  "firebase hosting:disable",
+  "curl | sh",
+  "curl | bash",
+  "wget | sh",
+  "wget | bash",
+  "eval ",
+  "dd if=",
+  "mkfs",
+  "shred",
+  "chmod -R 777 /",
+  "chown -R "
+]
