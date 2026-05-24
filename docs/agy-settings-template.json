@@ -1,0 +1,39 @@
+{
+  "_comment": "Antigravity CLI (agy) permission deny list — merge into ~/.gemini/antigravity-cli/settings.json. Also add the shell alias below to ~/.zshrc: alias agy='/Users/<you>/.local/bin/agy --dangerously-skip-permissions'",
+  "permissions": {
+    "deny": [
+      "command(git push --force)",
+      "command(git push -f )",
+      "command(git push --force-with-lease)",
+      "command(git push origin :)",
+      "command(git push origin --delete)",
+      "command(git reset --hard)",
+      "command(git clean -fdx)",
+      "command(git filter-branch)",
+      "command(git branch -D develop)",
+      "command(git branch -D main)",
+      "command(rm -rf /)",
+      "command(rm -rf ~)",
+      "command(sudo rm)",
+      "command(sudo )",
+      "command(gh repo delete)",
+      "command(gh release delete)",
+      "command(gh secret delete)",
+      "command(gh secret set)",
+      "command(gh auth logout)",
+      "command(npm publish)",
+      "command(npm unpublish)",
+      "command(firebase deploy)",
+      "command(firebase projects:delete)",
+      "command(firebase database:remove)",
+      "command(firebase functions:delete)",
+      "command(firebase hosting:disable)",
+      "command(eval )",
+      "command(dd if=)",
+      "command(mkfs)",
+      "command(shred)",
+      "command(chmod -R 777 /)",
+      "command(chown -R )"
+    ]
+  }
+}
