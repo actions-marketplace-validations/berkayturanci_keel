@@ -86,13 +86,13 @@ Issue body: [from Step 1]
 
 Instructions:
 1. Read `AGENTS.md`, `CLAUDE.md`, and the platform `CLAUDE.md`.
-2. **Workspace isolation (mandatory):** before any code-modifying work, create a git worktree off `origin/develop` and perform every edit, build, and push from inside it — never mutate the user's primary checkout. Per `AGENTS.md` § "Workspace Isolation (AI agents)":
+2. **Workspace isolation (mandatory):** before any code-modifying work, create a git worktree off `origin/develop` and perform every edit, build, and push from inside it — never mutate the user's primary checkout. Per `AGENTS.md` § "Workspace Isolation (AI agents)" (path convention per #931 — nested under repo root, never a sibling):
    ```bash
    git fetch origin develop --quiet
-   git worktree add -b feature/issue-$ARGUMENTS-[slug] <path-outside-repo> origin/develop
-   cd <path-outside-repo>
+   git worktree add -b feature/issue-$ARGUMENTS-[slug] worktrees/issue-$ARGUMENTS origin/develop
+   cd worktrees/issue-$ARGUMENTS
    ```
-   Run the gates below from that path. When the PR is merged, clean up with `git worktree remove <path-outside-repo> --force` (the `--force` covers untracked build artefacts that may remain in the worktree).
+   Run the gates below from that path. When the PR is merged, clean up with `git worktree remove worktrees/issue-$ARGUMENTS --force` (the `--force` covers untracked build artefacts that may remain in the worktree). The `worktrees/` directory is gitignored, so the worktree itself never appears in `git status` of the primary checkout.
 3. Implement all acceptance criteria with focused commits.
 4. Run the applicable gates from inside the worktree:
    - Android: `cd android && ./gradlew test lint --no-daemon -Pcom.google.firebase.perf.instrumentationEnabled=false`
