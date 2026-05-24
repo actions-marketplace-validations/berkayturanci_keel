@@ -46,7 +46,7 @@ auto-approve mode and a shell-level deny list that mirrors the Claude Code guard
 approval = "never"
 sandbox  = "workspace-write"
 
-shell_deny = [
+block_commands = [
   "git push --force",
   "git push -f ",
   "git push --force-with-lease",
@@ -63,6 +63,7 @@ shell_deny = [
   "rm -rf $HOME",
   "rm -rf --no-preserve-root",
   "sudo rm",
+  # The trailing space is intentional: it prefix-matches all "sudo <anything>" invocations.
   "sudo ",
   "gh repo delete",
   "gh release delete",
@@ -89,26 +90,41 @@ shell_deny = [
 ]
 ```
 
-`approval = "never"` makes Codex auto-approve all model-generated commands. The
-`workspace-write` sandbox restricts writes to the project directory and `/tmp` — it is
-the primary security boundary. `shell_deny` adds an explicit blocklist on top for the
-most destructive operations.
+`approval = "never"` makes Codex auto-approve all model-generated commands.
+
+**Security layers (verified 2026-05-25):**
+
+| Layer | Mechanism | Status |
+|-------|-----------|--------|
+| `sandbox = "workspace-write"` | Filesystem-level: Codex cannot write outside project dir + `/tmp` | ✅ Verified — blocked `git reset --hard` at the OS level when no hook fired |
+| `.codex/hooks.json` PreToolUse | Reads the project's `.claude/settings.json` deny list and blocks matching commands before execution | ✅ Verified — fires before the sandbox, shows explicit deny-pattern message |
+| `block_commands` | Config-level blocklist in `~/.codex/config.toml` | ⚠️ Unverified — Codex silently ignored this key during testing; do not rely on it as the sole guard |
+
+The **primary** defence is the project hook + sandbox combination. `block_commands` is
+kept as a best-effort declaration in case a future Codex version honours it.
 
 ### Antigravity CLI (agy) — `~/.gemini/antigravity-cli/settings.json`
 
+> Note: verify this path against the version of agy installed on your machine — the
+> settings location may differ across CLI versions.
+
 Add a `permissions.deny` block to your existing settings. agy does not support a
-config-level bypass flag, so also add a shell alias (see next section):
+config-level bypass flag, so also add a shell alias (see next section).
+
+Replace `[]` in the `"allow"` field below with your existing allow entries from your
+current `settings.json` before saving.
 
 ```json
 {
   "permissions": {
-    "allow": ["...existing entries..."],
+    "allow": [],
     "deny": [
       "command(git push --force)",
       "command(git push -f )",
       "command(git push --force-with-lease)",
       "command(git push origin :)",
       "command(git push origin --delete)",
+      "command(git push --delete)",
       "command(git reset --hard)",
       "command(git clean -fdx)",
       "command(git filter-branch)",
@@ -147,8 +163,10 @@ agy has no config-level permission bypass. Add this alias so the flag is always 
 
 ```zsh
 # agy: always skip permission prompts (security guard is in settings.json deny list)
-alias agy='/Users/berkayturanci/.local/bin/agy --dangerously-skip-permissions'
+alias agy='~/.local/bin/agy --dangerously-skip-permissions'
 ```
+
+Verify the path with `which agy` on your machine before applying.
 
 After editing `~/.zshrc`, run `source ~/.zshrc` to activate.
 
@@ -167,6 +185,7 @@ them to the global file:
 1. Open `~/.claude/settings.json` in your editor (create it if it does not exist).
 2. Merge the JSON block above into the existing object, preserving any keys you already
    have. Restart Claude Code so it picks up the new config.
+3. Restart Codex CLI and agy sessions to pick up config changes.
 
 ## Risk notes
 
