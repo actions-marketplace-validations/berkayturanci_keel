@@ -49,7 +49,6 @@ so this spec and the ship.md step both refer to it as the `/ship` command.
 
 ```
 compound-learning.sh <PR_NUMBER> [--format=json|markdown] [--dry-run]
-                                 [--input-json <file|->]
 ```
 
 ### Arguments
@@ -60,13 +59,12 @@ compound-learning.sh <PR_NUMBER> [--format=json|markdown] [--dry-run]
 
 ### Flags
 
-| Flag                  | Default        | Behaviour |
-|-----------------------|----------------|-----------|
-| `--format=json`       | json (default) | Emit a single JSON object to stdout. |
-| `--format=markdown`   | —              | Emit a human-readable markdown bundle (same content, different shape). |
-| `--dry-run`           | false          | Tag the bundle `"classification": "deferred"` so the calling agent knows NOT to act on it. The bundle content is otherwise identical. Used by `/ship --dry-run` and for operator inspection. |
-| `--input-json <file>` | —              | Skip every `gh` call and read a pre-fetched envelope from `<file>` (or stdin when the value is `-`). See § "Bundler input modes" for the envelope schema and which runtimes use which mode. Used by MCP-only runtimes (issue #975). |
-| `-h`, `--help`        | —              | Show usage and exit 0. |
+| Flag              | Default     | Behaviour |
+|-------------------|-------------|-----------|
+| `--format=json`     | json (default) | Emit a single JSON object to stdout. |
+| `--format=markdown` | —              | Emit a human-readable markdown bundle (same content, different shape). |
+| `--dry-run`         | false          | Tag the bundle `"classification": "deferred"` so the calling agent knows NOT to act on it. The bundle content is otherwise identical. Used by `/ship --dry-run` and for operator inspection. |
+| `-h`, `--help`      | —              | Show usage and exit 0. |
 
 Unknown flags or values exit 1 with usage.
 
@@ -75,8 +73,8 @@ Unknown flags or values exit 1 with usage.
 | Code | Meaning              |
 |------|----------------------|
 | 0    | Success.             |
-| 1    | Usage / dependency error (bad args, missing `gh` in CLI mode, missing `jq`, `gh` not authenticated in CLI mode, malformed or unreadable `--input-json` envelope). |
-| 2    | PR not found (CLI mode only — `gh pr view` returned nothing). In `--input-json` mode this state surfaces as exit 3 instead, because a missing-PR envelope will simply lack `mergedAt`. |
+| 1    | Usage / dependency error (bad args, missing `gh`, missing `jq`, gh not authenticated). |
+| 2    | PR not found (`gh pr view` returned nothing). |
 | 3    | PR not merged. Compound learning only runs post-merge; the script refuses to bundle an open or closed-but-not-merged PR so callers cannot accidentally classify draft work. |
 
 ### Stdout (JSON shape, schema_version 1)
@@ -138,109 +136,13 @@ knows the picture is partial.
 
 ### Prerequisites
 
-`jq` is **always** required.
-
-`gh` (GitHub CLI) is required in CLI mode (the default — no `--input-json`
-flag). When `gh` is missing or unauthenticated in CLI mode, the script
-exits 1 with a clear install hint on stderr. The hint also points at
-`--input-json` as the escape hatch for `gh`-less runtimes.
-
-In `--input-json` mode the orchestrator pre-fetches the PR envelope via
-its own GitHub access (e.g. `mcp__github__pull_request_read` in Claude
-Code on the Web) and pipes it in. No `gh` call is made. See § "Bundler
-input modes" for the full schema.
+`gh` (GitHub CLI) and `jq` must be installed and `gh` must be authenticated.
+If either is missing, the script exits 1 with a clear install hint on
+stderr. There is no fallback — every supported calling environment (Claude
+Code, Codex, plain shell) already has `gh` on the project's runner.
 
 The script must NEVER perform any `cd` that permanently changes the caller's
-working directory; it reads from the GitHub API (or the supplied envelope)
-only.
-
-## Bundler input modes
-
-Issue #975 added a second input mode so the bundler can run in runtimes
-that lack `gh` (notably the Claude Code on the Web sandbox container,
-which exposes GitHub access only through the MCP server, not via shell
-credentials). The two modes share the same output schema; the only
-difference is where the PR data comes from.
-
-| Mode             | Trigger          | Data source                                                      | gh required? |
-|------------------|------------------|------------------------------------------------------------------|--------------|
-| **CLI** (default) | no flag          | Five `gh` calls (`gh pr view`, `gh pr diff`, `gh pr view --comments`, `gh api …/comments`, `gh pr view --json statusCheckRollup`). | yes |
-| **--input-json**  | `--input-json <file\|->` | A single JSON envelope on disk or stdin, assembled by the caller from its own GitHub API access. | no |
-
-Both modes emit byte-equivalent bundles when fed the same PR data (modulo
-the `generated_at` timestamp). The CLI path stays the default so Codex
-and local Mac runs see zero regression; the `--input-json` path is the
-escape hatch for MCP-only runtimes.
-
-### Envelope schema
-
-The `--input-json` envelope is a single JSON object that unions the five
-`gh` outputs the CLI path would have produced:
-
-```json
-{
-  "meta": {
-    "number":        <int>,         // PR number — REQUIRED
-    "title":         "<string>",
-    "body":          "<string>",    // optional, currently unused by the bundle output
-    "state":         "MERGED",      // REQUIRED ("MERGED" for normal flow)
-    "mergedAt":      "<ISO8601>",   // REQUIRED — null/missing ⇒ exit 3 (not merged)
-    "baseRefName":   "<string>",
-    "headRefName":   "<string>",
-    "additions":     <int>,         // optional, defaults to 0
-    "deletions":     <int>,         // optional, defaults to 0
-    "changedFiles":  <int>,         // optional, defaults to 0
-    "files":    [ { "path": "...", "additions": <int>, "deletions": <int> } ],
-    "commits":  [ { "messageHeadline": "..." } ],
-    "reviews":  [ { "author": { "login": "..." }, "state": "APPROVED" } ]
-  },
-  "diff":            "<unified diff string>",   // optional, defaults to ""
-  "issue_comments":  "<text blob>",             // optional, defaults to ""
-  "review_comments": [ /* gh api repos/{owner}/{repo}/pulls/<N>/comments shape */ ],
-  "ci_status":       { "statusCheckRollup": [ /* gh statusCheckRollup payload */ ] }
-}
-```
-
-Field-by-field mapping to the CLI gh calls:
-
-| Envelope path                   | CLI source                                                  |
-|---------------------------------|-------------------------------------------------------------|
-| `meta`                          | `gh pr view --json mergedAt,state,number,title,baseRefName,headRefName,additions,deletions,changedFiles,files,reviews,commits` |
-| `diff`                          | `gh pr diff <N>` (raw stdout)                               |
-| `issue_comments`                | `gh pr view <N> --comments` (raw stdout)                    |
-| `review_comments`               | `gh api repos/{owner}/{repo}/pulls/<N>/comments` (JSON)     |
-| `ci_status.statusCheckRollup`   | `gh pr view <N> --json statusCheckRollup`                   |
-
-The orchestrator (Claude Code on the Web) assembles the envelope by
-calling the equivalent `mcp__github__pull_request_read` methods:
-
-| Envelope path                   | MCP source                                                                      |
-|---------------------------------|---------------------------------------------------------------------------------|
-| `meta`                          | `mcp__github__pull_request_read` (method=`get`) — field rename: `merged_at` → `mergedAt`, `base.ref` → `baseRefName`, `head.ref` → `headRefName`. |
-| `diff`                          | `mcp__github__pull_request_read` (method=`get_diff`).                           |
-| `issue_comments`                | `mcp__github__pull_request_read` (method=`get_comments`) — join bodies into a single text blob to match the `gh pr view --comments` shape. |
-| `review_comments`               | `mcp__github__pull_request_read` (method=`get_review_comments`).                |
-| `ci_status.statusCheckRollup`   | `mcp__github__pull_request_read` (method=`get_check_runs`) — wrap the runs array in `{statusCheckRollup: [...]}` for parity. |
-
-### Exit-code parity
-
-Both modes follow the same exit-code table from § "Exit codes" — `exit 3`
-fires when `mergedAt` is null/missing regardless of which mode produced
-the envelope. The `--input-json` path adds two new exit-1 conditions:
-
-- Malformed JSON in the envelope file/stdin.
-- `--input-json` file path missing or unreadable.
-
-Both are usage errors and fall under the existing `exit 1` bucket.
-
-### When NOT to use --input-json
-
-- Local developer machines and CI runners where `gh` is on `$PATH` and
-  authenticated. CLI mode is simpler, fewer moving parts.
-- Codex's `/ship` parity command — Codex inherits the `gh`-on-PATH
-  assumption today and the CLI path stays the default for Codex. If
-  Codex ever runs in an MCP-only sandbox, it can switch to `--input-json`
-  by pre-fetching via the same approach.
+working directory; it reads from the GitHub API only.
 
 ## Classification taxonomy
 
@@ -269,8 +171,8 @@ needs to follow.
   classifier itself is the policy gate, and the implementer subagent is
   constrained to the Step 5b docs-only allowlist (`^\.claude/`, `^\.codex/`,
   `^docs/`, `.*\.md$`, `^AGENTS\.md$`, `^CLAUDE\.md$`) so the PR cannot
-  silently land code changes. The merge bypasses the UTC+3 07:00–01:30
-  merge-window check (night no-merge window 01:30–07:00; `BLOCKER=true` for the defensive re-check in Step 5f.1)
+  silently land code changes. The merge bypasses the UTC+3 09:00–23:59
+  window check (`BLOCKER=true` for the defensive re-check in Step 5f.1)
   so the rule lands atomically with the parent merge that produced it.
 - **Failure path:** if the implementer rejects an out-of-allowlist payload,
   CI fails on the compound PR, mergeStateStatus is BEHIND/DIRTY and cannot
