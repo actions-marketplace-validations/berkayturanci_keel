@@ -1,5 +1,5 @@
 ---
-description: End-to-end issue ship — branch, PR, self-review, CI, N parallel reviewers, time-windowed merge, issue close. UTC+3 07:00–01:30 merge window (night no-merge window 01:30–07:00).
+description: End-to-end issue ship — branch, PR, self-review, CI, N parallel reviewers, time-windowed merge, issue close. UTC+3 09:00–23:59 merge window.
 allowed-tools: Bash(gh:*), Bash(git:*), Bash(date:*), Bash(./gradlew:*), Bash(./scripts/compound-learning.sh:*), Bash(mkdir:*), Bash(rmdir:*), Bash(rm:*), Bash(cat:*), Bash(test:*), Bash(sleep:*), Bash(seq:*), Bash(timeout:*), Bash(gtimeout:*), Bash(kill:*), Bash(printf:*), Bash(echo:*), Bash(grep:*), Bash(sed:*), Read, Edit, Write, Agent, mcp__github__issue_read, mcp__github__issue_write, mcp__github__list_issues, mcp__github__search_issues, mcp__github__add_issue_comment, mcp__github__pull_request_read, mcp__github__list_pull_requests, mcp__github__search_pull_requests, mcp__github__get_file_contents, mcp__github__list_commits, mcp__github__get_commit, mcp__github__list_branches, mcp__github__get_label, mcp__github__create_pull_request, mcp__github__update_pull_request, mcp__github__push_files, mcp__github__add_reply_to_pull_request_comment, mcp__github__pull_request_review_write, mcp__github__enable_pr_auto_merge, mcp__github__merge_pull_request, mcp__github__update_pull_request_branch, mcp__github__subscribe_pr_activity
 argument-hint: [issue numbers...] [--reviewers N] [--blocker] [--dry-run]
 ---
@@ -48,16 +48,16 @@ State the detected `GH_MODE` in your first user-facing line (alongside the `HHMM
 | `gh pr merge <PR> --squash --delete-branch --subject "<X>"` | `mcp__github__merge_pull_request` (merge_method=`squash`, commit_title=`<X>`). Branch deletion: call `mcp__github__update_pull_request_branch` is NOT a delete; branch cleanup in MCP mode is a known gap — log and continue. |
 | `gh pr create ...` | `mcp__github__create_pull_request` |
 | `gh api repos/.../pulls/<N>/comments` (review-thread comments) | `mcp__github__pull_request_read` (method=`get_comments`) |
-| `gh pr checks <PR>` / `gh pr checks --watch` | `mcp__github__pull_request_read` (method=`get_check_runs`). Returns the check runs for the head commit with per-job `status` and `conclusion`. `--watch` is replaced by a poll-with-delay loop (no native streaming). See Step 5b § `GH_MODE=mcp` fallback. |
-| `gh run list ...` / `gh run view --log-failed` | **residual gap** — raw failure logs and branch-scoped workflow-run conclusions are not exposed by the MCP server today. See CI degrade note below for the fallback semantics. |
+| `gh pr checks <PR>` / `gh pr checks --watch` | **no MCP equivalent today** — see CI degrade note below. |
+| `gh run list ...` / `gh run view --log-failed` | **no MCP equivalent today** — see CI degrade note below. |
 
-### CI Health degrade (MCP mode — residual gaps)
+### CI Health degrade (MCP mode only)
 
-The Step 5b CI gate has a full MCP fallback via `mcp__github__pull_request_read(method=get_check_runs)` (see Step 5b § `GH_MODE=mcp` fallback). The remaining `GH_MODE=mcp` gaps:
+`gh pr checks`, `gh run list`, and `gh run view` are not available via the current MCP server. In `GH_MODE=mcp`:
 
-- **Step 5b raw failure logs.** `gh run view --log-failed` has no MCP equivalent. On a CI failure in MCP mode the implementer subagent receives only the check name and `details_url`; it must reproduce the failure locally (gradle/npm/etc.) to diagnose. If reproduction is not feasible without log access, mark `status:blocked` with a comment quoting the `details_url`(s) so an operator can investigate via the browser. This differentiates a real CI failure (`status:blocked` with `details_url`) from the prior blanket "CI unavailable" false positives that parked green PRs.
+- **Step 5b CI gate.** Cannot poll `statusCheckRollup`. If every changed path matches the docs-only allowlist (see Step 5b empty-array branch), proceed as if checks returned `EMPTY` — the docs-only allowlist is the explicit carve-out for this. For any non-docs PR, emit `CI unavailable in MCP mode — cannot satisfy Step 5b precondition`, mark `status:blocked` on the issue, post a one-line comment naming this limitation, and skip the issue. **Do NOT merge non-docs PRs in MCP mode** — the safety invariant "Never merge without CI green" stands.
 - **Step 5f.0 / 5f.1 mergeStateStatus.** Use `mcp__github__pull_request_read` (method=`get`); read `mergeable_state` and apply the same `BEHIND`/`DIRTY` semantics (the MCP field is lowercase: `behind` / `dirty`).
-- **Step 3 rule 5 (develop red on gating workflow).** `mcp__github__pull_request_read` is PR-scoped and does not expose workflow-run conclusion for arbitrary branches (e.g. `develop`). Treat as no-fire (`BLOCKER=false` from this rule) and log `Step 3 rule 5 skipped in MCP mode (branch-scoped workflow-run conclusion unavailable)`. If a future MCP server adds a branch-workflow-runs query, lift this no-fire.
+- **Step 3 rule 5 (develop red on gating workflow).** Cannot run workflow status query. Treat as no-fire (`BLOCKER=false` from this rule) and log `Step 3 rule 5 skipped in MCP mode (workflow status unavailable)`.
 
 ### Implementer subagent inheritance
 
@@ -102,14 +102,11 @@ HHMM=$(TZ='Etc/GMT-3' date +%H%M)
 # Done in shell (not via `date +%-H`) because `%-H` is GNU-only and macOS BSD
 # date silently emits "%-H" literally, breaking arithmetic.
 HOUR=$((10#$HOUR_RAW))
-HHMM_DEC=$((10#$HHMM))
 
-# Night no-merge window: UTC+3 01:30 (inclusive) – 07:00 (exclusive).
-# Merge window (open): the complement — 07:00 through 01:29 the next day.
-if (( HHMM_DEC >= 130 && HHMM_DEC < 700 )); then
-  WINDOW=closed
-else
+if (( HOUR >= 9 && HOUR <= 23 )); then
   WINDOW=open
+else
+  WINDOW=closed
 fi
 ```
 
@@ -191,9 +188,9 @@ without redoing review/test.
 
 Step 4 itself does NOT filter the queue or write the morning-queue file. That
 write happens inside Step 5f when the merge is actually deferred (see Step 5f
-point 2). This preserves the invariant "no merge during the night window" while keeping
+point 2). This preserves the invariant "no merge after hours" while keeping
 the work pipeline moving — agents that have time/budget to review and test
-during the night should not be idle waiting for 07:00.
+overnight should not be idle waiting for 09:00.
 
 For deferred **merges** (the write happens inside Step 5f, not here):
 
@@ -201,7 +198,7 @@ For deferred **merges** (the write happens inside Step 5f, not here):
 
    ```markdown
    # Morning merge queue — <DATE>
-   Outside merge window (inside UTC+3 night no-merge window 01:30–07:00). PRs parked for morning merge:
+   Outside merge window (UTC+3 09:00–23:59). PRs parked for morning merge:
 
    | # | PR | Title | Reason | Blocker? | Tester verdict |
    |---|----|-------|--------|----------|----------------|
@@ -212,10 +209,9 @@ For deferred **merges** (the write happens inside Step 5f, not here):
 
    ```
    Implementation, CI, review, and tester gate all complete. Merge deferred to
-   the morning window — inside the UTC+3 night no-merge window 01:30–07:00.
-   The next `/ship` session outside that window (i.e. 07:00 – 01:30 next day)
-   will pick up at Step 5f (mergeability re-check + squash) without re-running
-   review or tests.
+   the morning window — outside UTC+3 09:00–23:59. The next `/ship` session
+   inside the window will pick up at Step 5f (mergeability re-check + squash)
+   without re-running review or tests.
    ```
 
 3. Leave the issue at `status:needs-test`. Do **not** set `status:done` —
@@ -245,11 +241,11 @@ Post the agent-start comment to the issue (skip if `--dry-run`; log instead). Ad
 
 Spawn the chosen subagent with the same prompt block as `/implement` Step 5, plus:
 
-- "**Workspace isolation (mandatory):** create a git worktree off `origin/develop` and perform every edit, build, and push from inside it — never mutate the user's primary checkout. Per `AGENTS.md` § "Workspace Isolation (AI agents)": `git fetch origin develop --quiet && git worktree add -b <branch> worktrees/issue-<N> origin/develop && cd worktrees/issue-<N>`. All subsequent steps run from that path. After the PR is merged, clean up with `git worktree remove worktrees/issue-<N> --force`."
+- "**Workspace isolation (mandatory):** create a git worktree off `origin/develop` and perform every edit, build, and push from inside it — never mutate the user's primary checkout. Per `AGENTS.md` § "Workspace Isolation (AI agents)": `git fetch origin develop --quiet && git worktree add -b <branch> <path-outside-repo> origin/develop && cd <path-outside-repo>`. All subsequent steps run from that path. After the PR is merged, clean up with `git worktree remove <path-outside-repo> --force`."
 - "Open the PR as **draft** with `Closes #<N>` in the body."
 - "Branch from `develop` (`AGENTS.md` § Branch Rules). Reject any other base."
 - "Before pushing, run `git diff origin/develop...HEAD --name-only` and verify every listed path belongs to issue `<N>`'s scope. If any unexpected file appears, revert it before pushing."
-- "**Workspace path convention (mandatory, per #931):** create the worktree at `worktrees/issue-<N>` (nested under the repo root in the gitignored `worktrees/` subdirectory), where `<N>` is the issue number. The orchestrator's Step 5f.0 pre-cleanup hard-fails if `worktree_path` is the repo root itself or anywhere outside `<repo-root>/worktrees/`. The deprecated sibling form (`../smartinventory-<N>`) is no longer accepted."
+- "**Workspace path convention (mandatory):** create the worktree at `../smartinventory-<N>` (sibling of the repo root, NEVER under the repo root), where `<N>` is the issue number. The orchestrator's Step 5f.0 pre-cleanup hard-fails if `worktree_path` is the repo root or inside it."
 - "Return as the FINAL block of the response, a JSON code-fence with schema:
   ```json
   {
@@ -326,18 +322,7 @@ Set `REVIEWERS` to the detected tier value. Log the detection result:
 
 ### 5b. CI gate
 
-**`GH_MODE=mcp` fallback.** When `GH_MODE=mcp`, replace the `gh pr checks` invocation with `mcp__github__pull_request_read(method=get_check_runs, pullNumber=<PR>)` and interpret the result with the same three-branch semantics described below. The branch-enumeration, fix-and-reply loop, and retry budgets are mode-agnostic; only the polling tool differs.
-
-**Evaluate the rules below in order; the first matching rule wins.** A mixed state (some runs `queued`/`in_progress` plus at least one `failure`) fires the failure rule, NOT the pending rule — never poll while a failure has already been observed.
-
-- **Empty `check_runs` array** ⇒ behaves like branch 1 (no checks scheduled). Apply the docs-only allowlist check; otherwise mark `status:blocked` per branch 1.
-- **Any run has `conclusion` in `{failure, cancelled, timed_out, action_required}`** ⇒ behaves like branch 3 (failed), enter the fix-and-reply loop. **Residual-gap caveat:** raw failure logs (`gh run view --log-failed`) are not exposed via MCP — the implementer subagent gets only the check name + `details_url` and must reproduce the failure locally. If reproduction is not feasible, mark `status:blocked` with the `details_url`(s) quoted (per § CI Health degrade).
-- **Any run still has `status` in `{queued, in_progress}`** ⇒ behaves like the pending sub-branch of branch 3. Poll with a 30 s delay between calls; honour the same 30-minute hard timeout (no MCP equivalent of `--watch`).
-- **All runs have `conclusion` in `{success, skipped, neutral, stale}`** ⇒ behaves like branch 2 (all checks succeeded), proceed to 5c. `stale` is included as non-blocking per GitHub's own UI semantics (Dependabot / merge-queue mark superseded check runs `stale`).
-
-Both the `gh pr checks` and `mcp__github__pull_request_read(method=get_check_runs)` paths share the **per-issue CI retry budget** (3 fix-and-push rounds) and **session-wide CI cooldown** described below.
-
-The `GH_MODE=cli` polling form:
+**`GH_MODE=mcp` short-circuit.** `gh pr checks` has no MCP equivalent. In MCP mode, apply the rule from § Runtime detection: only the docs-only allowlist branch (empty-array path) proceeds; every other PR is marked `status:blocked` with a comment naming the limitation, and this issue is skipped. The rest of Step 5b below applies to `GH_MODE=cli` only.
 
 ```bash
 gh pr checks <PR> --json statusCheckRollup --jq '.statusCheckRollup'
@@ -513,22 +498,14 @@ This sub-step runs **outside** the merge.lock and **outside** the single `bash -
    elif [[ ! -d "$WORKTREE_PATH" ]]; then
      echo "[5f.0] pre-cleanup: skipped (path no longer exists)"
    else
-     # Hard guards (updated per #931 — nested under repo root, never the repo
-     # root itself, never outside the repo root, never the filesystem root).
+     # Hard guards — refuse to operate on repo root or paths inside it.
      case "$WORKTREE_PATH" in
-       "$REPO_ROOT")
-         echo "[5f.0] FAIL: implementer returned the repo root itself ($WORKTREE_PATH); refusing"
+       "$REPO_ROOT"|"$REPO_ROOT"/*)
+         echo "[5f.0] FAIL: implementer returned worktree_path inside repo root ($WORKTREE_PATH); refusing"
          exit 1
-         ;;
-       "$REPO_ROOT"/worktrees/*)
-         # The only accepted shape: nested under <repo-root>/worktrees/.
          ;;
        /)
          echo "[5f.0] FAIL: implementer returned root path; refusing"
-         exit 1
-         ;;
-       *)
-         echo "[5f.0] FAIL: worktree_path ($WORKTREE_PATH) is not under \$REPO_ROOT/worktrees/ (per #931 nested-worktree convention); refusing"
          exit 1
          ;;
      esac
@@ -544,8 +521,6 @@ This sub-step runs **outside** the merge.lock and **outside** the single `bash -
    ```
 
    Hard-fail (`exit 1`) on guard violations; the issue gets `status:blocked`, the operator sees the failure in stdout, and the merge does NOT proceed. This is intentional — a malformed `worktree_path` indicates a broken implementer prompt, not a transient error. The three skip log lines (`skipped (no worktree_path...)`, `skipped (path no longer exists)`) are non-fatal and degrade gracefully to the Step 5f.1 Option 4 fallback (PR #794).
-
-   **Path shape (per #931):** the only accepted `worktree_path` is `<repo-root>/worktrees/<slug>` (any value under the gitignored `worktrees/` subdirectory). The repo root itself, the filesystem root `/`, and any path outside `<repo-root>/worktrees/` (including the deprecated `../smartinventory-<N>` sibling form) are rejected. Existing sibling worktrees from before #931 stay until their PRs merge but cannot be the `worktree_path` for a new `/ship` invocation.
 
 5. THEN proceed to Step 5f.1 (lock acquisition).
 
@@ -757,9 +732,7 @@ If both classifier paths are unavailable in the current runtime — the `ce-comp
 
 **Steps:**
 
-1. Invoke the agent-neutral bundler. Two paths exist (issue #975 — the MCP-runtime branch lets the bundler run without `gh` on `$PATH`); both produce the same `$BUNDLE_JSON` shape so points 2–5 dispatch identically:
-
-   **CLI mode (`GH_MODE=cli`):**
+1. Invoke the agent-neutral bundler:
    ```bash
    if BUNDLE_JSON="$(./scripts/compound-learning.sh "$PR_NUMBER" 2>/dev/null)"; then
      BUNDLE_EXIT=0
@@ -768,24 +741,7 @@ If both classifier paths are unavailable in the current runtime — the `ce-comp
      BUNDLE_JSON=""
    fi
    ```
-
-   **MCP mode (`GH_MODE=mcp`):** the orchestrator pre-fetches the PR data via `mcp__github__pull_request_read` (methods `get`, `get_diff`, `get_comments`, `get_review_comments`, `get_check_runs`), assembles the envelope (schema documented in `docs/development/compound-learning-spec.md § "Bundler input modes"`), and pipes it into the bundler on stdin. Stdin avoids the need for a tempfile (and the `mktemp` / `rm -f` calls that would otherwise have to be added to `allowed-tools`):
-   ```bash
-   # $ENVELOPE_JSON is the assembled envelope. The envelope is a single
-   # object with keys: meta (PR metadata), diff (unified diff string),
-   # issue_comments (text blob), review_comments (array from
-   # get_review_comments), ci_status (object wrapping statusCheckRollup).
-   # Required meta fields: number, state, mergedAt. When
-   # mcp__github__pull_request_read returns no mergedAt, the bundler
-   # exits 3 and Step 5g logs + skips per the fail-soft rule below.
-   if BUNDLE_JSON="$(printf '%s' "$ENVELOPE_JSON" | ./scripts/compound-learning.sh "$PR_NUMBER" --input-json - 2>/dev/null)"; then
-     BUNDLE_EXIT=0
-   else
-     BUNDLE_EXIT=$?
-     BUNDLE_JSON=""
-   fi
-   ```
-   The explicit `if/else` is required in both paths: writing `... || true` inside the command substitution would force the subshell to exit 0, masking real failures and feeding an empty bundle to the classifier. On non-zero exit (gh missing in CLI mode, jq missing, PR not found, PR not merged, malformed envelope in MCP mode) ⇒ log `compound-learning: bundler exit $BUNDLE_EXIT — skipping` to stdout and exit Step 5g (do NOT abort `/ship`; this is fail-soft).
+   The explicit `if/else` is required: writing `... || true` inside the command substitution would force the subshell to exit 0, masking real failures and feeding an empty bundle to the classifier. On non-zero exit (gh missing, jq missing, PR not found, PR not merged) ⇒ log `compound-learning: bundler exit $BUNDLE_EXIT — skipping` to stdout and exit Step 5g (do NOT abort `/ship`; this is fail-soft).
 
 2. Classify the bundle. The classifier source depends on the runtime — there are two paths, both of which MUST produce a `{classification, payload}` shape so points 3–5 below can dispatch identically regardless of which path was taken:
 
@@ -931,7 +887,7 @@ On exit (success or partial), log a one-line summary per processed/deferred/bloc
 - Never merge without all reviewers `LGTM` (no blockers) AND CI green AND tester clear, except for the compound Rule / Pattern PR carve-outs documented below.
 - Never bypass the merge lock; never run `gh pr merge` outside Step 5f.1. (Search marker: `MERGE_GATE_ONLY`.)
 - Never let reviewers call any GitHub write API — only the orchestrator does.
-- Inside the UTC+3 night no-merge window 01:30–07:00, only blockers may **merge**. Implementation, CI,
+- Outside the merge window, only blockers may **merge**. Implementation, CI,
   review, and tester gates always run regardless of window — the gate only
   fires at Step 5f. If unsure whether to merge, defer.
 - **Compound Rule and Pattern PR window-bypass carve-out.** A
