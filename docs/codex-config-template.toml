@@ -1,14 +1,19 @@
 # Codex CLI global config additions
-# Merge these into ~/.codex/config.toml
+# Add these keys to `~/.codex/config.toml` if they are not already present.
 #
 # approval = "never"  — auto-approve all model-generated commands
-# sandbox  = "workspace-write" — restrict writes to project dir + /tmp (primary security boundary)
-# shell_deny — explicit blocklist mirroring Claude Code's deny rules
+# sandbox  = "workspace-write" — PRIMARY security boundary (filesystem-level, verified)
+#
+# block_commands — UNVERIFIED key (tested 2026-05-25): Codex silently ignored it;
+#   the sandbox blocked dangerous ops at the filesystem level instead.
+#   The real deny enforcement comes from the project's .codex/hooks.json PreToolUse
+#   hook, which reads Claude Code's .claude/settings.json deny list.
+#   Keep this block as a best-effort declaration; do not rely on it as the sole guard.
 
 approval = "never"
 sandbox  = "workspace-write"
 
-shell_deny = [
+block_commands = [
   "git push --force",
   "git push -f ",
   "git push --force-with-lease",
@@ -25,6 +30,7 @@ shell_deny = [
   "rm -rf $HOME",
   "rm -rf --no-preserve-root",
   "sudo rm",
+  # The trailing space is intentional: it prefix-matches all "sudo <anything>" invocations.
   "sudo ",
   "gh repo delete",
   "gh release delete",
