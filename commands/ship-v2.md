@@ -1,7 +1,7 @@
 ---
 description: End-to-end issue ship (compound-engineering edition) — same lifecycle as /ship with compound skill substitutions for commit, simplify, review fan-out, PR-feedback loop, and post-merge knowledge capture.
 allowed-tools: Bash(gh:*), Bash(git:*), Bash(date:*), Bash(./gradlew:*), Bash(./scripts/compound-learning.sh:*), Bash(mkdir:*), Bash(rmdir:*), Bash(rm:*), Bash(cat:*), Bash(test:*), Bash(sleep:*), Bash(seq:*), Bash(timeout:*), Bash(gtimeout:*), Bash(kill:*), Bash(printf:*), Bash(echo:*), Bash(grep:*), Bash(sed:*), Read, Edit, Write, Agent, mcp__github__issue_read, mcp__github__issue_write, mcp__github__list_issues, mcp__github__search_issues, mcp__github__add_issue_comment, mcp__github__pull_request_read, mcp__github__list_pull_requests, mcp__github__search_pull_requests, mcp__github__get_file_contents, mcp__github__list_commits, mcp__github__get_commit, mcp__github__list_branches, mcp__github__get_label, mcp__github__create_pull_request, mcp__github__update_pull_request, mcp__github__push_files, mcp__github__add_reply_to_pull_request_comment, mcp__github__pull_request_review_write, mcp__github__enable_pr_auto_merge, mcp__github__merge_pull_request, mcp__github__update_pull_request_branch, mcp__github__subscribe_pr_activity
-argument-hint: [issue numbers...] [--reviewers N (ignored — v2 size-gates S3)] [--blocker] [--dry-run]
+argument-hint: [issue numbers...] [--reviewers N (ignored — v2 size-gates S3)] [--blocker] [--dry-run] [--preview]
 ---
 
 You are the SmartInventory end-to-end shipping orchestrator — **compound-engineering edition**. Drive each GitHub issue from `status:backlog` to `status:done` (merged + closed) using the same lifecycle as `/ship`, with five compound-engineering substitutions that improve commit hygiene, reviewer relevance, feedback resolution, and durable-learning capture.
@@ -114,7 +114,7 @@ When BLOCKERS or SUGGESTIONS need addressing:
 
 All of the following carry over from `/ship` (v1) **verbatim**, with no v2-specific behavior:
 
-- Step 0 (argument parsing — except v2 ignores `--reviewers`; see S3)
+- Step 0 (argument parsing — except v2 ignores `--reviewers`; see S3. `--preview` is honoured exactly as in v1: adds `deploy:preview` label after PR open, skipped under `--dry-run`)
 - Step 1 (time-window detection, UTC+3 07:00–01:30 merge window; night no-merge window 01:30–07:00)
 - Step 2 (queue build, watch-mode rules)
 - Step 3 (blocker auto-detection rules 1–5)
