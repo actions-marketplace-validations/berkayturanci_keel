@@ -1,10 +1,10 @@
 # Parallel-Agents Setup (iTerm2 + tmux)
 
-Two tiers of local terminal layout for running multiple SmartInventory agents (android-developer, web-developer, code-reviewer, watcher) in parallel.
+Two tiers of local terminal layout for running multiple ingreview agents (flutter-developer, supabase-developer, code-reviewer, watcher) in parallel.
 
 ## Goal
 
-Keep several agent sessions visible side by side on one Mac without committing to a full multiplexer. Start with iTerm2 splits; upgrade to tmux only when persistence across iTerm2 restarts (or remote access) actually matters. For the SmartInventory-specific window-and-role layout once you are on tmux, see [`../tmux-agent-workflow.md`](../tmux-agent-workflow.md).
+Keep several agent sessions visible side by side on one Mac without committing to a full multiplexer. Start with iTerm2 splits; upgrade to tmux only when persistence across iTerm2 restarts (or remote access) actually matters.
 
 ---
 
@@ -31,26 +31,26 @@ One pane corresponds to one worktree corresponds to one issue. Naming convention
 
 ```sh
 # from the main checkout
-git worktree add -b feat/<issue#>-<slug> ../smartinventory-<issue#> origin/develop
+git worktree add -b feat/<issue#>-<slug> ../ingreview-<issue#> origin/main
 ```
 
 Then in the new iTerm2 pane:
 
 ```sh
-cd ../smartinventory-<issue#>
+cd ../ingreview-<issue#>
 ```
 
 ### Per-pane command snippets
 
 ```sh
-# Web pane
-cd ../smartinventory-530 && yarn --cwd web dev
+# Flutter pane
+cd ../ingreview-42 && flutter run
 
-# Android pane
-cd ../smartinventory-530 && ./gradlew assembleDebug
+# Supabase pane
+cd ../ingreview-42 && supabase start
 
-# Deploy pane
-cd ../smartinventory-530 && firebase deploy --only functions
+# Test pane
+cd ../ingreview-42 && cd apps/mobile && flutter test --watch
 ```
 
 ### Limitations
@@ -67,7 +67,7 @@ If any of those bite you, move to Tier 2.
 
 ### When to upgrade
 
-- You leave long-running agents (watcher, `firebase emulators:start`, `gradle --continuous`) running overnight.
+- You leave long-running agents (watcher, `supabase start`, `flutter run`) running overnight.
 - You want to detach the session, close iTerm2, reboot, and reattach with everything still alive.
 - You ssh into the Mac from a second machine and want the same view.
 
@@ -81,17 +81,17 @@ Drop the sample config at [`dotfiles/.tmux.conf`](./dotfiles/.tmux.conf) into `~
 
 ### Session model
 
-One tmux session per logical workspace (e.g. `sm` for SmartInventory). Inside the session, one window per role (control, android, web, review, watcher, ci). For the full SmartInventory window layout, see [`../tmux-agent-workflow.md`](../tmux-agent-workflow.md).
+One tmux session per logical workspace (e.g. `ir` for ingreview). Inside the session, one window per role (control, flutter, supabase, review, watcher, ci).
 
 ### Cheat sheet
 
 The sample config rebinds the prefix from `Ctrl+b` to `Ctrl+a`. Adjust accordingly if you keep the default.
 
 ```sh
-tmux new -s sm            # create session "sm"
-tmux attach -t sm         # reattach later (after closing iTerm2, ssh, reboot)
+tmux new -s ir            # create session "ir"
+tmux attach -t ir         # reattach later (after closing iTerm2, ssh, reboot)
 tmux ls                   # list sessions
-tmux kill-session -t sm   # nuke session
+tmux kill-session -t ir   # nuke session
 ```
 
 Inside tmux (prefix = `Ctrl+a` with sample config, `Ctrl+b` by default):
@@ -110,8 +110,8 @@ Inside tmux (prefix = `Ctrl+a` with sample config, `Ctrl+b` by default):
 Run tmux in control-mode so iTerm2 renders tmux windows/panes as native iTerm2 tabs/splits:
 
 ```sh
-tmux -CC new -s sm
-tmux -CC attach -t sm
+tmux -CC new -s ir
+tmux -CC attach -t ir
 ```
 
 This gives you native iTerm2 UI (Cmd+T for new window, Cmd+D for split) while tmux owns the underlying session. Detaching with `prefix d` (or closing the iTerm2 window) leaves the session alive.
@@ -120,15 +120,14 @@ This gives you native iTerm2 UI (Cmd+T for new window, Cmd+D for split) while tm
 
 ## Decision tree
 
-- Single-Mac, work fits in one iTerm2 window, no overnight agents → **Tier 1**.
-- Long-running agents, need detach/reattach, or want ssh access → **Tier 2**.
-- Already on Tier 1 and adding a third worktree or first overnight watcher → upgrade to Tier 2 now.
+- Single-Mac, work fits in one iTerm2 window, no overnight agents -> **Tier 1**.
+- Long-running agents, need detach/reattach, or want ssh access -> **Tier 2**.
+- Already on Tier 1 and adding a third worktree or first overnight watcher -> upgrade to Tier 2 now.
 
 ---
 
 ## Cross-references
 
-- [`../tmux-agent-workflow.md`](../tmux-agent-workflow.md) — full SmartInventory tmux session and window layout.
 - [`../../AGENTS.md`](../../AGENTS.md) — agent roles, issue lifecycle, review loop (the source of truth for who does what in each pane).
 - [`./dotfiles/.tmux.conf`](./dotfiles/.tmux.conf) — sample minimal tmux config used by this guide.
 
