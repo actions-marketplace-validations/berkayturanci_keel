@@ -1,39 +1,34 @@
 ---
-description: On-demand dependency security and licence audit (npm + Gradle OWASP plugin + licence drift)
-allowed-tools: Bash(./gradlew:*), Bash(npm:*), Bash(node:*), Bash(git:*), Bash(gh:*), Bash(jq:*), Bash(find:*), Bash(grep:*), Bash(sort:*), Bash(diff:*), Read, Agent, mcp__github__issue_read, mcp__github__issue_write, mcp__github__add_issue_comment, mcp__github__list_issues, mcp__github__search_issues
-argument-hint: [android|web|all] [--severity low|moderate|high|critical] [--dry-run]
+description: On-demand dependency security and licence audit (npm for Supabase functions + pub.dev for Flutter packages + licence drift)
+allowed-tools: Bash(flutter:*), Bash(dart:*), Bash(npm:*), Bash(node:*), Bash(deno:*), Bash(git:*), Bash(gh:*), Bash(jq:*), Bash(find:*), Bash(grep:*), Bash(sort:*), Bash(diff:*), Read, Agent, mcp__github__issue_read, mcp__github__issue_write, mcp__github__add_issue_comment, mcp__github__list_issues, mcp__github__search_issues
+argument-hint: [flutter|supabase|all] [--severity low|moderate|high|critical] [--dry-run]
 ---
 
-You are running an on-demand dependency security and licence audit for SmartInventory.
+You are running an on-demand dependency security and licence audit for ingreview.
 
-The command is **read-only on application code**: it never modifies dependency manifests, never applies upgrades, and never closes the tracking issue. It runs `npm audit` for the web tree, the OWASP Gradle plugin for the Android tree, computes licence drift against a committed baseline, and posts a single comment to today's `deps-audit: <DATE>` tracking issue. Repeated runs append a fresh comment per run; the codename-prefixed first line is what lets morning briefings and future searches locate the latest run inside a multi-comment issue.
+The command is **read-only on application code**: it never modifies dependency manifests, never applies upgrades, and never closes the tracking issue. It runs `npm audit` for Supabase functions, `flutter pub outdated` + pub.dev advisory checks for Flutter packages, computes licence drift against a committed baseline, and posts a single comment to today's `deps-audit: <DATE>` tracking issue.
 
 ## Language
 
-All committed/published artifacts (commits, branch names, PR/issue titles and bodies, comments, file contents, slash command definitions) MUST be written in English. Free-form chat with the user may stay in any language. See `AGENTS.md` § "Language Policy". The tracking-issue comment this command posts is a published artifact and MUST be English.
+All committed/published artifacts MUST be written in English. The tracking-issue comment this command posts is a published artifact and MUST be English.
 
 ## Step 0 — Parse arguments
 
 Argument grammar:
 
-- Positional, optional: one of `android`, `web`, `all`. Default: `all`. Reject anything else.
-- `--severity <level>` — one of `low`, `moderate`, `high`, `critical`. Default: `moderate`. Severity ordering uses a numeric mapping (`critical=4`, `high=3`, `moderate=2`, `low=1`); findings with `severity_rank >= threshold_rank` are reported.
-- `--dry-run` — boolean; compute the report and log the would-be comment body to stdout but skip every `mcp__github__issue_write` (issue create) and `mcp__github__add_issue_comment` (comment post) mutation.
+- Positional, optional: one of `flutter`, `supabase`, `all`. Default: `all`. Reject anything else.
+- `--severity <level>` — one of `low`, `moderate`, `high`, `critical`. Default: `moderate`. Severity ordering: `critical=4`, `high=3`, `moderate=2`, `low=1`.
+- `--dry-run` — boolean; compute the report and log the would-be comment body to stdout but skip every mutation.
 
-Reject:
-
-- Unknown flags (anything starting with `--` not in the list above).
-- `--severity` without a value or with a value outside the four allowed levels.
-- More than one positional.
-- A positional not in {`android`, `web`, `all`}.
+Reject unknown flags, `--severity` without a valid value, more than one positional, a positional not in {`flutter`, `supabase`, `all`}.
 
 Worked examples:
 
 ```
-/deps-audit                            → SCOPE=all     SEVERITY=moderate
-/deps-audit web                        → SCOPE=web     SEVERITY=moderate
-/deps-audit android --severity high    → SCOPE=android SEVERITY=high
-/deps-audit --dry-run                  → SCOPE=all     SEVERITY=moderate  DRY_RUN=true
+/deps-audit                              → SCOPE=all       SEVERITY=moderate
+/deps-audit supabase                     → SCOPE=supabase  SEVERITY=moderate
+/deps-audit flutter --severity high      → SCOPE=flutter   SEVERITY=high
+/deps-audit --dry-run                    → SCOPE=all       SEVERITY=moderate  DRY_RUN=true
 ```
 
 ## Step 1 — Find or create today's tracking issue
@@ -48,7 +43,7 @@ Search for an existing open tracking issue with the exact title `deps-audit: <DA
 
 ```
 mcp__github__search_issues
-  query: repo:berkayturanci/smartinventory is:open in:title "deps-audit: <DATE>"
+  query: repo:berkayturanci/ingreview is:open in:title "deps-audit: <DATE>"
 ```
 
 - If found, capture its number → `TRACKING_N`.
@@ -56,77 +51,65 @@ mcp__github__search_issues
   - title: `deps-audit: <DATE>`
   - body: `Auto-generated by /deps-audit. Each run appends a comment with that run's findings.`
   - labels: `["documentation"]`
-
   Capture the new issue number → `TRACKING_N`.
-- If `--dry-run` and no existing issue is found: print `DRY-RUN: would create tracking issue deps-audit: <DATE>` to stdout and continue (no `TRACKING_N` needed because Step 6 will skip the post anyway).
+- If `--dry-run` and no existing issue found: print `DRY-RUN: would create tracking issue deps-audit: <DATE>`.
 
-## Step 2 — Android audit
+## Step 2 — Flutter audit
 
-Skip this step entirely if `SCOPE=web`. Otherwise (`SCOPE=android` or `SCOPE=all`):
-
-Detect the OWASP plugin task on the Android build:
+Skip this step entirely if `SCOPE=supabase`. Otherwise (`SCOPE=flutter` or `SCOPE=all`):
 
 ```bash
-cd android && ./gradlew tasks --all 2>/dev/null | grep -iE 'dependencyCheckAnalyze'
+cd apps/mobile && flutter pub outdated --json > /tmp/flutter-outdated.json || true
 ```
 
-- If the task is **not present**, do NOT fail the run. Add a graceful note to the report under the "Skipped" section:
-
-  > Android audit skipped: OWASP dependency-check plugin not wired up. Follow-up: open an issue to add `org.owasp.dependencycheck` to the root Android build script.
-
-  Continue to Step 3.
-
-- If the task **is** present:
-
-  ```bash
-  cd android && ./gradlew dependencyCheckAnalyze
-  ```
-
-  Parse the JSON report at `android/build/reports/dependency-check-report.json` with `jq`. Extract per vulnerability:
-
-  - CVE id (e.g. `CVE-2024-12345`)
-  - severity (`critical`/`high`/`moderate`/`low` — normalise from CVSS if the plugin emits numeric scores)
-  - dependency name (`group:artifact`)
-  - current resolved version
-  - fix-available flag (true if the report lists a non-vulnerable upgrade target, else false)
-
-  Filter to entries with `severity_rank >= threshold_rank` using the mapping in Step 0.
-
-If the gradle invocation itself fails (network, plugin error), capture the failure and add a "Skipped: Android audit failed — <one-line error>" entry to the report; do NOT abort the whole run.
-
-## Step 3 — Web audit
-
-Skip this step entirely if `SCOPE=android`. Otherwise (`SCOPE=web` or `SCOPE=all`):
+Also run Dart's built-in security advisory check:
 
 ```bash
-cd web && npm audit --json > /tmp/npm-audit.json || true
+dart pub audit 2>/dev/null > /tmp/dart-audit.txt || true
 ```
 
-`npm audit` exits non-zero whenever it has findings — the `|| true` is load-bearing; without it the script aborts before the report is built. Parse `/tmp/npm-audit.json` with `jq` and extract per vulnerability:
+Parse `/tmp/dart-audit.txt` and `/tmp/flutter-outdated.json` with `jq` / grep. Extract per vulnerability:
 
 - package name
-- severity (`critical`/`high`/`moderate`/`low`)
-- via / root cause (the upstream advisory or transitive parent)
-- fix-available flag
+- severity (map from pub.dev advisory severity: `critical`/`high`/`moderate`/`low`)
+- CVE id or advisory URL
 - current installed version
-- recommended version (the closest non-vulnerable release per the advisory)
+- fix-available flag (true if a non-affected version exists in pub.dev)
+- recommended version
 
 Filter to entries with `severity_rank >= threshold_rank`.
 
-If `npm audit` cannot run at all (missing `node_modules`, network down), add a "Skipped: Web audit failed — <one-line error>" entry; continue.
+If the flutter invocation itself fails (missing Flutter SDK, network), capture the failure and add a "Skipped: Flutter audit failed — <one-line error>" entry to the report; do NOT abort.
+
+## Step 3 — Supabase functions audit
+
+Skip this step entirely if `SCOPE=flutter`. Otherwise (`SCOPE=supabase` or `SCOPE=all`):
+
+```bash
+cd supabase/functions && npm audit --json > /tmp/npm-audit.json || true
+```
+
+`npm audit` exits non-zero whenever it has findings — the `|| true` is load-bearing. Parse `/tmp/npm-audit.json` with `jq` and extract per vulnerability:
+
+- package name
+- severity (`critical`/`high`/`moderate`/`low`)
+- via / root cause
+- fix-available flag
+- current installed version
+- recommended version
+
+Filter to entries with `severity_rank >= threshold_rank`.
+
+If `npm audit` cannot run at all (missing `node_modules`, network down), add a "Skipped: Supabase functions audit failed — <one-line error>" entry; continue.
 
 ## Step 4 — Licence drift
 
-Baseline file path (committed): `docs/licences-baseline.txt`. Format: sorted lines of `<package>@<version> <licence>` representing the canonical licence set for the current lockfile state.
+Baseline file path (committed): `docs/licences-baseline.txt`. Format: sorted lines of `<package>@<version> <licence>`.
 
-- If `docs/licences-baseline.txt` is **missing**, write a one-time scaffolding note to the report and skip the diff:
-
-  > Licence drift skipped: baseline missing — run `/deps-audit --bootstrap` to capture the current licence set as the new baseline; this flag is implementation backlog for a follow-up.
-
+- If `docs/licences-baseline.txt` is **missing**, write a scaffolding note to the report and skip the diff.
 - Otherwise, build `current-licences.txt`:
-
-  - **Android (only if Android scope ran):** `cd android && ./gradlew :smartinventory:dependencies` and grep direct deps; for each, look up the published POM `<license>` field on Maven Central. If the network is unavailable, skip this half and note `Skipped: Maven Central unreachable — Android licences not refreshed`.
-  - **Web (only if Web scope ran):** read every `web/node_modules/*/package.json` and pull the `license` field.
+  - **Flutter (only if Flutter scope ran):** `cd apps/mobile && flutter pub deps` and for each direct dep look up the `license` field from the package's `LICENSE` file in `.pub-cache`. If unavailable, note `Skipped: pub-cache licence unavailable for <package>`.
+  - **Supabase functions (only if Supabase scope ran):** read every `supabase/functions/node_modules/*/package.json` and pull the `license` field.
 
   Combine, sort, and write to `/tmp/current-licences.txt`. Then:
 
@@ -134,15 +117,15 @@ Baseline file path (committed): `docs/licences-baseline.txt`. Format: sorted lin
   diff docs/licences-baseline.txt /tmp/current-licences.txt
   ```
 
-  Classify each diff line as `added`, `removed`, or `changed` (changed = same `<package>` but different licence or version).
+  Classify each diff line as `added`, `removed`, or `changed`.
 
 - If the diff is empty, the report says `licences: no drift`.
 
 ## Step 5 — Build the report comment
 
-Format as a single markdown body. The first line MUST be the codename so the morning briefing and future runs can find it.
+Format as a single markdown body. The first line MUST be the codename.
 
-**Codename pin (load-bearing invariant):** the codename line `DEPS-AUDIT-<DATE>-<UTC_TIMESTAMP>` MUST be the literal first line of the comment body — no blank line above it, no leading whitespace, no quoting, no Markdown prefix (no `#`, no `>`, no list marker), and no surrounding formatting (no backticks, no bold). Step 6's `startswith("DEPS-AUDIT-<DATE>-")` search depends on this exact invariant to locate the latest deps-audit run inside a multi-comment tracking issue; any deviation (e.g. wrapping the codename in a heading or preceding it with a blank line) will cause downstream consumers (morning briefing, search anchors) to miss the comment.
+**Codename pin (load-bearing invariant):** the codename line `DEPS-AUDIT-<DATE>-<UTC_TIMESTAMP>` MUST be the literal first line of the comment body — no blank line above it, no leading whitespace, no quoting, no Markdown prefix, and no surrounding formatting.
 
 ```
 DEPS-AUDIT-<DATE>-<UTC_TIMESTAMP>
@@ -151,13 +134,13 @@ DEPS-AUDIT-<DATE>-<UTC_TIMESTAMP>
 
 Summary: critical: <n> | high: <n> | moderate: <n> | low: <n>
 
-### Android
+### Flutter packages
 | Package | Version | Severity | CVE / advisory | Fix available? |
 |---|---|---|---|---|
-| org.example:foo | 1.2.3 | high | CVE-2024-12345 | yes |
+| some_package | 1.2.3 | high | https://pub.dev/... | yes |
 | … | … | … | … | … |
 
-### Web
+### Supabase functions (npm)
 | Package | Version | Severity | Advisory | Fix available? |
 |---|---|---|---|---|
 | lodash | 4.17.20 | high | GHSA-xxxx-xxxx-xxxx | yes |
@@ -171,16 +154,15 @@ Summary: critical: <n> | high: <n> | moderate: <n> | low: <n>
 | changed | core-pkg@3.1.0 | MIT | GPL-3.0 |
 
 ### Skipped
-- Android audit skipped: OWASP dependency-check plugin not wired up.
+- Flutter audit skipped: dart pub audit not available.
 - Licence drift skipped: baseline missing.
 ```
 
 Formatting rules:
-
 - Summary line counts include **all platforms that ran**, after threshold filtering.
-- Omit a platform table entirely if that platform was not in scope (do not render an empty Android table for a web-only run).
-- If a platform was in scope but produced zero findings above threshold, render a single italic line in place of the table: `_No <platform> findings at or above <SEVERITY> severity._`
-- If the licence drift section ran and the diff was empty, render `_licences: no drift_` in place of the table.
+- Omit a platform table entirely if that platform was not in scope.
+- If a platform was in scope but produced zero findings above threshold, render `_No <platform> findings at or above <SEVERITY> severity._`
+- If the licence drift section ran and the diff was empty, render `_licences: no drift_`.
 - The "Skipped" section is omitted entirely if nothing was skipped.
 
 ## Step 6 — Post or update the tracking-issue comment
@@ -193,45 +175,37 @@ mcp__github__issue_read
   issue_number: <TRACKING_N>
 ```
 
-Then filter comment bodies that start with `DEPS-AUDIT-<DATE>-`. The MCP add-comment API does **not** edit existing comments; it only appends. The codename pin (Step 5) is what lets a human reader or a downstream script find the latest run within a multi-comment issue, so appending one comment per run is acceptable — the prefix doubles as the search anchor for "latest deps-audit run on <DATE>".
+Then filter comment bodies that start with `DEPS-AUDIT-<DATE>-`. Append a fresh comment per run (the MCP API does not edit existing comments).
 
-- If `--dry-run`: print the report body to stdout under `DRY-RUN: would post comment on issue #<TRACKING_N>:` and skip the API call.
-- Otherwise: post a fresh comment via:
-
-  ```
-  mcp__github__add_issue_comment
-    issue_number: <TRACKING_N>
-    body: <BODY>
-  ```
-
-Re-runs against the same `TRACKING_N` are safe — the new comment is appended, and the prefix search will surface the latest one by timestamp.
+- If `--dry-run`: print the report body to stdout under `DRY-RUN: would post comment on issue #<TRACKING_N>:`.
+- Otherwise: post via `mcp__github__add_issue_comment`.
 
 ## Stop conditions / safety invariants
 
-- **Never auto-apply upgrades.** Bumping versions is Renovate's job. This command is advisory only.
-- **Never close the tracking issue.** Humans triage findings into per-CVE issues if they choose; closing the umbrella issue is a manual action.
-- **Never modify dependency manifests, lockfiles, or the licence baseline.** Even if drift is detected, the baseline at `docs/licences-baseline.txt` is updated by a separate intentional commit, not by this command.
-- **On any individual audit's failure, continue with the others.** Network failures, missing plugins, missing baselines, and tool errors are reported under "Skipped" — they do NOT abort the run. The only fatal case is argument-parse failure in Step 0.
-- **No silent dry-run mutations.** Under `--dry-run`, every state-changing call (issue create, comment post) MUST be redirected to stdout as `DRY-RUN: <description>` and skipped.
+- **Never auto-apply upgrades.** This command is advisory only.
+- **Never close the tracking issue.**
+- **Never modify dependency manifests, lockfiles, or the licence baseline.**
+- **On any individual audit's failure, continue with the others.**
+- **No silent dry-run mutations.**
 
 ## Prerequisites
 
-- **Android (OWASP plugin):** `org.owasp.dependencycheck` must be wired into `android/build.gradle.kts` and produce the `dependencyCheckAnalyze` task. As of writing this is NOT wired up — the command **degrades gracefully** by emitting the "Android audit skipped" note rather than failing.
-- **Web (npm):** `npm` must be on PATH and `web/package-lock.json` must be populated. If `node_modules` is missing, the `npm audit` call will fail; the command reports it under "Skipped" rather than aborting.
-- **Licence baseline:** `docs/licences-baseline.txt` exists and is sorted. If missing, the command emits the bootstrap note rather than failing.
+- **Flutter (dart pub audit):** requires Dart SDK 3.0+ and network access to pub.dev advisories. Command degrades gracefully with a "Skipped" note if unavailable.
+- **Supabase functions (npm):** `npm` must be on PATH and `supabase/functions/package-lock.json` must be populated.
+- **Licence baseline:** `docs/licences-baseline.txt` exists and is sorted. If missing, the command emits the bootstrap note.
 - **`jq`** available on PATH for JSON parsing.
-- **GitHub MCP tools** authenticated with `repo` scope (issue read/create + comment).
+- **GitHub MCP tools** authenticated with `repo` scope.
 
 ## Examples
 
 ```
-/deps-audit                            # all platforms, moderate threshold
-/deps-audit web                        # web only
-/deps-audit android --severity high    # android only, high+critical findings
-/deps-audit --dry-run                  # show what would be reported, no writes
+/deps-audit                              # all platforms, moderate threshold
+/deps-audit supabase                     # supabase functions only
+/deps-audit flutter --severity high      # flutter only, high+critical findings
+/deps-audit --dry-run                    # show what would be reported, no writes
 ```
 
-- `/deps-audit` — full sweep: Android OWASP + web `npm audit` + licence drift, moderate-and-above findings, appended to today's `deps-audit: <DATE>` tracking issue.
-- `/deps-audit web` — web-only run; useful when you just bumped a web package and want to recheck advisories without paying the Gradle warm-up cost.
-- `/deps-audit android --severity high` — narrows the Android findings to high and critical only; quieter signal when you only care about the loud stuff.
-- `/deps-audit --dry-run` — full computation, no GitHub writes; the rendered body is logged to stdout. Use this to sanity-check the report before letting it land on the tracking issue.
+- `/deps-audit` — full sweep: Flutter pub audit + Supabase npm audit + licence drift, moderate-and-above findings, appended to today's `deps-audit: <DATE>` tracking issue.
+- `/deps-audit supabase` — Supabase functions only; useful when you just bumped an npm package.
+- `/deps-audit flutter --severity high` — Flutter packages only, high and critical findings only.
+- `/deps-audit --dry-run` — full computation, no GitHub writes.
