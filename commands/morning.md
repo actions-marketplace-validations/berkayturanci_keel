@@ -29,7 +29,7 @@ GitHub Actions runs are not available via the MCP server tools we have today. In
 
 ### Step 1a — Persistent deferral queue
 
-Read `.claude/deferrals.json` if it exists — this is the canonical cross-session deferral queue written by `/ship` when issues are deferred outside the UTC+3 09:00–23:59 merge window. Surface any entries at the **top** of the morning brief as "🌙 Overnight /ship deferrals". After surfacing the entries, clear the file by writing `[]` to it (the entries are now visible to the operator and will be picked up by the next `/ship` run).
+Read `.claude/deferrals.json` if it exists — this is the canonical cross-session deferral queue written by `/ship` when issues are deferred outside the UTC+3 07:00–01:30 merge window. Surface any entries at the **top** of the morning brief as "🌙 Overnight /ship deferrals". After surfacing the entries, clear the file by writing `[]` to it (the entries are now visible to the operator and will be picked up by the next `/ship` run).
 
 Fall back to the legacy `docs/reports/morning-merge-queue-<DATE>.md` file for backward compatibility (where `<DATE>` is today in UTC+3). Use the Bash tool to resolve the date (`TZ='Etc/GMT-3' date +%Y-%m-%d`) and to test for existence (`test -f …`). If the legacy file exists and is non-empty, surface its contents in the same "🌙 Overnight /ship deferrals" section and append `(legacy queue — .claude/deferrals.json not present)`.
 
