@@ -109,21 +109,11 @@ Status:
     checklist of other issue links), set status to "" and explain in reasoning;
     the orchestrator will post a note and skip the status label.
 
-Scope heuristics (matches monorepo layout):
-  - Files / paths mentioned under apps/mobile/ ⇒ scope:mobile.
-  - Files / paths mentioned under supabase/ ⇒ scope:supabase.
-  - Files / paths mentioned under packages/ ⇒ scope:packages.
-  - Docs, AGENTS.md, .claude/, slash commands ⇒ scope:docs (or scope:tools
-    for tools/, scripts/).
-  - If unclear, omit the scope label and explain in reasoning.
-
-Domain heuristics (ingreview-specific):
-  - Camera / OCR flow ⇒ domain:scan.
-  - Ingredient parsing / knowledge base ⇒ domain:ingredients.
-  - Personal-sensitivity scoring ⇒ domain:risk-engine.
-  - Community score / user reports ⇒ domain:community.
-  - Product catalogue / lookup ⇒ domain:products.
-  - Auth / sessions ⇒ domain:auth.
+Platform heuristics:
+  - Files / paths mentioned under android/ ⇒ platform:android.
+  - Files / paths mentioned under web/ ⇒ platform:web.
+  - Docs, AGENTS.md, .claude/, slash commands, shared schema ⇒ platform:shared.
+  - If unclear, default to platform:shared.
 
 reasoning MUST be a single sentence ≤ 120 chars, English.
 
