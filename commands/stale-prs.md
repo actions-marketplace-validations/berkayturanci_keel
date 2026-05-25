@@ -4,9 +4,9 @@ allowed-tools: Bash(git:*), Bash(gh:*), Bash(jq:*), Bash(grep:*), Bash(awk:*), B
 argument-hint: [days] [--merge-develop] [--dry-run]
 ---
 
-You are running an on-demand triage of open pull requests for SmartInventory that have either gone quiet or drifted out of sync with `develop`.
+You are running an on-demand triage of open pull requests for SmartInventory that have either gone quiet or drifted out of sync with `main`.
 
-The command is **read-only on PR code by default**: it never modifies a PR's diff, never closes a PR, never re-triggers CI manually, and never merges a PR into `develop`. Without `--merge-develop` the only write is one triage comment per stale PR. With `--merge-develop` the additional write is `git merge --no-ff origin/develop` plus a push for each PR in the drift bucket that is not a draft — that push organically retriggers CI, which is the only intended CI side-effect. Repeated runs of `/stale-prs` MUST NOT spam duplicate comments on the same PR within the same UTC date — the Step 4 idempotency check is load-bearing.
+The command is **read-only on PR code by default**: it never modifies a PR's diff, never closes a PR, never re-triggers CI manually, and never merges a PR into `main`. Without `--merge-develop` the only write is one triage comment per stale PR. With `--merge-develop` the additional write is `git merge --no-ff origin/main` plus a push for each PR in the drift bucket that is not a draft — that push organically retriggers CI, which is the only intended CI side-effect. Repeated runs of `/stale-prs` MUST NOT spam duplicate comments on the same PR within the same UTC date — the Step 4 idempotency check is load-bearing.
 
 ## Language
 
@@ -17,11 +17,11 @@ All committed/published artifacts (commits, branch names, PR/issue titles and bo
 Argument grammar:
 
 - Positional, optional: a single positive integer `[days]` — the staleness threshold in calendar days. Default: `7`. Reject `0` or negative integers, non-integers, and more than one positional.
-- `--merge-develop` — boolean; when set, actually merge `origin/develop` into each drift-bucket PR's branch and push. Without this flag, the command is comment-only.
+- `--merge-develop` — boolean; when set, actually merge `origin/main` into each drift-bucket PR's branch and push. Without this flag, the command is comment-only.
 - `--dry-run` — boolean; print the intended actions to stdout but make **no** API calls and **no** `git push`. Under `--dry-run`, every state-changing call (comment post, branch checkout, merge, push) MUST be redirected to stdout as a `would …: …` line and skipped. The session lock file (if any) is NOT touched under `--dry-run`.
 - Reject unknown flags (anything starting with `--` not in the list above).
 
-`--merge-develop` and `--dry-run` may be combined; the combination prints `would merge develop into branch <head> for #<N>` per drift-bucket PR and posts no comments and runs no `git push`.
+`--merge-develop` and `--dry-run` may be combined; the combination prints `would merge main into branch <head> for #<N>` per drift-bucket PR and posts no comments and runs no `git push`.
 
 Worked examples:
 
@@ -33,16 +33,16 @@ Worked examples:
 /stale-prs 14 --merge-develop --dry-run → DAYS=14 MERGE_DEVELOP=true DRY_RUN=true
 ```
 
-## Step 1 — List open PRs targeting `develop`
+## Step 1 — List open PRs targeting `main`
 
-Enumerate every open PR with base `develop`:
+Enumerate every open PR with base `main`:
 
 ```
 mcp__github__list_pull_requests
   owner: berkayturanci
-  repo:  smartinventory
+  repo: ingreview
   state: OPEN
-  base:  develop
+  base:  main
   perPage: 100
 ```
 
@@ -69,7 +69,7 @@ mcp__github__pull_request_read
 
 Bucket assignment, in priority order (a PR that qualifies for multiple buckets goes into the highest-priority one):
 
-1. **Drift bucket** — `mergeStateStatus` is `BEHIND` or `DIRTY`. The PR's branch is behind `develop` (BEHIND) or has merge conflicts (DIRTY); a refresh is the unblocking action.
+1. **Drift bucket** — `mergeStateStatus` is `BEHIND` or `DIRTY`. The PR's branch is behind `main` (BEHIND) or has merge conflicts (DIRTY); a refresh is the unblocking action.
 2. **Review-stalled bucket** — `mergeStateStatus` is `CLEAN` or `HAS_HOOKS` AND no recent reviewer activity (no review, no PR-line comment, no `Reviewers requested` event inside the staleness window). The PR is technically mergeable but waiting on humans.
 3. **Likely-abandoned bucket** — `isDraft: true` AND the PR's age (from creation, not last activity) is greater than `2 × <DAYS>`. This is an informational flag only; see the Stop conditions — `/stale-prs` does NOT close abandoned PRs.
 
@@ -98,7 +98,7 @@ STALE-PRS-<DATE>-<UTC_TIMESTAMP>
 ### Suggested action
 
 <one of:>
-- Drift: `git fetch origin develop && git merge --no-ff origin/develop` on `<headRefName>`, resolve any conflicts, push. Or re-run `/stale-prs --merge-develop` and the orchestrator will attempt the auto-merge.
+- Drift: `git fetch origin main && git merge --no-ff origin/main` on `<headRefName>`, resolve any conflicts, push. Or re-run `/stale-prs --merge-develop` and the orchestrator will attempt the auto-merge.
 - Review-stalled: ping reviewer `@<reviewer-login>` for re-review, or request a fresh reviewer if the original is unavailable.
 - Likely-abandoned: no activity in <age> days on a draft — consider whether the work is still needed; this is an informational flag only, the PR will not be closed by automation.
 ```
@@ -128,7 +128,7 @@ Filter comment bodies that start with `STALE-PRS-<DATE>-`. The codename header (
   ```
   mcp__github__add_issue_comment
     owner:        berkayturanci
-    repo:         smartinventory
+    repo: ingreview
     issue_number: <N>           # PR number — GitHub treats PRs as issues for comment APIs
     body:         <BODY>
   ```
@@ -142,17 +142,17 @@ Skip this step entirely when `--merge-develop` is not set.
 
 When the flag is set: for each PR in the **drift bucket** that is NOT a draft (drafts are skipped to avoid pushing work-in-progress branches that the author may be rebasing), the implementer-style helper performs the refresh.
 
-The mechanical flow MUST mirror `/ship` Step 5f.0 — that step is the precedent for "merge `develop` into the PR branch with the same conflict heuristics" inside this codebase, and `/stale-prs` does not reinvent the conflict-resolution heuristic. Concretely, for each drift-bucket non-draft PR:
+The mechanical flow MUST mirror `/ship` Step 5f.0 — that step is the precedent for "merge `main` into the PR branch with the same conflict heuristics" inside this codebase, and `/stale-prs` does not reinvent the conflict-resolution heuristic. Concretely, for each drift-bucket non-draft PR:
 
 1. Fetch the PR's head branch:
    ```bash
    git fetch origin "<headRefName>" --quiet
    git checkout -B "stale-prs/<headRefName>" "origin/<headRefName>"
    ```
-2. Merge `origin/develop`:
+2. Merge `origin/main`:
    ```bash
-   git fetch origin develop --quiet
-   git merge --no-ff origin/develop -m "merge: refresh <headRefName> with develop (via /stale-prs)"
+   git fetch origin main --quiet
+   git merge --no-ff origin/main -m "merge: refresh <headRefName> with main (via /stale-prs)"
    ```
 3. Conflict handling — straightforward conflicts only, per `/ship` Step 5f.0:
    - If `git merge` exits 0, push:
@@ -171,7 +171,7 @@ The mechanical flow MUST mirror `/ship` Step 5f.0 — that step is the precedent
    git branch -D "stale-prs/<headRefName>" --quiet
    ```
 
-Under `--dry-run`: print `would merge develop into branch <headRefName> for #<N>` to stdout per drift-bucket non-draft PR; perform no `git fetch`/`checkout`/`merge`/`push` mutations.
+Under `--dry-run`: print `would merge main into branch <headRefName> for #<N>` to stdout per drift-bucket non-draft PR; perform no `git fetch`/`checkout`/`merge`/`push` mutations.
 
 Per-PR failures (auth `403` on push, network drop on fetch, merge driver crash) MUST NOT abort the run for other PRs. Capture the failure as `action: error-skipped — <one-line reason>` in the summary and continue to the next PR.
 
@@ -209,7 +209,7 @@ Under `--dry-run`: still write the local report file (it is local-only and infor
 - **Per-PR errors must not abort the run.** Auth failures, push 403s, network drops, merge driver crashes — each is recorded in the summary as `error-skipped — <reason>` and the loop continues to the next PR.
 - **Same-day idempotency.** Step 4's prefix dedupe MUST be honoured; re-running `/stale-prs` on the same UTC-project date must not post duplicate comments on the same PR.
 - **No silent dry-run mutations.** Under `--dry-run`, every state-changing call (comment post, branch checkout, merge, push) MUST be redirected to stdout as a `would …: …` line and skipped. The session lock file (if any) is NOT touched.
-- **Never modify the PR's tree contents** beyond the merge commit that brings in `origin/develop`. No file edits, no formatter passes, no auto-fix attempts.
+- **Never modify the PR's tree contents** beyond the merge commit that brings in `origin/main`. No file edits, no formatter passes, no auto-fix attempts.
 
 ## Prerequisites
 
@@ -228,7 +228,7 @@ Under `--dry-run`: still write the local report file (it is local-only and infor
 /stale-prs --dry-run             # show what would happen, no writes
 ```
 
-- `/stale-prs` — default sweep: every open PR against `develop` whose last activity was more than 7 days ago gets bucketed and a triage comment with the author mention.
+- `/stale-prs` — default sweep: every open PR against `main` whose last activity was more than 7 days ago gets bucketed and a triage comment with the author mention.
 - `/stale-prs 14` — quieter sweep; useful for a fortnightly tidy when the 7-day cadence is too chatty.
-- `/stale-prs 7 --merge-develop` — same triage plus an auto-`git merge --no-ff origin/develop` and push for each drift-bucket non-draft PR. Conflicts are skipped (recorded as `conflict-skipped`); the natural `git push` retriggers CI for the refreshed branch.
+- `/stale-prs 7 --merge-develop` — same triage plus an auto-`git merge --no-ff origin/main` and push for each drift-bucket non-draft PR. Conflicts are skipped (recorded as `conflict-skipped`); the natural `git push` retriggers CI for the refreshed branch.
 - `/stale-prs --dry-run` — full computation, no GitHub writes, no `git push`. Use this to sanity-check bucket assignments before letting the comment stream land on teammates' PRs.
