@@ -1,7 +1,7 @@
 ---
 description: End-to-end issue ship — branch, PR, self-review, CI, N parallel reviewers, time-windowed merge, issue close. UTC+3 07:00–01:30 merge window (night no-merge window 01:30–07:00).
 allowed-tools: Bash(gh:*), Bash(git:*), Bash(date:*), Bash(./gradlew:*), Bash(./scripts/compound-learning.sh:*), Bash(mkdir:*), Bash(rmdir:*), Bash(rm:*), Bash(cat:*), Bash(test:*), Bash(sleep:*), Bash(seq:*), Bash(timeout:*), Bash(gtimeout:*), Bash(kill:*), Bash(printf:*), Bash(echo:*), Bash(grep:*), Bash(sed:*), Read, Edit, Write, Agent, mcp__github__issue_read, mcp__github__issue_write, mcp__github__list_issues, mcp__github__search_issues, mcp__github__add_issue_comment, mcp__github__pull_request_read, mcp__github__list_pull_requests, mcp__github__search_pull_requests, mcp__github__get_file_contents, mcp__github__list_commits, mcp__github__get_commit, mcp__github__list_branches, mcp__github__get_label, mcp__github__create_pull_request, mcp__github__update_pull_request, mcp__github__push_files, mcp__github__add_reply_to_pull_request_comment, mcp__github__pull_request_review_write, mcp__github__enable_pr_auto_merge, mcp__github__merge_pull_request, mcp__github__update_pull_request_branch, mcp__github__subscribe_pr_activity
-argument-hint: [issue numbers...] [--reviewers N] [--blocker] [--dry-run]
+argument-hint: [issue numbers...] [--reviewers N] [--blocker] [--dry-run] [--preview]
 ---
 
 You are the SmartInventory end-to-end shipping orchestrator. Drive each GitHub issue from `status:backlog` to `status:done` (merged + closed) through the full lifecycle in `AGENTS.md` § "Standard Issue Lifecycle".
@@ -71,6 +71,7 @@ Argument grammar:
 - `--reviewers <N>` ⇒ consumes exactly one integer immediately after the flag. Valid: `1`, `2`, `3`. Default: `auto` (reviewer count is determined automatically at Step 5a.2 after the diff is known). Reject any other value with an error.
 - `--blocker` ⇒ boolean flag; treat every queued issue as blocker (human override).
 - `--dry-run` ⇒ boolean flag; perform every read but redirect every state-changing GitHub call (`gh pr comment`, `gh pr merge`, `gh pr ready`, `gh issue close`, `gh issue comment`, label edits) to stdout as `DRY-RUN: <command>` lines. Implementer subagent is also instructed to honour dry-run (no push, no PR open).
+- `--preview` ⇒ boolean flag; after the PR is opened, add the `deploy:preview` label so the Firebase Hosting preview channel is deployed. Without this flag no preview channel is deployed (opt-in, per CI change #1315). Also skipped under `--dry-run` (logged to stdout).
 
 Flags and their value MUST appear together; positional integers are everything not consumed by a flag. Worked examples:
 
@@ -80,6 +81,7 @@ Flags and their value MUST appear together; positional integers are everything n
 /ship --reviewers 2 42     → ISSUES=[42]                REVIEWERS=2
 /ship 42 --reviewers 2 56  → ISSUES=[42,56]             REVIEWERS=2
 /ship --dry-run 42         → ISSUES=[42]                REVIEWERS=auto   DRY_RUN=true
+/ship --preview 42         → ISSUES=[42]                REVIEWERS=auto   PREVIEW=true
 /ship                      → ISSUES=[] (watch mode)     REVIEWERS=auto (resolved per-issue at Step 5a.2)
 ```
 
@@ -287,6 +289,7 @@ Spawn the chosen subagent with the same prompt block as `/implement` Step 5, plu
   ```
   Orchestrator parses this JSON via `jq` for Step 5a.1 / 5f.0 consumption. Free-text in the response above the JSON block is fine (human-readable summary); the JSON envelope is the machine-readable contract. `worktree_path` MUST be an absolute path (the same one passed to `git worktree add`)."
 - If `--dry-run`: "Do NOT push, do NOT open a PR. Return the diff and intended PR title/body. Orchestrator will skip subsequent steps."
+- If `--preview`: after the PR is opened (and not under `--dry-run`), add the `deploy:preview` label via `gh pr edit <PR> --add-label deploy:preview`. This triggers the Firebase Hosting preview channel workflow. Under `--dry-run`, log `DRY-RUN: gh pr edit <PR> --add-label deploy:preview` to stdout instead.
 
 If `--dry-run` is set, after the implementer returns the dry-run diff, log it and skip 5b–5f.
 
@@ -297,14 +300,21 @@ When issue labels include `delegate:codex`:
 1. Generate codename `CODEX-<N>-<UTC_TIMESTAMP>`.
 2. Post the agent-start comment and flip labels (`status:backlog` → `status:in-progress`), same as the default path (skip under `--dry-run`).
 3. Build the task prompt string from the issue title + body + the standard implementation brief (worktree isolation, branch-from-develop, `Closes #<N>`, scope-check, JSON return contract). Include the full JSON schema at the end of the prompt so Codex emits it in its final response.
-4. Invoke Codex from the project root:
+4. Invoke Codex from the project root. Write the prompt to a temp file and pipe via stdin — passing the prompt as a positional argument causes Codex to hang waiting for additional stdin. Use `-s danger-full-access` so `gh` CLI can reach `api.github.com`; the default `sandbox = "workspace-write"` in `~/.codex/config.toml` blocks outbound HTTP to GitHub's API:
    ```bash
-   codex exec "<task prompt>"
+   # Use $CLAUDE_JOB_DIR in background sessions to avoid /tmp collisions across parallel jobs
+   PROMPT_FILE="$CLAUDE_JOB_DIR/codex-prompt-<N>.txt"
+   cat > "$PROMPT_FILE" << 'CODEX_PROMPT'
+   <task prompt>
+   CODEX_PROMPT
+
+   codex exec -s danger-full-access < "$PROMPT_FILE"
    ```
-   Codex auto-applies `approval = "never"` and `sandbox = "workspace-write"` from `~/.codex/config.toml`; no extra flags are needed. The `.codex/hooks.json` PreToolUse hook is the primary command-level security guard (reads `.claude/settings.json` deny list and blocks matching commands before execution).
+   `approval = "never"` is already set in `~/.codex/config.toml`; no extra flag needed. Do NOT use `--full-auto` (implies `workspace-write` sandbox, which blocks `gh` API calls). The `.codex/hooks.json` PreToolUse hook is the primary command-level security guard (reads `.claude/settings.json` deny list and blocks matching commands before execution).
 5. Parse the JSON code-fence from Codex's stdout — same schema as the default-path JSON contract (`pr_number`, `branch`, `files_changed`, `test_results`, `codename`, `worktree_path`). All downstream steps (5a.1 scope gate, 5b CI, 5f merge) operate on this JSON identically to the default path.
 6. **Unavailability / error fallback:** if `codex` is not installed (`command -v codex` exits non-zero) or exits non-zero with no parseable JSON block: fall back to the default Claude subagent path. Log `ship: codex unavailable or errored, fell back to android-developer/web-developer`.
 7. **`--dry-run`:** include `"Do NOT push, do NOT open a PR. Return the diff and intended PR title/body."` in the task prompt. After Codex returns, log and skip 5b–5f as with the default path.
+8. **`--preview`:** after parsing the JSON contract from Codex's stdout (step 5), the orchestrator adds `deploy:preview` to the PR via `gh pr edit <pr_number> --add-label deploy:preview`. Under `--dry-run`, log to stdout instead. Codex itself does not need to know about `--preview`.
 
 ### 5a.agy — Antigravity CLI delegation path
 
@@ -313,19 +323,25 @@ When issue labels include `delegate:agy`:
 1. Generate codename `AGY-<N>-<UTC_TIMESTAMP>`.
 2. Post the agent-start comment and flip labels, same as the default path (skip under `--dry-run`).
 3. Build the task prompt string (same as the Codex path — full issue brief + JSON return schema at end).
-4. Invoke agy via the shell alias (which applies `--dangerously-skip-permissions`):
+4. Invoke agy by writing the prompt to a temp file and piping via stdin — passing the prompt as a `--print` argument causes the same stdin-hang issue as Codex. The `agy` shell alias (`agy --dangerously-skip-permissions`) is only available in interactive shells; use `bash -i` to inherit it, or invoke the binary directly:
    ```bash
-   agy --print "<task prompt>"
-   ```
-   If the shell alias is not in scope, invoke directly:
-   ```bash
-   agy --dangerously-skip-permissions --print "<task prompt>"
+   PROMPT_FILE="$CLAUDE_JOB_DIR/agy-prompt-<N>.txt"
+   cat > "$PROMPT_FILE" << 'AGY_PROMPT'
+   <task prompt>
+   AGY_PROMPT
+
+   # Preferred: bash -i inherits the agy alias
+   bash -i -c "agy --print - < '$PROMPT_FILE'"
+
+   # Fallback if alias not available:
+   # /Users/berkayturanci/.local/bin/agy --dangerously-skip-permissions --print - < "$PROMPT_FILE"
    ```
    Security guard: `~/.gemini/antigravity-cli/settings.json` `permissions.deny` list blocks destructive commands. See `docs/claude-code-global-setup.md` § Antigravity CLI for the full deny list.
 5. Parse the JSON code-fence from stdout — same schema as the default-path JSON contract. All downstream steps operate on this JSON identically to the default path.
 6. **Quota fallback (HTTP 429 / RESOURCE_EXHAUSTED):** if agy exits with a 429 error, fall back to the default Claude subagent path immediately — do NOT retry (quota reset takes ~62 hours). Log `ship: agy quota exhausted (429), fell back to android-developer/web-developer`.
 7. **Availability fallback:** if `agy` is not installed, fall back to the default Claude subagent path. Log `ship: agy unavailable, fell back to android-developer/web-developer`.
 8. **`--dry-run`:** same as Codex path — include dry-run semantics in the task prompt and skip 5b–5f after agy returns.
+9. **`--preview`:** same as Codex path — after parsing the JSON contract from agy's stdout (step 5), the orchestrator adds `deploy:preview` to the PR. Under `--dry-run`, log to stdout instead.
 
 ### 5a.1 — Branch scope validation gate
 
