@@ -90,6 +90,22 @@ Reject:
 - `--reviewers` without an integer immediately following.
 - Negative or zero positional integers.
 
+**CLI delegation (label-based, not a flag):** add `delegate:codex` or `delegate:agy` to the issue before running `/ship`. The label is detected at Step 5a; the argument grammar is unchanged.
+
+```
+# Issue #42 has label delegate:codex → Codex CLI handles implementation
+/ship 42                   → Step 5a routes to codex exec "<prompt>"
+
+# Issue #56 has label delegate:agy  → Antigravity CLI handles implementation
+/ship 56                   → Step 5a routes to agy --print "<prompt>"
+
+# No delegation label → default Claude subagent (android-developer / web-developer)
+/ship 99                   → Step 5a spawns the matching Claude subagent
+
+# Fallback: if codex is unavailable or quota exhausted on agy, /ship falls
+#            back to the default Claude subagent and logs the reason.
+```
+
 ## Step 1 — Time-window detect
 
 ```bash
