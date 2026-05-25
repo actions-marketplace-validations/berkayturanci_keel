@@ -110,6 +110,38 @@ When BLOCKERS or SUGGESTIONS need addressing:
 - Per #691 (marker-enforcement layer), v2 S5 inherits the v1 Step 5g **Marker contract** verbatim — see `.claude/commands/ship.md` § "Step 5g → Marker contract". Every PR that reaches S5 MUST emit either the canonical 3-line success-path marker set (`bundler_exit` / `classifier` / `apply`) or exactly one of the canonical skip markers (`dry-run` / `deferred` / `merge-failed` / `compound-of-compound` / `no-classifier-available`). The v1 Step 6 session-end verifier (see `.claude/commands/ship.md` § "Step 6") applies to v2 sessions unchanged; a missing marker for any merged PR flips the session to `status:blocked`. Closed skip vocabulary, marker shapes, and the optional JSON-line emission are all inherited from v1's Marker contract — do NOT paraphrase the strings; the verifier greps for them verbatim.
 - Session-report row records `Classifier = plugin` (the inline-prompt path is not reachable under v2). The corresponding `classifier=plugin` marker line is required regardless.
 
+### Post-merge worktree cleanup (v2 addition to Step 5f.1 point 3)
+
+After `gh pr merge` returns success and `POST_MERGE_STATE == MERGED` (Step 5f.1 point 3), and **before** the closure comment (point 4), run a post-merge worktree removal as a safety-net complement to the pre-merge cleanup in Step 5f.0 step 4.5:
+
+```bash
+# Step 5f.1 post-merge worktree cleanup (v2 addition — safety-net for worktrees
+# that survived pre-merge cleanup, e.g. when worktree_path was absent at that time).
+WORKTREE_PATH=$(echo "$IMPLEMENTER_RETURN_JSON" | jq -r '.worktree_path // empty')
+
+if [[ -z "$WORKTREE_PATH" ]]; then
+  echo "[5f.1-post-merge] worktree cleanup: skipped (no worktree_path in implementer return)"
+elif [[ ! -d "$WORKTREE_PATH" ]]; then
+  echo "[5f.1-post-merge] worktree cleanup: already-gone ($WORKTREE_PATH)"
+elif git worktree list --porcelain | grep -qE "^worktree $WORKTREE_PATH$"; then
+  git worktree remove "$WORKTREE_PATH" --force \
+    && echo "[5f.1-post-merge] worktree cleanup: removed $WORKTREE_PATH" \
+    || echo "[5f.1-post-merge] worktree cleanup: remove failed — continuing (non-fatal)"
+else
+  echo "[5f.1-post-merge] worktree cleanup: skipped (not a registered worktree)"
+fi
+```
+
+This step is **non-fatal**: any failure logs to stdout but MUST NOT abort the closure block (points 4–6 execute regardless). Logged outcomes:
+
+- `removed <path>` — worktree was present and removed.
+- `already-gone` — path no longer exists; no-op.
+- `skipped (no worktree_path)` — implementer return JSON had no `worktree_path` field.
+- `skipped (not a registered worktree)` — path exists but is not in `git worktree list`; skipped to avoid removing unrelated directories.
+- `remove failed — continuing (non-fatal)` — `git worktree remove` exited non-zero; logged and suppressed.
+
+The pre-merge cleanup (Step 5f.0 step 4.5) remains the primary mechanism — it runs before `--delete-branch` so the branch ref is not held by a local worktree. This post-merge step is the fallback.
+
 ## Steps NOT changed by v2
 
 All of the following carry over from `/ship` (v1) **verbatim**, with no v2-specific behavior:
@@ -124,7 +156,7 @@ All of the following carry over from `/ship` (v1) **verbatim**, with no v2-speci
 - Step 5b (CI gate, docs-only allowlist, per-issue retry budget = 3, session-wide cooldown = 3)
 - Step 5e.bis (tester gate semantics; `status:done` set only at merge time)
 - Step 5f.0 (mergeability prep, BEHIND/DIRTY resolution, max 2 re-merge iterations)
-- Step 5f.1 (merge lock, defensive window re-check, single-`bash -c` block invariant, closure-comment on both issue and PR, `status:done` transition)
+- Step 5f.1 (merge lock, defensive window re-check, single-`bash -c` block invariant, closure-comment on both issue and PR, `status:done` transition) — **v2 inserts a post-merge worktree cleanup after point 3 (before the closure comment); see § "Post-merge worktree cleanup (v2 addition to Step 5f.1 point 3)"**
 - All Stop conditions
 - All Safety invariants (including the compound Rule PR window-bypass carve-out and review/tester skip for compound Rule PRs — these belong to Step 5g, which v2 reuses unchanged via S5)
 
