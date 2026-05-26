@@ -300,7 +300,7 @@ When issue labels include `delegate:codex`:
 1. Generate codename `CODEX-<N>-<UTC_TIMESTAMP>`.
 2. Post the agent-start comment and flip labels (`status:backlog` → `status:in-progress`), same as the default path (skip under `--dry-run`).
 3. Build the task prompt string from the issue title + body + the standard implementation brief (worktree isolation, branch-from-develop, `Closes #<N>`, scope-check, JSON return contract). Include the full JSON schema at the end of the prompt so Codex emits it in its final response.
-4. Invoke Codex from the project root. Write the prompt to a temp file and pipe via stdin — passing the prompt as a positional argument causes Codex to hang waiting for additional stdin. Use `-s danger-full-access` so `gh` CLI can reach `api.github.com`; the default `sandbox = "workspace-write"` in `~/.codex/config.toml` blocks outbound HTTP to GitHub's API:
+4. Invoke Codex from the project root. Write the prompt to a temp file and pipe via stdin — passing the prompt as a positional argument causes Codex to hang waiting for additional stdin. Use `-s danger-full-access` so `gh` CLI can reach `api.github.com`; the default `sandbox = "workspace-write"` in `~/.codex/config.toml` blocks outbound HTTP to GitHub's API. If the issue has a `delegate-model:<name>` label, extract `<name>` and pass `-c model=<name>` to override the model for this run:
    ```bash
    # Use $CLAUDE_JOB_DIR in background sessions to avoid /tmp collisions across parallel jobs
    PROMPT_FILE="$CLAUDE_JOB_DIR/codex-prompt-<N>.txt"
@@ -308,7 +308,12 @@ When issue labels include `delegate:codex`:
    <task prompt>
    CODEX_PROMPT
 
-   codex exec -s danger-full-access < "$PROMPT_FILE"
+   # Read delegate-model:<name> label if present (e.g. delegate-model:o4-mini)
+   MODEL_FLAG=""
+   DELEGATE_MODEL=$(gh issue view <N> --json labels --jq '.labels[].name | select(startswith("delegate-model:"))' | head -1 | sed 's/delegate-model://')
+   [ -n "$DELEGATE_MODEL" ] && MODEL_FLAG="-c model=$DELEGATE_MODEL"
+
+   codex exec -s danger-full-access $MODEL_FLAG < "$PROMPT_FILE"
    ```
    `approval = "never"` is already set in `~/.codex/config.toml`; no extra flag needed. Do NOT use `--full-auto` (implies `workspace-write` sandbox, which blocks `gh` API calls). The `.codex/hooks.json` PreToolUse hook is the primary command-level security guard (reads `.claude/settings.json` deny list and blocks matching commands before execution).
 5. Parse the JSON code-fence from Codex's stdout — same schema as the default-path JSON contract (`pr_number`, `branch`, `files_changed`, `test_results`, `codename`, `worktree_path`). All downstream steps (5a.1 scope gate, 5b CI, 5f merge) operate on this JSON identically to the default path.
@@ -323,20 +328,18 @@ When issue labels include `delegate:agy`:
 1. Generate codename `AGY-<N>-<UTC_TIMESTAMP>`.
 2. Post the agent-start comment and flip labels, same as the default path (skip under `--dry-run`).
 3. Build the task prompt string (same as the Codex path — full issue brief + JSON return schema at end).
-4. Invoke agy by writing the prompt to a temp file and piping via stdin — passing the prompt as a `--print` argument causes the same stdin-hang issue as Codex. The `agy` shell alias (`agy --dangerously-skip-permissions`) is only available in interactive shells; use `bash -i` to inherit it, or invoke the binary directly:
+4. Invoke agy by writing the prompt to a temp file and piping via stdin. The `agy` shell alias is only available in interactive shells — Claude Code subprocesses don't inherit it. Use the full binary path directly. Do NOT pass `--sandbox` (blocks network/terminal tools). Set `--print-timeout 90m` — the default 5m is too short for implementation tasks:
    ```bash
    PROMPT_FILE="$CLAUDE_JOB_DIR/agy-prompt-<N>.txt"
    cat > "$PROMPT_FILE" << 'AGY_PROMPT'
    <task prompt>
    AGY_PROMPT
 
-   # Preferred: bash -i inherits the agy alias
-   bash -i -c "agy --print - < '$PROMPT_FILE'"
-
-   # Fallback if alias not available:
-   # /Users/berkayturanci/.local/bin/agy --dangerously-skip-permissions --print - < "$PROMPT_FILE"
+   /Users/berkayturanci/.local/bin/agy --dangerously-skip-permissions --print --print-timeout 90m - < "$PROMPT_FILE"
    ```
    Security guard: `~/.gemini/antigravity-cli/settings.json` `permissions.deny` list blocks destructive commands. See `docs/claude-code-global-setup.md` § Antigravity CLI for the full deny list.
+
+   **Model configuration:** agy has no `--model` CLI flag. Model is controlled by the `"model"` field in `~/.gemini/antigravity-cli/settings.json`. Recommended default: `"gemini-1.5-flash-001"` (Gemini Flash — significantly faster than `"GPT-OSS 120B (Medium)"` which caused 32+ minute waits). Edit `settings.json` directly before running `/ship` to change the model; there is no per-run CLI override.
 5. Parse the JSON code-fence from stdout — same schema as the default-path JSON contract. All downstream steps operate on this JSON identically to the default path.
 6. **Quota fallback (HTTP 429 / RESOURCE_EXHAUSTED):** if agy exits with a 429 error, fall back to the default Claude subagent path immediately — do NOT retry (quota reset takes ~62 hours). Log `ship: agy quota exhausted (429), fell back to android-developer/web-developer`.
 7. **Availability fallback:** if `agy` is not installed, fall back to the default Claude subagent path. Log `ship: agy unavailable, fell back to android-developer/web-developer`.
