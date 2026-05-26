@@ -170,6 +170,69 @@ Verify the path with `which agy` on your machine before applying.
 
 After editing `~/.zshrc`, run `source ~/.zshrc` to activate.
 
+## Non-interactive subprocess invocation
+
+When Claude Code (or any orchestrator) calls Codex or agy as a subprocess — e.g. from
+`/ship` Step 5a — interactive shell aliases and TTY-detection defaults break. Use the
+confirmed-working patterns below.
+
+### Codex
+
+```bash
+# Write prompt to a file — positional arg causes Codex to hang waiting for stdin
+PROMPT_FILE="$CLAUDE_JOB_DIR/codex-prompt-<N>.txt"
+cat > "$PROMPT_FILE" << 'EOF'
+<task prompt>
+EOF
+
+codex exec -s danger-full-access < "$PROMPT_FILE"
+```
+
+Key flags:
+- **`-s danger-full-access`** — required so `gh` CLI can reach `api.github.com`. The default `sandbox = "workspace-write"` in `~/.codex/config.toml` blocks outbound HTTP to GitHub's API.
+- **Stdin pipe, not positional arg** — passing the prompt as a positional argument causes Codex to hang waiting for additional stdin.
+- **`approval = "never"`** is set globally in `~/.codex/config.toml`; no extra flag needed.
+- Do NOT use `--full-auto` (implies `workspace-write` sandbox, which blocks `gh` API calls).
+
+**Model override:** Codex accepts `-c model=<name>` to override the model for a single run:
+
+```bash
+codex exec -s danger-full-access -c model=o4-mini < "$PROMPT_FILE"
+```
+
+In `/ship`, the orchestrator reads a `delegate-model:<name>` label from the issue and passes it as `-c model=<name>` when invoking Codex. Example: add both `delegate:codex` and `delegate-model:o4-mini` to an issue to use o4-mini for that run.
+
+### Antigravity (agy)
+
+```bash
+# Write prompt to a file — stdin pipe required
+PROMPT_FILE="$CLAUDE_JOB_DIR/agy-prompt-<N>.txt"
+cat > "$PROMPT_FILE" << 'EOF'
+<task prompt>
+EOF
+
+/Users/berkayturanci/.local/bin/agy --dangerously-skip-permissions --print --print-timeout 90m - < "$PROMPT_FILE"
+```
+
+Key flags:
+- **Full binary path** — the `agy` alias is only available in interactive shells; Claude Code subprocesses don't inherit shell aliases.
+- **`--dangerously-skip-permissions`** — disables interactive permission prompts. Security guard is the `permissions.deny` list in `~/.gemini/antigravity-cli/settings.json`.
+- **`--print-timeout 90m`** — default 5 minutes is too short for implementation tasks.
+- **`-` as the prompt arg** — tells agy to read the prompt from stdin.
+- Do NOT pass `--sandbox` — it blocks network and terminal tools.
+
+**Model configuration:** agy has no `--model` CLI flag. Model is set via `~/.gemini/antigravity-cli/settings.json`:
+
+```json
+{
+  "model": "gemini-1.5-flash-001"
+}
+```
+
+Recommended default: `gemini-1.5-flash-001` (Gemini Flash — significantly faster than GPT-OSS 120B Medium, which caused 32+ minute waits). To change the model, edit `settings.json` directly before running `/ship`.
+
+**Verified (2026-05-26):** `--dangerously-skip-permissions` bypass (`AGY_INVOCATION_TEST_OK`), Flash model (`FLASH_MODEL_TEST_OK`), full `/ship` delegation (issue #735 via `delegate:agy`).
+
 ## What NOT to migrate
 
 Keep the following in the gitignored `.claude/settings.local.json` rather than promoting
