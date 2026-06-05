@@ -1,0 +1,68 @@
+name: keel-ship
+
+# Run keel against real PRs on GitHub's free hosted runner. The runner already has
+# git + an authenticated gh (GITHUB_TOKEN), so `keel ship` can read the diff and the
+# PR's CI status, post its assessment as a comment, and gate the merge on the decision.
+#
+# Consumers copy this workflow and swap `pip install -e .` for a pinned keel install
+# (`pip install "git+https://github.com/berkayturanci/keel@v0.1.0"`) and the config path
+# for their own `.keel/project.yaml`.
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to assess (optional)"
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ship:
+    name: keel ship (assessment)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so keel can diff against the base branch
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install keel plus dev tools (ruff, coverage)
+        run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - name: Make base branch available locally
+        env:
+          BASE: ${{ github.base_ref || 'main' }}
+        run: git fetch --no-tags origin "$BASE:$BASE" || true
+      - name: Run keel ship (informational)
+        id: ship
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+        run: |
+          set +e
+          ARGS="projects/keel.yaml --root ."
+          if [ -n "$PR" ]; then ARGS="$ARGS --pr $PR"; fi
+          keel ship $ARGS | tee ship.txt
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          { echo '### 🚢 keel ship'; echo '```'; cat ship.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment assessment on the PR
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          CODE: ${{ steps.ship.outputs.code }}
+        run: |
+          {
+            echo '### 🚢 keel ship'
+            echo
+            echo '```'
+            cat ship.txt
+            echo '```'
+            echo
+            echo "_decision exit code: ${CODE} (0 = not BLOCK). Informational — not a required gate._"
+          } > body.md
+          gh pr comment "$PR" --body-file body.md
