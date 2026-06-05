@@ -1,0 +1,245 @@
+"""Unit tests for the keel CLI."""
+
+import contextlib
+import io
+import unittest
+from pathlib import Path
+
+from keel import cli
+
+PROJECTS = Path(__file__).resolve().parent.parent / "projects"
+REPO_ROOT = PROJECTS.parent
+
+
+def run(argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = cli.main(argv)
+    return rc, out.getvalue(), err.getvalue()
+
+
+class TestVersion(unittest.TestCase):
+    def test_version_subcommand(self):
+        rc, out, _ = run(["version"])
+        self.assertEqual(rc, 0)
+        self.assertIn("keel", out)
+
+
+class TestNoCommand(unittest.TestCase):
+    def test_prints_help_and_returns_2(self):
+        rc, out, _ = run([])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage", out.lower())
+
+
+class TestValidate(unittest.TestCase):
+    def test_valid_configs(self):
+        rc, out, _ = run(["validate", str(PROJECTS / "keel.yaml"),
+                          str(PROJECTS / "smartinventory.yaml")])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count("OK"), 2)
+
+    def test_missing_file(self):
+        rc, out, _ = run(["validate", str(PROJECTS / "nope.yaml")])
+        self.assertEqual(rc, 1)
+        self.assertIn("MISSING", out)
+
+    def test_invalid_config(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write("extends: keel\n")  # missing required keys
+            bad = f.name
+        rc, out, _ = run(["validate", bad])
+        self.assertEqual(rc, 1)
+        self.assertIn("INVALID", out)
+
+    def test_strict_extensions_missing_root(self):
+        # ingreview references extension files not present in this repo -> strict fail.
+        rc, out, _ = run(["validate", str(PROJECTS / "ingreview.yaml"), "--root", str(REPO_ROOT)])
+        self.assertEqual(rc, 1)
+        self.assertIn("extensions", out)
+
+
+class TestPlan(unittest.TestCase):
+    def test_plan_renders_backbone(self):
+        rc, out, err = run(
+            ["plan", str(PROJECTS / "smartinventory.yaml"), "--root", str(REPO_ROOT)]
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("s10  merge", out)
+        self.assertIn("gate: build", out)
+
+    def test_plan_missing_config(self):
+        rc, _, err = run(["plan", str(PROJECTS / "nope.yaml")])
+        self.assertEqual(rc, 1)
+        self.assertIn("no such config", err)
+
+    def test_plan_reports_extension_problems_on_stderr(self):
+        # ingreview's extension files are not in this repo -> fail-soft warnings.
+        rc, out, err = run(["plan", str(PROJECTS / "ingreview.yaml"), "--root", str(REPO_ROOT)])
+        self.assertEqual(rc, 0)
+        self.assertIn("extension not loaded", err)
+
+    def test_plan_invalid_config(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write("extends: keel\n")
+            bad = f.name
+        rc, _, err = run(["plan", bad])
+        self.assertEqual(rc, 1)
+        self.assertIn("invalid keel config", err)
+
+
+def _write_raw(text):
+    import tempfile
+    fd = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    fd.write(text)
+    fd.close()
+    return fd.name
+
+
+def _write_config(build_cmd):
+    return _write_raw(
+        "extends: keel\ncore_version: '^0.1'\nbase_branch: main\n"
+        f"repo: tmp\ngates: [build]\nknobs:\n  build_gate_cmd: {build_cmd}\n"
+    )
+
+
+class TestRunGates(unittest.TestCase):
+    def test_passing_gate(self):
+        rc, out, _ = run(["run-gates", _write_config("'true'"), "--root", "."])
+        self.assertEqual(rc, 0)
+        self.assertIn("ok", out)
+        self.assertIn("build", out)
+
+    def test_failing_gate_blocks(self):
+        rc, out, _ = run(["run-gates", _write_config("'false'"), "--root", "."])
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL", out)
+        self.assertIn("BLOCKED", out)
+
+    def test_missing_config(self):
+        rc, _, err = run(["run-gates", "/no/such.yaml"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no such config", err)
+
+    def test_invalid_config(self):
+        rc, _, err = run(["run-gates", _write_raw("extends: keel\n")])
+        self.assertEqual(rc, 1)
+        self.assertIn("invalid keel config", err)
+
+    def test_unknown_builtin_gate(self):
+        p = _write_raw("extends: keel\ncore_version: '^0.1'\nbase_branch: main\n"
+                       "repo: x\ngates: [bogus]\nknobs:\n  build_gate_cmd: 'true'\n")
+        rc, _, err = run(["run-gates", p])
+        self.assertEqual(rc, 1)
+        self.assertIn("unknown built-in gate", err)
+
+    def test_reports_extension_problem(self):
+        p = _write_raw("extends: keel\ncore_version: '^0.1'\nbase_branch: main\nrepo: x\n"
+                       "gates: [build]\nknobs:\n  build_gate_cmd: 'true'\n"
+                       "extensions:\n  tester: [ghost.md]\nextensions_dir: .keel/extensions\n")
+        rc, out, err = run(["run-gates", p, "--root", "/tmp"])
+        self.assertEqual(rc, 0)
+        self.assertIn("extension not loaded", err)
+
+
+class TestPlanErrors(unittest.TestCase):
+    def test_plan_unknown_builtin_gate(self):
+        p = _write_raw("extends: keel\ncore_version: '^0.1'\nbase_branch: main\n"
+                       "repo: x\ngates: [bogus]\nknobs:\n  build_gate_cmd: 'true'\n")
+        rc, _, err = run(["plan", p])
+        self.assertEqual(rc, 1)
+        self.assertIn("unknown built-in gate", err)
+
+    def test_plan_invalid_config(self):
+        rc, _, err = run(["plan", _write_raw("extends: keel\n")])
+        self.assertEqual(rc, 1)
+        self.assertIn("invalid keel config", err)
+
+
+class TestWindow(unittest.TestCase):
+    def test_configured(self):
+        rc, out, _ = run(["window", str(PROJECTS / "smartinventory.yaml")])
+        self.assertEqual(rc, 0)
+        self.assertIn("merge window", out)
+        self.assertIn("Etc/GMT-3", out)
+
+    def test_not_configured(self):
+        p = _write_raw("extends: keel\ncore_version: '^0.1'\nbase_branch: main\n"
+                       "knobs:\n  build_gate_cmd: 'true'\n")
+        rc, out, _ = run(["window", p])
+        self.assertEqual(rc, 0)
+        self.assertIn("no merge window", out)
+
+    def test_missing_config(self):
+        rc, _, err = run(["window", "/no/such.yaml"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no such config", err)
+
+    def test_invalid_config(self):
+        rc, _, err = run(["window", _write_raw("extends: keel\n")])
+        self.assertEqual(rc, 1)
+        self.assertIn("invalid keel config", err)
+
+
+class TestShip(unittest.TestCase):
+    def test_clean_merges(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:  # non-git root -> no changed files
+            rc, out, _ = run(["ship", _write_config("'true'"), "--root", d])
+        self.assertEqual(rc, 0)
+        self.assertIn("keel ship", out)
+        self.assertIn("TIER-2", out)        # empty changeset -> default tier
+        self.assertIn("DECISION", out.upper())
+        self.assertIn("MERGE", out)
+
+    def test_failing_gate_blocks(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            rc, out, _ = run(["ship", _write_config("'false'"), "--root", d])
+        self.assertEqual(rc, 1)
+        self.assertIn("BLOCK", out)
+
+    def test_missing_config(self):
+        rc, _, err = run(["ship", "/no/such.yaml"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no such config", err)
+
+    def test_invalid_config(self):
+        rc, _, err = run(["ship", _write_raw("extends: keel\n")])
+        self.assertEqual(rc, 1)
+        self.assertIn("invalid keel config", err)
+
+    def test_bogus_gate_errors(self):
+        p = _write_raw("extends: keel\ncore_version: '^0.1'\nbase_branch: main\n"
+                       "repo: x\ngates: [bogus]\nknobs:\n  build_gate_cmd: 'true'\n")
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            rc, _, err = run(["ship", p, "--root", d])
+        self.assertEqual(rc, 1)
+        self.assertTrue(err)
+
+    def test_unloadable_extension_warned(self):
+        import tempfile
+        p = _write_raw("extends: keel\ncore_version: '^0.1'\nbase_branch: main\nrepo: x\n"
+                       "gates: [build]\nknobs:\n  build_gate_cmd: 'true'\n"
+                       "extensions:\n  tester: [missing.md]\nextensions_dir: .keel/extensions\n")
+        with tempfile.TemporaryDirectory() as d:
+            rc, _, err = run(["ship", p, "--root", d])
+        self.assertEqual(rc, 0)
+        self.assertIn("extension not loaded", err)
+
+
+class TestParser(unittest.TestCase):
+    def test_subcommands_present(self):
+        parser = cli.build_parser()
+        # argparse stores subparser choices on the subparsers action.
+        actions = [a for a in parser._actions if a.dest == "command"]
+        self.assertTrue(actions)
+        self.assertEqual(set(actions[0].choices),
+                         {"version", "validate", "plan", "run-gates", "window", "ship"})
+
+
+if __name__ == "__main__":
+    unittest.main()
