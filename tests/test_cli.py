@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -85,6 +86,20 @@ class TestPlan(unittest.TestCase):
         self.assertIn("plan", data)
         self.assertEqual(data["contract"]["schema_version"], "keel.command-contract.v1")
         self.assertEqual(data["contract"]["command"], "ship")
+        self.assertIn("review_merge_contract", data["contract"])
+
+    def test_plan_json_resolves_review_jury_flags(self):
+        rc, out, _ = run(
+            ["plan", str(PROJECTS / "example-android.yaml"), "--root", str(REPO_ROOT),
+             "--command", "ship", "--reviewers", "2", "--review-comments", "summary",
+             "--jury", "--jury-advisory", "--json"]
+        )
+        self.assertEqual(rc, 0)
+        review = json.loads(out)["contract"]["review_merge_contract"]
+        self.assertEqual(review["reviewers"]["count"], 2)
+        self.assertEqual(review["reviewers"]["source"], "override")
+        self.assertEqual(review["posting"]["mode"], "summary")
+        self.assertEqual(review["jury"]["mode"], "advisory")
 
     def test_plan_json_can_expose_other_command_graph(self):
         rc, out, _ = run(
@@ -158,6 +173,10 @@ def _write_config(build_cmd):
         "extends: keel\ncore_version: '^0.1'\nbase_branch: main\n"
         f"repo: tmp\ngates: [build]\nknobs:\n  build_gate_cmd: {build_cmd}\n"
     )
+
+
+def _run_git(root: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
 
 
 class TestRunGates(unittest.TestCase):
@@ -254,7 +273,8 @@ class TestShip(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             rc, out, _ = run(["ship", _write_config("'true'"), "--root", d,
-                              "--dry-run", "--json"])
+                              "--dry-run", "--json", "--review-comments", "summary",
+                              "--no-jury", "--reviewers", "1"])
         self.assertEqual(rc, 0)
         data = json.loads(out)
         self.assertEqual(data["contract"]["command"], "ship")
@@ -264,6 +284,44 @@ class TestShip(unittest.TestCase):
                          "not-required-dry-run")
         self.assertEqual(data["result"]["changed_file_count"], 0)
         self.assertEqual(data["result"]["assessment"]["merge"]["action"], "merge")
+        review = data["result"]["assessment"]["review_merge_contract"]
+        self.assertEqual(review["reviewers"]["count"], 1)
+        self.assertEqual(review["posting"]["mode"], "summary")
+        self.assertEqual(review["jury"]["mode"], "off")
+
+    def test_json_contract_matches_assessment_for_tier3_auto_jury(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            _run_git(root, "init", "-b", "main")
+            _run_git(root, "config", "user.email", "test@example.com")
+            _run_git(root, "config", "user.name", "Test User")
+            (root / "README.md").write_text("base\n", encoding="utf-8")
+            _run_git(root, "add", "README.md")
+            _run_git(root, "commit", "-m", "base")
+            _run_git(root, "checkout", "-b", "feature")
+            workflow = root / ".github" / "workflows" / "ci.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("name: ci\n", encoding="utf-8")
+            _run_git(root, "add", ".github/workflows/ci.yml")
+            _run_git(root, "commit", "-m", "change workflow")
+
+            config = _write_raw(
+                "extends: keel\ncore_version: '^0.1'\nbase_branch: main\nrepo: tmp\n"
+                "gates: [build, jury]\nknobs:\n  build_gate_cmd: 'true'\n"
+                "  tier3_globs: ['.github/workflows/**']\n"
+            )
+            rc, out, _ = run(["ship", config, "--root", d, "--dry-run", "--json"])
+
+        self.assertEqual(rc, 0)
+        data = json.loads(out)
+        contract_review = data["contract"]["review_merge_contract"]
+        assessment_review = data["result"]["assessment"]["review_merge_contract"]
+        self.assertEqual(contract_review["reviewers"]["tier"], 3)
+        self.assertEqual(contract_review["reviewers"]["count"], 3)
+        self.assertEqual(contract_review["reviewers"]["source"], "risk-tier")
+        self.assertEqual(contract_review["jury"]["mode"], "gating")
+        self.assertEqual(contract_review, assessment_review)
 
     def test_ship_rejects_conflicting_live_and_dry_run_flags(self):
         rc, _, err = run(["ship", _write_config("'true'"), "--dry-run", "--live"])
