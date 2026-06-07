@@ -71,6 +71,104 @@ class TestBuildCommandContract(unittest.TestCase):
         self.assertIn("shell", contract["required_capabilities"])
         self.assertEqual(contract["github_transport"]["transport"], "mcp")
         self.assertFalse(contract["side_effects"]["mutates_in_dry_run"])
+        self.assertEqual(contract["operator_consent"]["status"], "not-required-dry-run")
+        self.assertEqual(
+            contract["operator_consent"]["consent_scope"],
+            ["filesystem", "git", "github"],
+        )
+        self.assertTrue(contract["operator_consent"]["would_require_operator_consent"])
+        self.assertFalse(contract["operator_consent"]["requires_operator_consent"])
+
+    def test_live_contract_records_approved_consent_scope(self):
+        config = cfg.load_config(PROJECTS / "example-android.yaml")
+        loaded = {}
+        plan = orchestrator.build_plan(config, loaded)
+        report = runtime.CapabilityReport(())
+        requirement = runtime.CapabilityRequirement()
+        contract = contracts.build_command_contract(
+            command="ship",
+            config=config,
+            loaded=loaded,
+            plan=plan,
+            requirement=requirement,
+            evaluation=runtime.evaluate(requirement, report),
+            transport=github_transport.resolve(report),
+            dry_run=False,
+            approved_consent_scopes=("filesystem", "git", "github"),
+            operator="operator",
+            target="issue #82",
+        )
+        self.assertEqual(contract["mode"], "live")
+        self.assertEqual(contract["operator_consent"]["status"], "approved")
+        self.assertEqual(
+            contract["operator_consent"]["delegated_agent_scope"]["approved_mutation_scopes"],
+            ["filesystem", "git", "github"],
+        )
+        self.assertFalse(contract["operator_consent"]["consent_record"]["secret_values_recorded"])
+
+    def test_coverage_contract_requires_local_worktree_consent(self):
+        config = cfg.load_config(PROJECTS / "example-android.yaml")
+        loaded = {}
+        plan = orchestrator.build_plan(config, loaded)
+        report = runtime.CapabilityReport(())
+        requirement = runtime.CapabilityRequirement()
+        contract = contracts.build_command_contract(
+            command="coverage",
+            config=config,
+            loaded=loaded,
+            plan=plan,
+            requirement=requirement,
+            evaluation=runtime.evaluate(requirement, report),
+            transport=github_transport.resolve(report),
+            dry_run=False,
+            approved_consent_scopes=("github",),
+        )
+        self.assertEqual(
+            contract["operator_consent"]["consent_scope"],
+            ["filesystem", "git", "github"],
+        )
+        self.assertEqual(contract["operator_consent"]["status"], "missing")
+        self.assertEqual(
+            contract["operator_consent"]["missing_scope"],
+            ["filesystem", "git"],
+        )
+
+    def test_capability_requirements_extend_consent_scope(self):
+        config = cfg.load_config(PROJECTS / "example-android.yaml")
+        loaded = {
+            "pre-merge": [parse_extension(
+                "---\nid: release\nslot: pre-merge\nkind: command\nrun: true\n"
+                "required_capabilities: [release-publish]\n"
+                "optional_capabilities: [secret-access, production-adjacent]\n"
+                "on_fail: block\n---\n",
+                source="release.md",
+            )],
+        }
+        plan = orchestrator.build_plan(config, loaded)
+        report = runtime.CapabilityReport(())
+        requirement = runtime.CapabilityRequirement(
+            required=("release-publish",),
+            optional=("secret-access", "production-adjacent"),
+        )
+        contract = contracts.build_command_contract(
+            command="ship",
+            config=config,
+            loaded=loaded,
+            plan=plan,
+            requirement=requirement,
+            evaluation=runtime.evaluate(requirement, report),
+            transport=github_transport.resolve(report),
+            dry_run=False,
+            approved_consent_scopes=("filesystem", "git", "github"),
+        )
+        self.assertEqual(
+            contract["operator_consent"]["consent_scope"],
+            ["filesystem", "git", "github", "secrets", "release", "production-adjacent"],
+        )
+        self.assertEqual(
+            contract["operator_consent"]["missing_scope"],
+            ["secrets", "release", "production-adjacent"],
+        )
 
     def test_real_extension_absence_is_representable(self):
         config = cfg.load_config(PROJECTS / "example-flutter.yaml")
