@@ -29,6 +29,8 @@ the structured command contracts described in [`command-contracts.md`](command-c
 | `subagents` | A host runtime reports subagent support through `KEEL_SUBAGENTS=1`. |
 | `parallel-subagents` | A host runtime reports parallel subagent support through `KEEL_PARALLEL_SUBAGENTS=1`. |
 | `browser` | A host runtime reports browser automation support through `KEEL_BROWSER=1`. |
+| `adb` | The Android Debug Bridge is available on `PATH`, or the host reports it through `KEEL_ADB=1`. |
+| `firebase` | The Firebase CLI is available on `PATH`, or the host reports it through `KEEL_FIREBASE=1`. |
 | `filesystem-write` | The configured root is writable. |
 | `worktree` | The runtime has `git` and a writable root. |
 | `release-publish` | The operator/runtime explicitly allowed release publishing through `KEEL_RELEASE_PUBLISH=1`. |
@@ -58,6 +60,19 @@ run: ./tools/report
 required_capabilities: [shell]
 optional_capabilities: [browser]
 ---
+```
+
+Project-provided commands declare the same fields in `policy_pack.project_commands`:
+
+```yaml
+policy_pack:
+  name: example
+  project_commands:
+    device-smoke:
+      command: ".keel/commands/device-smoke"
+      required_capabilities: [shell, adb]
+      optional_capabilities: [browser, firebase]
+      side_effects: [report_write]
 ```
 
 Unknown capability names fail validation so typos do not silently degrade a run.
