@@ -1,4 +1,4 @@
-personality = "direct"
+personality = "friendly"
 
 [features]
 hooks = true
