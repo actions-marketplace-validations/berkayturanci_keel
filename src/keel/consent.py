@@ -17,6 +17,9 @@ CONSENT_SCOPES = (
     "production-adjacent",
 )
 
+APPROVAL_SOURCES = ("none", "flag", "env", "config")
+CONSENT_MODES = ("explicit", "standing", "agent")
+
 _SIDE_EFFECT_SCOPES: dict[str, tuple[str, ...]] = {
     "capture": ("filesystem",),
     "deferral_queue": ("filesystem",),
@@ -115,6 +118,8 @@ def build_consent_contract(
     side_effects: Iterable[str],
     dry_run: bool,
     approved_scopes: Iterable[str] = (),
+    approval_source: str = "flag",
+    mode: str = "explicit",
     operator: str | None = None,
     target: str | None = None,
     now: datetime | None = None,
@@ -122,19 +127,33 @@ def build_consent_contract(
     """Build a JSON-compatible consent block for a command contract."""
     consent_scope = side_effect_scopes(side_effects)
     approved_scope = normalize_scopes(approved_scopes)
+    if approval_source not in APPROVAL_SOURCES:
+        raise ValueError(
+            f"unknown approval source {approval_source!r}; valid: {', '.join(APPROVAL_SOURCES)}"
+        )
+    if mode not in CONSENT_MODES:
+        raise ValueError(f"unknown consent mode {mode!r}; valid: {', '.join(CONSENT_MODES)}")
     effective_approved_scope = tuple(scope for scope in consent_scope if scope in approved_scope)
     missing_scope = tuple(scope for scope in consent_scope if scope not in effective_approved_scope)
     would_require = bool(consent_scope)
-    requires = (not dry_run) and bool(missing_scope)
-    status = _status(dry_run=dry_run, would_require=would_require, requires=requires)
+    agent_delegated = (not dry_run) and mode == "agent" and would_require
+    requires = (not dry_run) and bool(missing_scope) and not agent_delegated
+    status = _status(
+        dry_run=dry_run,
+        would_require=would_require,
+        requires=requires,
+        agent_delegated=agent_delegated,
+    )
     approved_live = (not dry_run) and would_require and not missing_scope
     return {
         "schema_version": SCHEMA_VERSION,
         "requires_operator_consent": requires,
         "would_require_operator_consent": would_require,
         "status": status,
+        "mode": mode,
         "consent_scope": list(consent_scope),
         "approved_scope": list(approved_scope),
+        "approval_source": approval_source if approved_scope else "none",
         "effective_approved_scope": list(effective_approved_scope),
         "missing_scope": list(missing_scope if not dry_run else ()),
         "consent_prompt": _prompt(command, target, dry_run, consent_scope, missing_scope),
@@ -146,6 +165,7 @@ def build_consent_contract(
         },
         "consent_record": (
             _record(command, target, effective_approved_scope, operator, dry_run, now)
+            | {"source": approval_source}
             if approved_live
             else None
         ),
@@ -161,9 +181,11 @@ def assert_operator_consent(contract: dict[str, Any]) -> tuple[bool, str]:
     return True, "operator consent satisfied"
 
 
-def _status(*, dry_run: bool, would_require: bool, requires: bool) -> str:
+def _status(*, dry_run: bool, would_require: bool, requires: bool, agent_delegated: bool) -> str:
     if dry_run:
         return "not-required-dry-run" if would_require else "not-required-read-only"
+    if agent_delegated:
+        return "agent-delegated"
     if requires:
         return "missing"
     return "approved" if would_require else "not-required-read-only"

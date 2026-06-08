@@ -29,6 +29,7 @@ declared through `required_capabilities`, `policy_pack`, or extension docs.
 | `timezone` | string | | IANA tz for the merge window (`Europe/Istanbul`, `Etc/GMT-3`) |
 | `merge_window` | string `HH:MM-HH:MM` | | open merge window; the complement is the night no-merge window |
 | `merge_window_mode` | `freeze` \| `pause` | `freeze` | outside the window: `freeze` blocks the merge but keeps gates/CI running; `pause` halts the pipeline |
+| `consent_mode` | `explicit` \| `standing` \| `agent` | `explicit` | default live-run consent mode for every command |
 | `gates` | string[] | | built-in gates to run: any of `build`, `lint`, `jury` |
 | `extensions` | object | | add-only Lego pieces keyed by named slot |
 | `extensions_dir` | string | | dir holding extension files (default `.keel/extensions`) |
@@ -78,6 +79,30 @@ Controls behavior outside the merge window:
 - `pause` halts the pipeline outside the window.
 
 If omitted, Keel defaults to `freeze`.
+
+#### `consent_mode`
+
+Default operator-consent mode for live command preflight. The built-in default is
+`explicit`, and per-run inputs override it in this order:
+
+1. `--consent-mode explicit|standing|agent`
+2. `KEEL_CONSENT_MODE`
+3. `consent_mode` in `.keel/project.yaml`
+4. built-in `explicit`
+
+Modes:
+
+- `explicit` requires the current run to pass `--approve-scope` for any live mutation
+  scopes.
+- `standing` allows trusted unattended approval from `KEEL_APPROVE_SCOPE` or
+  `automation.approved_scopes`, with an operator identity.
+- `agent` delegates prompting/enforcement to the host agent permission model. Keel still
+  emits the structured consent contract and delegated scope, but it does not double-prompt
+  or fail the preflight for missing `--approve-scope`.
+
+No mode bypasses findings, CI, project gates, merge windows, merge locks, or release
+policy. Read-only live contracts do not consume standing approvals, so stale or invalid
+standing approval environment values do not break read-only checks.
 
 #### `gates`
 
@@ -195,6 +220,31 @@ back to packaged command prose.
 | `workflow_policies` | map command→object | | command-specific workflow policy such as posting mode, reviewer isolation, CI/fix-loop behavior, and completion markers |
 | `reports` | map name→string | | report destinations, paths, or issue prefixes |
 | `review` | object | | project-owned rubric additions and required PR/review sections |
+
+## `automation`
+
+Trusted unattended-run consent defaults. Env approval is preferred for CI/cron because it
+keeps authorization outside the repository, but config approval is useful when a project
+wants an explicit auditable policy.
+
+| field | type | required | description |
+|---|---|---|---|
+| `approved_scopes` | string[] | | standing consent scopes such as `filesystem`, `git`, and `github` |
+| `operator` | string | runtime-required with `approved_scopes` | automation identity recorded in `consent_record` when config approval is used |
+
+`automation.approved_scopes` only satisfies the consent preflight. It never bypasses
+findings, CI, project gates, merge windows, or merge locks. Approval is least-privilege:
+any required scope not listed here still blocks the live run.
+If `approved_scopes` is selected by a live mutating `standing` run without `operator`,
+preflight fails before mutation.
+
+Example:
+
+```yaml
+automation:
+  approved_scopes: [filesystem, git, github]
+  operator: automation:nightly
+```
 
 ### `policy_pack.name`
 

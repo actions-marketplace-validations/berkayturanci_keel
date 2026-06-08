@@ -45,6 +45,36 @@ Live mode:
 - passes only the approved scopes that match the resolved plan to delegated agents
 - never records secret values
 
+Consent mode is selected for every run in this order:
+
+1. `--consent-mode explicit|standing|agent`
+2. `KEEL_CONSENT_MODE`
+3. `consent_mode` in `.keel/project.yaml`
+4. built-in `explicit`
+
+Modes:
+
+- `explicit`: live mutation requires `--approve-scope` on that invocation.
+- `standing`: trusted unattended approval may come from env or config.
+- `agent`: enforcement is delegated to the host agent permission model; keel still emits
+  the full contract and delegated scope, but does not fail preflight just because
+  `--approve-scope` is absent.
+
+Approval sources inside `standing` mode, in precedence order:
+
+1. `--approve-scope` flags for the current command invocation.
+2. `KEEL_APPROVE_SCOPE`, for trusted unattended environments such as cron or CI.
+3. `automation.approved_scopes` in `.keel/project.yaml`.
+
+Standing approval only satisfies the consent preflight. It never bypasses findings,
+project gates, CI, the merge window, or the merge lock. Scope remains least-privilege:
+only listed scopes are approved, and any broader required scope still stops the run.
+Use `KEEL_OPERATOR` with `KEEL_APPROVE_SCOPE`, or `automation.operator` with config-based
+approval, so the `consent_record` names the automation identity. Standing approval without
+an operator identity fails the live preflight. Dry-run and read-only commands ignore
+standing approval environment/config values unless an explicit `--approve-scope` flag is
+passed.
+
 Example:
 
 ```bash
@@ -54,6 +84,19 @@ keel plan .keel/project.yaml --command ship --live \
   --operator "$USER" \
   --target "issue #123" \
   --json
+KEEL_APPROVE_SCOPE=filesystem,git,github KEEL_OPERATOR=automation:nightly \
+  keel overnight .keel/project.yaml --live --consent-mode standing --json
+KEEL_CONSENT_MODE=agent \
+  keel ship .keel/project.yaml --live --json
+```
+
+Config-based standing approval:
+
+```yaml
+consent_mode: standing
+automation:
+  approved_scopes: [filesystem, git, github]
+  operator: automation:nightly
 ```
 
 ## Delegated agents

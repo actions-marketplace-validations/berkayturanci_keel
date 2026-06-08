@@ -88,10 +88,40 @@ class TestParse(unittest.TestCase):
         config = cfg.parse_config(copy.deepcopy(VALID))
         self.assertEqual(config.base_branch, "main")
         self.assertEqual(config.extensions_dir, cfg.DEFAULT_EXTENSIONS_DIR)
+        self.assertEqual(config.consent_mode, "explicit")
         self.assertEqual(config.gates, ())
         self.assertEqual(config.knobs.required_capabilities, ())
         self.assertEqual(config.knobs.optional_capabilities, ())
         self.assertEqual(config.policy_pack, {})
+        self.assertEqual(config.automation.approved_scopes, ())
+        self.assertIsNone(config.automation.operator)
+
+    def test_automation_standing_approval_parses(self):
+        data = copy.deepcopy(VALID)
+        data["automation"] = {
+            "approved_scopes": ["filesystem", "git", "github"],
+            "operator": "automation:nightly",
+        }
+        config = cfg.parse_config(data)
+        self.assertEqual(config.automation.approved_scopes, ("filesystem", "git", "github"))
+        self.assertEqual(config.automation.operator, "automation:nightly")
+
+    def test_consent_mode_parses(self):
+        data = copy.deepcopy(VALID)
+        data["consent_mode"] = "agent"
+        self.assertEqual(cfg.parse_config(data).consent_mode, "agent")
+
+    def test_invalid_consent_mode_rejected(self):
+        bad = copy.deepcopy(VALID)
+        bad["consent_mode"] = "maybe"
+        with self.assertRaises(cfg.ConfigError):
+            cfg.parse_config(bad)
+
+    def test_automation_unknown_scope_parses_for_consent_preflight(self):
+        bad = copy.deepcopy(VALID)
+        bad["automation"] = {"approved_scopes": ["filesystem", "bogus"]}
+        config = cfg.parse_config(bad)
+        self.assertEqual(config.automation.approved_scopes, ("bogus", "filesystem"))
 
     def test_policy_pack_parses_project_policy_contract(self):
         data = copy.deepcopy(VALID)
@@ -294,6 +324,13 @@ class TestConfigHash(unittest.TestCase):
         other["policy_pack"] = {"name": "example"}
         b = cfg.parse_config(other)
         self.assertNotEqual(cfg.config_hash(a), cfg.config_hash(b))
+
+    def test_automation_scope_order_independent(self):
+        a = copy.deepcopy(VALID)
+        b = copy.deepcopy(VALID)
+        a["automation"] = {"approved_scopes": ["github", "filesystem", "git"]}
+        b["automation"] = {"approved_scopes": ["filesystem", "git", "github"]}
+        self.assertEqual(cfg.config_hash(cfg.parse_config(a)), cfg.config_hash(cfg.parse_config(b)))
 
     def test_key_order_independent(self):
         reordered = {
