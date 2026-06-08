@@ -45,7 +45,7 @@ keel validate projects/*.yaml                 # schema only
 keel validate .claude/project.yaml --root .   # schema + extensions (use in CI)
 ```
 
-## `keel plan <project.yaml> [--root DIR] [--command COMMAND] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--target TARGET] [--json]`
+## `keel plan <project.yaml> [--root DIR] [--command COMMAND] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--target TARGET] [--issue-title TITLE] [--issue-body BODY] [--issue-label LABEL] [--json]`
 
 Render the backbone plan for a project: the fixed steps with the project's built-in gates
 and extensions slotted in. This is the dry-run view — what an actual run would execute.
@@ -63,6 +63,7 @@ keel plan .claude/project.yaml --command ship --live --approve-scope filesystem,
 keel plan .claude/project.yaml --command ship --live --consent-mode standing --json
 KEEL_CONSENT_MODE=agent keel plan .claude/project.yaml --command ship --live --json
 keel plan .claude/project.yaml --command ship --review-comments summary --reviewers 2 --jury-advisory --json
+keel plan .claude/project.yaml --command ship --issue-title "Add setup docs" --issue-body "$ISSUE_BODY" --issue-label enhancement --json
 ```
 
 With `--json`, the output includes a structured command contract under `contract`: resolved
@@ -80,6 +81,12 @@ Consent mode is resolved as `--consent-mode` > `KEEL_CONSENT_MODE` >
 `consent_mode` in `.keel/project.yaml` > built-in `explicit`. `standing` mode accepts
 trusted `KEEL_APPROVE_SCOPE` or `automation.approved_scopes`; `agent` mode delegates the
 approval prompt to the host agent permission system while keeping the structured contract.
+
+When `--issue-title`, `--issue-body`, or `--issue-label` is supplied for a work-owning
+command, the JSON contract includes `issue_intake`. The intake block classifies the issue
+as `ready`, `needs-input`, `blocked`, or `out-of-scope`, extracts acceptance criteria and
+docs/test expectations, and emits concrete clarification questions. Live work must stop
+before mutation when an explicitly supplied issue is not `ready`.
 
 ## `keel morning <project.yaml> [--root DIR] [--since WHEN] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--json]`
 
@@ -255,7 +262,7 @@ keel window .keel/project.yaml
 # merge window OPEN  [Europe/Istanbul 07:00-01:30]
 ```
 
-## `keel ship <project.yaml> [--root DIR] [--pr N] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--target TARGET] [--review-comments inline|summary] [--reviewers 1|2|3] [--jury|--no-jury] [--jury-advisory] [--json]`
+## `keel ship <project.yaml> [--root DIR] [--pr N] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--target TARGET] [--issue-title TITLE] [--issue-body BODY] [--issue-label LABEL] [--review-comments inline|summary] [--reviewers 1|2|3] [--jury|--no-jury] [--jury-advisory] [--json]`
 
 Run the **deterministic slice of a ship** against the current checkout and print the
 assessment: how many files changed vs. the base branch, the **risk tier** (→ reviewer
@@ -285,10 +292,18 @@ risk-derived reviewer count, and jury precedence is `--no-jury` over `--jury` ov
 auto-jury over off. `--jury-advisory` keeps an enabled jury report-only. No-jury mode still
 preserves the reviewer, CI, tester, merge-window, merge-lock, closeout, and capture gates.
 
+Adapters should pass the selected issue text with `--issue-title`, `--issue-body`, and
+`--issue-label` before branch/worktree creation. JSON output then includes
+`contract.issue_intake` and `result.issue_intake`. If an explicitly supplied issue is
+`needs-input`, `blocked`, or `out-of-scope`, `keel ship --live` exits non-zero before
+running gates or mutating code, and the intake block contains the questions or skip reason.
+Dry-run output records the same readiness decision without blocking inspection.
+
 ```bash
 keel ship .keel/project.yaml --root .
 keel ship .keel/project.yaml --root . --live --json
 keel ship .keel/project.yaml --root . --live --approve-scope filesystem,git,github --operator "$USER" --target "issue #123" --json
+keel ship .keel/project.yaml --root . --issue-title "Add setup docs" --issue-body "$ISSUE_BODY" --issue-label enhancement --json
 KEEL_APPROVE_SCOPE=filesystem,git,github KEEL_OPERATOR=automation:nightly keel ship .keel/project.yaml --root . --live --consent-mode standing --json
 # keel ship — keel  (base main)
 #   changed files : 53
@@ -330,7 +345,7 @@ Use `ship` for the standard delivery path and `ship-v2` when the operator wants 
 compound-engineering flavor while retaining the same CI, review, merge-window, merge-lock,
 closeout, and capture safety gates.
 
-## `keel implement <project.yaml> <issue> [--root DIR] [--delegate AGENT] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--json]`
+## `keel implement <project.yaml> <issue> [--root DIR] [--delegate AGENT] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--issue-title TITLE] [--issue-body BODY] [--issue-label LABEL] [--json]`
 
 Render the standalone implement-step contract for one issue. This is the direct-use form of
 the s4 implement step: it resolves project config, implementer routing, branch/worktree
@@ -339,11 +354,15 @@ planning, consent scopes, and the handoff target without running the full ship l
 ```bash
 keel implement .keel/project.yaml 76 --root . --dry-run --json
 keel implement .keel/project.yaml 76 --root . --live --consent-mode standing --approve-scope filesystem,git,github --operator "$USER" --json
+keel implement .keel/project.yaml 76 --root . --live --issue-title "Add setup docs" --issue-body "$ISSUE_BODY" --issue-label enhancement --approve-scope filesystem,git,github --operator "$USER" --json
 ```
 
 `implement` may create branches, worktrees, commits, pushes, PRs, and comments only in an
 approved live adapter run. Its contract explicitly marks standalone implement as a
 non-merge path and points the next step at `ship` or `pr-loop`.
+When issue context is supplied, `contract.issue_intake` applies the same readiness gate as
+`ship`: non-ready issues stop before branch/worktree creation or delegation, and the
+generated questions or skip reason remain machine-readable.
 
 ## `keel ci-check <project.yaml> [--root DIR] [--pr N] [--json]`
 
