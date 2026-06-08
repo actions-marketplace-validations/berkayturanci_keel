@@ -16,7 +16,7 @@
 > **Keel turns coding agents into work owners.** It is a project-neutral,
 > multi-agent **workflow backbone** that drives a unit of work — a GitHub issue —
 > from intake to done: understand readiness, branch, implement, wait on CI, review,
-> test, merge safely, close, and capture what was learned. Projects never fork the
+> test, merge safely, close, and run capture hooks. Projects never fork the
 > backbone: they set per-project **values** in `project.yaml` and snap their own
 > **Lego pieces** into named extension slots.
 
@@ -58,6 +58,21 @@ Changing the backbone is a keel-core change. Projects only ever touch layers 2�
   reviewer on the diff when installed; a fail-soft no-op otherwise.
 - **Safe merges by construction** — timezone-aware night no-merge window, `mkdir` merge lock,
   risk-tier → reviewer count, hotfix bypass with an audit line, vendor+model attribution.
+
+### How Keel compares
+
+Keel sits between three established tool categories:
+
+| category | examples | where they usually stop | what Keel adds |
+|---|---|---|---|
+| Coding agents | OpenHands, SWE-agent, Copilot coding agent, Devin | create or update a PR | intake, review gates, merge policy, closeout, capture hooks |
+| PR reviewers | CodeRabbit, Qodo / PR-Agent, Greptile, Cursor Bugbot | review an existing PR | implementation loop, tests, merge lock/window, planned learning capture |
+| Merge queues | GitHub Merge Queue, Mergify, Graphite, Trunk | serialize tested PRs | issue ownership before the PR exists |
+
+Keel is not trying to replace those tools. It is the work-ownership backbone that can use
+coding agents, reviewers, gates, and merge policy in one lifecycle. See
+[`docs/keel/comparison.md`](docs/keel/comparison.md) for the source-backed comparison and
+the ideas Keel should borrow.
 
 ### The backbone
 
