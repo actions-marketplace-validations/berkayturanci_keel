@@ -19,11 +19,12 @@ the installed keel — never copied, so the drift/overwrite class of bug is gone
 ## Step 1 — install + pin keel
 
 ```bash
-pipx install "git+https://github.com/berkayturanci/keel@v0.6.0"   # or pin an existing release tag
+pipx install "git+https://github.com/berkayturanci/keel@v0.6.1"   # or pin an existing release tag
 keel --version
-keel install-adapter all             # → both surfaces: Claude commands + the shared skill set
-#   claude → .claude/commands/keel/<cmd>.md      (native /keel:<cmd>)
-#   skills → .agents/skills/keel-<cmd>/SKILL.md  (every non-Claude agent — one shared copy)
+keel setup --root .                  # → config + both adapter surfaces + validate + plan
+#   config → .keel/project.yaml
+#   claude → .claude/commands/keel/<cmd>.md
+#   skills → .agents/skills/keel-<cmd>/SKILL.md
 ```
 
 Now both the old `/<command>` and the new `/keel:<command>` exist side by side — so you can
@@ -110,6 +111,31 @@ The cutover is a PR. If `/keel:*` misses something after merge, `git revert` the
 ## Updating later
 
 ```bash
-pipx install --force "git+https://github.com/berkayturanci/keel@vX.Y.Z"
-keel install-adapter claude --force      # refresh adapters (your edits are kept without --force)
+pipx upgrade keel-workflow
+# or: python -m pip install --upgrade keel-workflow
+# or: pipx install --force "git+https://github.com/berkayturanci/keel@vX.Y.Z"
+
+keel adapter-status all --root .
+keel sync --root . --dry-run
+keel sync --root .
+keel validate .keel/project.yaml --root .
+keel plan .keel/project.yaml --root .
 ```
+
+Only generated adapter files are candidates for automatic refresh:
+`.claude/commands/keel/*.md` and `.agents/skills/keel-*/SKILL.md`. Project-owned config,
+`.keel/extensions/*`, project-only commands, and policy docs are never touched by
+`sync`.
+
+Adapter files carry a `keel-generated` marker. `sync` updates files reported as `missing` or
+`outdated`; it refuses to overwrite `locally-modified` or `unknown` files. Treat those as
+normal PR review work and merge them by hand if needed.
+
+`sync` uses the keel version already installed in the active Python environment. It does not
+download the latest PyPI package by itself; keep package upgrades explicit so the upgrade PR
+shows both the package-version change and the generated adapter diff.
+
+Extension compatibility is checked after every upgrade with strict validation and plan
+rendering. If an extension references a removed/renamed slot or has malformed frontmatter,
+`keel validate .keel/project.yaml --root .` fails before any live adapter mutates repository
+or GitHub state.

@@ -640,7 +640,12 @@ def _cmd_init(args: argparse.Namespace) -> int:
     root = Path(args.root)
     target = root / ".keel" / "project.yaml"
     if target.exists() and not args.force:
-        print(f"{target} already exists (use --force to overwrite)", file=sys.stderr)
+        print(
+            f"{target} already exists; refusing to overwrite project config "
+            "(use --force only if you intentionally want to replace it). "
+            "Project extensions are not touched.",
+            file=sys.stderr,
+        )
         return 1
     stack = scaffold.detect_stack(root)
     repo = root.resolve().name
@@ -651,8 +656,22 @@ def _cmd_init(args: argparse.Namespace) -> int:
         text = scaffold.default_config(stack, repo=repo)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8")
+    if args.force:
+        print(
+            "warning: --force replaced .keel/project.yaml; .keel/extensions/ was not touched",
+            file=sys.stderr,
+        )
     print(f"wrote {target}  (detected stack: {stack})")
     return 0
+
+
+def _render_scaffolded_config(root: Path, *, wizard: bool) -> tuple[str, str]:
+    stack = scaffold.detect_stack(root)
+    repo = root.resolve().name
+    if wizard:
+        print(f"keel setup wizard — detected stack: {stack} (Enter accepts each default)")
+        return scaffold.wizard(stack, _ask, repo=repo), stack
+    return scaffold.default_config(stack, repo=repo), stack
 
 
 def _report_install(surface: str, installed: list[str], skipped: list[str]) -> None:
@@ -687,6 +706,58 @@ def _cmd_install_adapter(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_setup(args: argparse.Namespace) -> int:
+    root = Path(args.root)
+    target = root / ".keel" / "project.yaml"
+    print(f"keel setup — {root}")
+
+    if target.exists() and not args.force:
+        print(f"  config       : using existing {target}")
+        print("  extensions   : preserved (setup never deletes .keel/extensions/)")
+    else:
+        existed = target.exists()
+        if existed:
+            print(
+                "warning: --force will replace .keel/project.yaml; "
+                ".keel/extensions/ will not be touched",
+                file=sys.stderr,
+            )
+        text, stack = _render_scaffolded_config(root, wizard=args.wizard)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        action = "overwrote" if existed else "wrote"
+        print(f"  config       : {action} {target} (detected stack: {stack})")
+        print("  extensions   : preserved (setup never deletes .keel/extensions/)")
+
+    agent = args.adapter_target
+    if agent == "all":
+        results = install.install_all(root, force=args.force)
+    else:
+        results = {agent: install.install(agent, root, force=args.force)}
+    total = 0
+    for surface, (installed, skipped) in results.items():
+        _report_install(surface, installed, skipped)
+        total += len(installed)
+    print(f"  adapters     : {total} installed, "
+          f"{sum(len(skipped) for _, skipped in results.values())} skipped")
+
+    try:
+        config = cfg.load_config(target)
+        loaded, _ = load_extensions(config, root, strict=True)
+        plan = orch.build_plan(config, loaded)
+    except (cfg.ConfigError, ExtensionError, gates.GateError) as exc:
+        print(f"  validate     : failed ({exc})", file=sys.stderr)
+        return 1
+
+    print(f"  validate     : OK ({config.repo or '-'}, base {config.base_branch})")
+    print("  plan         :")
+    rendered = orch.render_plan(config, plan)
+    for line in rendered.splitlines():
+        print(f"    {line}")
+    print("  next         : run /keel:ship <issue> or the matching keel-<command> skill.")
+    return 0
+
+
 def _cmd_adapter_status(args: argparse.Namespace) -> int:
     try:
         rows = install.adapter_status(args.agent, args.root)
@@ -709,6 +780,17 @@ def _cmd_update_adapter(args: argparse.Namespace) -> int:
     if args.dry_run:
         print("dry-run: no adapter files were written")
     return 0
+
+
+def _cmd_sync(args: argparse.Namespace) -> int:
+    args.agent = args.target
+    print(f"keel sync — installed keel {__version__}")
+    print("  package      : not upgraded by sync; upgrade keel-workflow with pip/pipx first")
+    rc = _cmd_update_adapter(args)
+    if rc == 0:
+        print("  next         : run keel validate .keel/project.yaml --root .")
+        print("  next         : run keel plan .keel/project.yaml --root .")
+    return rc
 
 
 def _parse_legacy_mapping(raw: str) -> tuple[str, str]:
@@ -1050,6 +1132,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--wizard", action="store_true", help="prompt for values interactively")
     p_init.set_defaults(func=_cmd_init)
 
+    p_setup = sub.add_parser(
+        "setup",
+        help="scaffold config, install adapters, validate, and render the plan",
+    )
+    p_setup.add_argument("--root", default=".", help="project root to set up")
+    p_setup.add_argument(
+        "--adapter-target",
+        choices=("all", *install.TARGETS),
+        default="all",
+        help="adapter surface to install (default: all)",
+    )
+    p_setup.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite existing config and generated adapters",
+    )
+    p_setup.add_argument("--wizard", action="store_true", help="prompt for config values")
+    p_setup.set_defaults(func=_cmd_setup)
+
     p_ia = sub.add_parser("install-adapter", help="install the /keel:<command> adapters")
     p_ia.add_argument("agent", help=f"'all' or one of: {', '.join(install.TARGETS)}")
     p_ia.add_argument("--root", default=".", help="project root to install into")
@@ -1068,6 +1169,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_ua.add_argument("--root", default=".", help="project root to update")
     p_ua.add_argument("--dry-run", action="store_true", help="show planned updates only")
     p_ua.set_defaults(func=_cmd_update_adapter)
+
+    p_sync = sub.add_parser("sync", help="sync generated adapters with the installed keel package")
+    p_sync.add_argument("--root", default=".", help="project root to update")
+    p_sync.add_argument(
+        "--target",
+        choices=("all", *install.TARGETS),
+        default="all",
+        help="adapter surface to sync (default: all)",
+    )
+    p_sync.add_argument("--dry-run", action="store_true", help="show planned updates only")
+    p_sync.set_defaults(func=_cmd_sync)
 
     p_lw = sub.add_parser(
         "install-legacy-wrappers",

@@ -9,6 +9,28 @@ keel --version
 
 Print the keel version.
 
+## `keel setup [--root DIR] [--adapter-target all|claude|skills] [--wizard] [--force]`
+
+Set up keel in a consumer project in one pass. This command wraps the normal first-run
+sequence:
+
+1. create `.keel/project.yaml` if it does not exist;
+2. install the requested adapter surface (`all` by default);
+3. strict-validate the config and extensions;
+4. render the resolved backbone plan.
+
+```bash
+keel setup --root .
+keel setup --root . --wizard
+keel setup --root . --adapter-target claude
+keel setup --root . --force
+```
+
+Without `--force`, an existing `.keel/project.yaml` is reused so project-owned policy and
+extensions are not overwritten. With `--force`, the scaffolded config and generated adapter
+files are replaced from the installed keel package, but `.keel/extensions/*` is still never
+deleted or rewritten by `setup`.
+
 ## `keel validate <project.yaml…> [--root DIR]`
 
 Validate one or more project configs against the bundled schema. Reports `OK` /
@@ -331,6 +353,9 @@ files (`pubspec.yaml`→Flutter, `pyproject.toml`/`setup.py`→Python, `package.
 `build.gradle*`→Android, else generic) and writes a config that already passes
 `keel validate`. Refuses to overwrite an existing config unless `--force`.
 
+`--force` replaces `.keel/project.yaml`; it does not delete or rewrite `.keel/extensions/*`.
+Use it only when intentionally regenerating project config.
+
 ```bash
 keel init                 # scaffold .keel/project.yaml for the detected stack
 keel init --root ../app   # scaffold elsewhere
@@ -388,9 +413,14 @@ Generated adapter files carry a trailing `keel-generated` marker with the surfac
 keel version, source hash, and generated-body hash. That marker powers the safe update flow:
 
 ```bash
+pipx upgrade keel-workflow
+# or: python -m pip install --upgrade keel-workflow
+
 keel adapter-status all --root <repo>
 keel update-adapter all --root <repo> --dry-run
 keel update-adapter all --root <repo>
+keel sync --root <repo> --dry-run
+keel sync --root <repo>
 ```
 
 `adapter-status` reports:
@@ -403,11 +433,24 @@ keel update-adapter all --root <repo>
 | `locally-modified` | generated file has a marker, but its body changed after install |
 | `unknown` | file exists without a keel generated marker |
 
-`update-adapter` updates only `missing` and `outdated` generated adapter files. It refuses to
-overwrite `locally-modified` or `unknown` files; those need a human merge. `--dry-run` prints
-the same planned changes as `would-update` rows without writing. Adapter updates never touch
-project-owned config, `.keel/extensions/*`, project-provided commands, or local compatibility
-wrappers unless those files are explicitly marked as generated keel adapter surfaces.
+`sync` is the short everyday name for the same safe adapter refresh as
+`update-adapter all`. It updates only `missing` and `outdated` generated adapter files. It
+refuses to overwrite `locally-modified` or `unknown` files; those need a human merge.
+`--dry-run` prints the same planned changes as `would-update` rows without writing. Adapter
+updates never touch project-owned config, `.keel/extensions/*`, project-provided commands,
+or local compatibility wrappers unless those files are explicitly marked as generated keel
+adapter surfaces.
+
+`sync` uses the keel package that is already installed in the active Python environment. It
+does not contact PyPI, choose the latest version, or change the package installation. Upgrade
+`keel-workflow` with `pipx`/`pip` first, then run `sync` from the consumer repository.
+
+If a new keel release adds a command, `adapter-status` reports its generated files as
+`missing` and `sync` creates them. If a packaged adapter step changes, unchanged generated
+files become `outdated` and `sync` refreshes them. If a release changes the project config or
+extension contract, that is not an adapter sync; it must be handled as a documented migration
+and verified with `keel validate .keel/project.yaml --root .` plus
+`keel plan .keel/project.yaml --root .`.
 
 Extension schema migrations are separate from adapter command updates and must be documented
 as their own versioned migration.

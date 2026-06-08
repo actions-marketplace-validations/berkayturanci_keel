@@ -967,9 +967,14 @@ class TestInit(unittest.TestCase):
             keel = Path(d) / ".keel"
             keel.mkdir()
             (keel / "project.yaml").write_text("old")
-            rc, _, _ = run(["init", "--root", d, "--force"])
+            ext = keel / "extensions/local.md"
+            ext.parent.mkdir()
+            ext.write_text("extension\n")
+            rc, _, err = run(["init", "--root", d, "--force"])
             self.assertEqual(rc, 0)
+            self.assertIn("extensions/ was not touched", err)
             self.assertIn("extends: keel", (keel / "project.yaml").read_text())
+            self.assertEqual(ext.read_text(), "extension\n")
 
     def test_wizard_mode(self):
         import tempfile
@@ -986,6 +991,85 @@ class TestInit(unittest.TestCase):
             # validates
             vrc, _, _ = run(["validate", str(Path(d) / ".keel" / "project.yaml")])
             self.assertEqual(vrc, 0)
+
+
+class TestSetup(unittest.TestCase):
+    def test_scaffolds_installs_validates_and_plans(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "pyproject.toml").write_text("[project]\nname = 'demo'\n")
+            rc, out, err = run(["setup", "--root", d])
+            self.assertEqual(rc, 0, err)
+            self.assertIn("keel setup", out)
+            self.assertIn("detected stack: python", out)
+            self.assertIn("validate     : OK", out)
+            self.assertIn("plan         :", out)
+            self.assertTrue((Path(d) / ".keel/project.yaml").exists())
+            self.assertTrue((Path(d) / ".claude/commands/keel/ship.md").exists())
+            self.assertTrue((Path(d) / ".agents/skills/keel-ship/SKILL.md").exists())
+
+    def test_reuses_existing_config_without_force(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / ".keel/project.yaml"
+            target.parent.mkdir()
+            text = (
+                "extends: keel\ncore_version: '^0.6'\nrepo: existing\nbase_branch: develop\n"
+                "knobs:\n  build_gate_cmd: 'true'\n"
+            )
+            target.write_text(text)
+            rc, out, err = run(["setup", "--root", d, "--adapter-target", "claude"])
+            self.assertEqual(rc, 0, err)
+            self.assertIn("using existing", out)
+            self.assertIn("extensions   : preserved", out)
+            self.assertEqual(target.read_text(), text)
+            self.assertTrue((Path(d) / ".claude/commands/keel/ship.md").exists())
+            self.assertFalse((Path(d) / ".agents/skills/keel-ship/SKILL.md").exists())
+
+    def test_force_overwrites_config_and_adapters(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / ".keel/project.yaml"
+            target.parent.mkdir()
+            target.write_text("old")
+            ext = Path(d) / ".keel/extensions/local.md"
+            ext.parent.mkdir()
+            ext.write_text("extension\n")
+            adapter = Path(d) / ".claude/commands/keel/ship.md"
+            adapter.parent.mkdir(parents=True)
+            adapter.write_text("old")
+            rc, out, err = run(["setup", "--root", d, "--adapter-target", "claude", "--force"])
+            self.assertEqual(rc, 0, err)
+            self.assertIn("overwrote", out)
+            self.assertIn("extensions   : preserved", out)
+            self.assertIn(".keel/extensions/ will not be touched", err)
+            self.assertIn("extends: keel", target.read_text())
+            self.assertEqual(ext.read_text(), "extension\n")
+            self.assertIn("keel-generated", adapter.read_text())
+
+    def test_wizard_mode(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "pyproject.toml").write_text("x")
+            answers = ["develop", "Etc/GMT-3", "09:00-18:00", "pytest", ""]
+            with patch("builtins.input", side_effect=answers):
+                rc, out, err = run(["setup", "--root", d, "--wizard"])
+            self.assertEqual(rc, 0, err)
+            self.assertIn("keel setup wizard", out)
+            written = (Path(d) / ".keel/project.yaml").read_text()
+            self.assertIn("base_branch: develop", written)
+            self.assertIn('merge_window: "09:00-18:00"', written)
+
+    def test_invalid_existing_config_fails_validation(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / ".keel/project.yaml"
+            target.parent.mkdir()
+            target.write_text("extends: keel\n")
+            rc, out, err = run(["setup", "--root", d, "--adapter-target", "claude"])
+            self.assertEqual(rc, 1)
+            self.assertIn("using existing", out)
+            self.assertIn("validate     : failed", err)
 
 
 class TestShipHotfix(unittest.TestCase):
@@ -1109,6 +1193,37 @@ class TestInstallAdapter(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("unknown target", err)
 
+    def test_sync_alias_updates_generated_adapters(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            run(["install-adapter", "all", "--root", d])
+            ship = Path(d) / ".claude/commands/keel/ship.md"
+            ship.unlink()
+
+            rc, out, _ = run(["sync", "--root", d, "--dry-run"])
+            self.assertEqual(rc, 0)
+            self.assertIn("not upgraded by sync", out)
+            self.assertIn("would-update", out)
+            self.assertIn("dry-run: no adapter files were written", out)
+            self.assertIn("keel validate .keel/project.yaml --root .", out)
+            self.assertIn("keel plan .keel/project.yaml --root .", out)
+            self.assertFalse(ship.exists())
+
+            rc, out, _ = run(["sync", "--root", d, "--target", "claude"])
+            self.assertEqual(rc, 0)
+            self.assertIn("updated", out)
+            self.assertTrue(ship.exists())
+
+    def test_sync_failure_does_not_print_next_steps(self):
+        out, err = io.StringIO(), io.StringIO()
+        args = Namespace(target="codex", root=".", dry_run=False)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli._cmd_sync(args)
+        self.assertEqual(rc, 1)
+        self.assertIn("not upgraded by sync", out.getvalue())
+        self.assertNotIn("keel validate", out.getvalue())
+        self.assertIn("unknown target", err.getvalue())
+
 
 class TestInstallLegacyWrappers(unittest.TestCase):
     def test_installs_selected_legacy_wrapper(self):
@@ -1188,8 +1303,9 @@ class TestParser(unittest.TestCase):
                                 {"version", "validate", "plan", "run-gates", "window", "ship",
                                  "ship-v2", "implement", "ci-check", "morning", "capabilities",
                                  "wrap", "overnight", "init",
+                                 "setup",
                                  "install-adapter",
-                                 "adapter-status", "update-adapter", "project-commands",
+                                 "adapter-status", "update-adapter", "sync", "project-commands",
                                  "install-legacy-wrappers"})
 
 
