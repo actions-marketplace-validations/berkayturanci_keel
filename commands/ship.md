@@ -52,10 +52,22 @@ keel plan .keel/project.yaml --root . --command ship --live --json \
 
 Parse `contract.issue_intake` before s2. If `status` is `needs-input`, post or ask the
 generated `questions` and STOP that issue before branch/worktree/code mutation. If `status`
-is `blocked` or `out-of-scope`, record the `ledger_record`, skip mutation, and move to the
-next selected issue when watch/work-block policy allows. Only `ready` may proceed to s2.
-This is the same readiness discipline expected from a human teammate: clarify the ticket
-before starting work and keep the clarification trail in the run ledger.
+is `blocked` or `out-of-scope`, append or preserve the structured run-ledger record,
+skip mutation, and move to the next selected issue when watch/work-block policy allows.
+Only `ready` may proceed to s2. This is the same readiness discipline expected from a
+human teammate: clarify the ticket before starting work and keep the clarification trail
+in the run ledger.
+
+**Run ledger.** Read `contract.run_ledger` from `keel plan --json` or the
+`result.run_ledger` block from `keel ship --json`. Do not infer ship outcomes by parsing
+free-form PR or issue comments. For live runs, append exactly one structured record with
+`keel ship .keel/project.yaml --root . --live --append-ledger --run-id <id> --issue <N>
+--pull-request <PR> --capture-status <applied|deferred|skipped> --capture-reason <reason>
+--implementer <agent> --reviewer-agent <agent> --tester <agent> --approve-scope <scopes>
+--operator <operator> --json` after the ship assessment and capture status are known.
+If the configured ledger path is missing, treat it as empty history; if a ledger record is
+malformed, stop capture/reporting and ask for operator help instead of silently falling
+back to comment scraping.
 
 **GitHub transport.** Prefer the `gh` CLI when present (richer JSON, `--watch`); detect
 once at session start (`command -v gh`) and, when absent, fall back to an equivalent
@@ -311,11 +323,18 @@ codename, PR number, changed files, docs touched, capture outcome). Run any post
 open a follow-up docs-only PR that itself merges inline through s10's lock with a
 window-bypass carve-out, or file a follow-up issue) fail-soft, emit its audit marker, and
 do a post-merge worktree safety-net cleanup. **Marker discipline:** every merged PR that
-reaches capture must emit exactly one canonical capture marker — a success-set or one of the
-closed skip vocabulary (`dry-run` / `deferred` / `merge-failed` / a recursion guard /
-capability-unavailable) — keyed by PR number; a session-end verifier greps these and flips
-the session to blocked if any merged PR is missing its marker. The closure comment's capture
-field is mandatory and never empty (empty = silent-skip bug).
+reaches capture must write exactly one structured ledger record with a non-empty
+`capture.status` — a success-set or one of the closed skip vocabulary (`dry-run` /
+`deferred` / `merge-failed` / a recursion guard / `capability-unavailable`) — keyed by PR
+number. A session-end verifier reads `keel ledger .keel/project.yaml --root . --json` and
+blocks the session if any merged PR is missing a structured capture status. The closure
+comment's capture field is mandatory and never empty, but it is a human audit mirror, not
+the parser source.
+
+Also append the structured `ship_run` record to `contract.run_ledger.path` via
+`keel ship --live --append-ledger` or the equivalent core ledger writer. The ledger append
+is the machine-readable source for `/keel:morning`, `/keel:wrap`, overnight summaries, and
+capture verification; the closure comments are human/audit mirrors, not the parser source.
 
 ### s12 close
 Close the issue (idempotent if the squash auto-closed it via `Closes #<N>`), link the PR,
@@ -354,4 +373,4 @@ is set in exactly one place (s12, post-merge) · attribute the **effective** ven
 everywhere · a local-model implementer is orchestrator-driven, refused on tier-3, and never
 bypasses review/tester/merge gates or the lock.
 
-<!-- keel-generated: surface=plugin command=ship keel_version=0.7.0 source_sha256=61b1dd56870edb8c3e6208e1325b7d9e3a8ddb4aa28417277115df38597cd58f generated_sha256=61b1dd56870edb8c3e6208e1325b7d9e3a8ddb4aa28417277115df38597cd58f -->
+<!-- keel-generated: surface=plugin command=ship keel_version=0.7.0 source_sha256=e7343e629fc1ffe9168235f7115dfde873eb5f7a2d8542d61adb77238ebc4bca generated_sha256=e7343e629fc1ffe9168235f7115dfde873eb5f7a2d8542d61adb77238ebc4bca -->
