@@ -109,6 +109,12 @@ also enable push protection, non-provider patterns, and validity checks.
 
 **Tracking:** [#190](https://github.com/berkayturanci/keel/issues/190).
 
+**Status:** Resolved on 2026-06-09 by enabling GitHub secret scanning and push protection
+for the repository. The authenticated repository API now reports
+`secret_scanning.status=enabled` and `secret_scanning_push_protection.status=enabled`.
+Non-provider patterns and validity checks remain disabled in the current repository
+settings surface.
+
 ### Low — Concrete consumer-name literals appear in neutrality guards
 
 **Evidence:** The public-hygiene scan found concrete consumer/project-name literals used as
