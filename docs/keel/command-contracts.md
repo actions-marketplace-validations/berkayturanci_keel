@@ -13,6 +13,7 @@ describe what a command would do before an adapter starts mutating work.
 - `keel ship-v2 <project.yaml> --dry-run --json`
 - `keel ship-v2 <project.yaml> --live --json`
 - `keel ledger <project.yaml> --json`
+- `keel status <project.yaml> --json`
 - `keel checkpoint <project.yaml> --json`
 - `keel resume <project.yaml> --json`
 - `keel implement <project.yaml> <issue> --dry-run --json`
@@ -146,6 +147,26 @@ learn and where the learning goes through `policy_pack.capture` plus a `capture`
 reads the configured run ledger and returns `complete` only when every expected merged PR
 has exactly one valid marker. Missing, invalid, or duplicate markers make verification
 `incomplete` and exit non-zero.
+
+## Progress status surface
+
+`keel status <project.yaml> --root <repo> --json` exposes the
+`keel.progress-status.v1` snapshot surface. It is intentionally not a realtime daemon.
+The command reads the latest checkpoint plus the structured run ledger and reports the last
+safe boundary known to keel.
+
+The snapshot includes:
+
+- `status`: `no-active-run`, `active`, `waiting`, `interrupted`, or `completed`
+- `current`: active issue, step, PR, branch, worktree, head SHA, and wait reason when a
+  checkpoint exists
+- `history`: shipped, blocked, deferred, and skipped counts plus item summaries from the
+  run ledger
+- `next`: the next queued issue when the checkpoint queue names one
+
+Human-readable output is ordered by actionability: current issue/step/wait reason first,
+then PR/branch, shipped/blocked/deferred/skipped counts, and next item. This lets an
+operator check long-running work-block progress without scraping chat logs or PR comments.
 
 ## Checkpoint block
 
