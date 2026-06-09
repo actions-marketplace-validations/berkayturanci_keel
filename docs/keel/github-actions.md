@@ -1,9 +1,11 @@
 # Running keel on GitHub's free runner
 
-keel needs an environment with `git` and an authenticated `gh` to assess (and eventually
-ship) a real PR. A **GitHub-hosted runner already provides both** — `git` is configured and
-`gh` authenticates from the workflow's `GITHUB_TOKEN` — and public repositories get free
-Actions minutes. So the cheapest place to run keel live is a GitHub Actions workflow.
+keel needs an environment with `git` and an authenticated `gh` to assess a real PR. A
+**GitHub-hosted runner already provides both** — `git` is configured and `gh`
+authenticates from the workflow's `GITHUB_TOKEN` — and public repositories get free
+Actions minutes. The packaged workflow therefore runs the deterministic assessment slice
+on GitHub's free runner, while the full agentic ship loop still runs in an agent host that
+can delegate implementation and reviews.
 
 ## The `keel-ship` workflow
 
@@ -40,9 +42,10 @@ Copy the workflow and change two things:
 
 Everything else (the runner, `git`, `gh`, the free minutes) comes from GitHub.
 
-## What this does *not* do yet
+## Boundary
 
-This runs the **agent-free** slice (classify → CI → gates → decision) and comments it. The
-live *merge* and the *agentic* steps (implement / multi-agent review) still need a runner
-that can dispatch a coding agent; the workflow is the place that will host them once
-`keel ship --execute` lands.
+This workflow runs the **agent-free** slice (classify → CI → gates → decision) and comments
+it. The live *merge* and the *agentic* steps (implement / multi-agent review) intentionally
+remain in the installed `/keel:<command>` adapters and their agent host, where operator
+consent, delegation, model attribution, worktree isolation, and project extensions are
+available.

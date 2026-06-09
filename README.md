@@ -67,7 +67,7 @@ Keel sits between three established tool categories:
 | category | examples | where they usually stop | what Keel adds |
 |---|---|---|---|
 | Coding agents | OpenHands, SWE-agent, Copilot coding agent, Devin | create or update a PR | intake, review gates, merge policy, closeout, capture hooks |
-| PR reviewers | CodeRabbit, Qodo / PR-Agent, Greptile, Cursor Bugbot | review an existing PR | implementation loop, tests, merge lock/window, planned learning capture |
+| PR reviewers | CodeRabbit, Qodo / PR-Agent, Greptile, Cursor Bugbot | review an existing PR | implementation loop, tests, merge lock/window, closeout capture |
 | Merge queues | GitHub Merge Queue, Mergify, Graphite, Trunk | serialize tested PRs | issue ownership before the PR exists |
 
 Keel is not trying to replace those tools. It is the work-ownership backbone that can use

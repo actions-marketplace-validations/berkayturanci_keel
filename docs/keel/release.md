@@ -15,9 +15,8 @@ project intentionally publishes as `keel-workflow`.
 
 ## Current Release State
 
-As of 2026-06-09, the latest production PyPI release before the `1.0.0` tag is
-`keel-workflow==0.9.0`, owned by `berkayturanci`. Verify the current state before every
-new release with:
+As of 2026-06-09, the current production PyPI release is `keel-workflow==1.0.1`,
+owned by `berkayturanci`. Verify the current state before every new release with:
 
 ```bash
 python -m pip index versions keel-workflow

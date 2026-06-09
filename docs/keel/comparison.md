@@ -8,8 +8,9 @@ keel is an **agent-agnostic, project-agnostic work-ownership backbone** that dri
 single GitHub issue end-to-end through a fixed lifecycle: issue intake/readiness →
 branch/worktree → implement (coding agent) → push → CI wait → multi-agent code review
 (review→debate→verify→synthesize) → project test/build/lint gates → risk classification
-(TIER 1/2/3 → reviewer count) → safe merge → close → capture hooks. First-class durable
-post-merge learning capture is planned in #134. Distinctive elements:
+(TIER 1/2/3 → reviewer count) → safe merge → close → capture hooks. v1 includes the
+capture marker/verifier contract, redaction-before-durability guardrails, capture-health
+surfacing, and optional learning-quality decisions in the run ledger. Distinctive elements:
 
 - **Agent adapters** (Claude Code, Codex, Gemini, Antigravity) behind one backbone.
 - **`.keel/project.yaml`** per project (base branch, build/lint/test commands, CI names, file globs) + pluggable "Lego" extension gates.
@@ -18,7 +19,7 @@ post-merge learning capture is planned in #134. Distinctive elements:
 
 The crux of keel's novelty hypothesis: nobody combines *(fixed issue→done ownership
 backbone)* + *(agent-agnostic adapters)* + *(merge-window/lock invariants)* +
-*(multi-agent debate review)* + *(capture hooks today, durable learning capture planned)*
+*(multi-agent debate review)* + *(closeout capture with learning-quality decisions)*
 in one open, deterministic tool. The research below tests that.
 
 ## Executive comparison — work ownership, not only automation
@@ -42,22 +43,22 @@ Keel does not compete with a single category. The closest tools each own one sli
   [Mergify pause docs](https://docs.mergify.com/merge-queue/pause/)
 
 Keel's product claim is narrower and more integrated: it turns a coding agent into a
-work owner. It starts before the PR exists and ends after merge, closure, and the current
-capture hook stage.
+work owner. It starts before the PR exists and ends after merge, closure, capture markers,
+and optional project-owned learning decisions.
 
 | capability | Keel | Coding agents | PR reviewers | Merge queues |
 |---|---:|---:|---:|---:|
 | Takes an issue as input | yes | yes | no | no |
-| Performs intake/readiness gating | planned (#147) | partial | no | no |
+| Performs intake/readiness gating | yes | partial | no | no |
 | Implements code | yes, through adapters | yes | no | no |
 | Opens or updates a PR | yes | yes | no | no |
 | Performs independent review / jury | yes | partial | yes | no |
 | Runs project gates | yes | partial | partial | yes, as required checks |
 | Owns merge window + lock | yes | no | no | partial queue controls |
 | Closes the issue / PR loop | yes | partial | no | partial |
-| Supports multi-issue work blocks | planned (#146) | partial | no | queue-only |
-| Supports resume/checkpoint/reconcile | planned (#149, #141) | partial | no | partial queue state |
-| Captures post-merge learning | planned (#134) | no | partial repo memory | no |
+| Supports multi-issue work blocks | yes | partial | no | queue-only |
+| Supports resume/checkpoint/reconcile | yes | partial | no | partial queue state |
+| Captures post-merge learning | yes, policy-gated | no | partial repo memory | no |
 | Project policy extensibility | yes | partial | partial | yes |
 | Agent/vendor agnostic | yes | partial | no | not applicable |
 
@@ -70,11 +71,11 @@ job is to connect those proven pieces into one deterministic, project-neutral li
 
 | idea to borrow | source category | Keel issue |
 |---|---|---|
-| Plan-before-code / readiness before implementation | coding agents + human team workflow | #147 |
-| Cloud/session progress and operator visibility | Copilot coding agent sessions, coding agent UX | #148 |
-| Checkpoint and resume after interrupted work | coding agent sessions + merge queue state | #149 |
+| Plan-before-code / readiness before implementation | coding agents + human team workflow | shipped in v1 |
+| Cloud/session progress and operator visibility | Copilot coding agent sessions, coding agent UX | shipped as ledger snapshots / status in v1 |
+| Checkpoint and resume after interrupted work | coding agent sessions + merge queue state | shipped in v1 |
 | Queue pause/freeze and out-of-order hotfix language | Mergify, Graphite, Trunk | shipped via #18/#20 |
-| Repository memory/context with redaction | Greptile, PR review tools | #134, #142, #143 |
+| Repository memory/context with redaction | Greptile, PR review tools | shipped as capture policy, redaction, and learning decisions in v1 |
 | Low-noise inline vs summary review UX | CodeRabbit, Qodo / PR-Agent, Cursor Bugbot | shipped basics; refine via review-cycle work |
 | Plugin/marketplace install surface | agent platforms and Claude Code plugin model | #135 |
 | Capability detection and safe degradation | agent platform packaging and local tool variance | shipped basics; reused by #134 |
