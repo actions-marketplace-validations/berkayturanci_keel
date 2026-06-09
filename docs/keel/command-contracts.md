@@ -190,6 +190,9 @@ markdown verbatim for humans.
 The block records:
 
 - `schema_version: keel.closure-comment.v1`
+- `comment_marker: <!-- keel.closure-comment.v1 -->`, rendered at the top of the
+  comment so external evidence checks can distinguish the actual s11 closure comment from
+  PR bodies, chat summaries, and automated assessment comments
 - `heading` (`Ship outcome`) and the ordered `sections`: implementer, reviewers, tester,
   pull_request, changed_files, docs_touched, capture, run_id
 - the `docs_touched` section renders `- **Docs touched:** yes|no` directly after the

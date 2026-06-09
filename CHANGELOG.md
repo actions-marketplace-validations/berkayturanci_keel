@@ -6,6 +6,16 @@ All notable changes to keel are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **Ship comment evidence on every path** — the `ship` adapter now explicitly requires
+  operator-driven runs, delegated runs, every tier, and the TIER-1 single-reviewer path to
+  post the s7 review verdict as a distinct PR review/comment. The s11 ship-outcome closure
+  must also be posted as distinct issue and PR comments, never folded into the PR body or
+  represented by the automated CI assessment block.
+- **Closure evidence marker** — rendered ship-outcome comments now include a stable hidden
+  `keel.closure-comment.v1` marker so future evidence checks can distinguish the actual s11
+  closure from PR bodies, chat summaries, and CI assessment comments.
+
 ### Removed
 - Removed the stale legacy `adapters/` directory; the canonical adapter source is
   `src/keel/adapters/commands/` (generated into the plugin `commands/`,

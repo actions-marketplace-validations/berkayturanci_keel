@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 CLOSURE_SCHEMA_VERSION = "keel.closure-comment.v1"
+COMMENT_MARKER = f"<!-- {CLOSURE_SCHEMA_VERSION} -->"
 HEADING = "Ship outcome"
 JURY_LABEL = "AI Jury"
 
@@ -35,6 +36,7 @@ def contract_as_dict() -> dict[str, Any]:
     """Return the stable closure-comment contract consumed by ship adapters."""
     return {
         "schema_version": CLOSURE_SCHEMA_VERSION,
+        "comment_marker": COMMENT_MARKER,
         "heading": HEADING,
         "source": "run-ledger ship_run record",
         "deterministic": True,
@@ -66,7 +68,7 @@ def render_closure_comment(record: dict[str, Any]) -> str:
     ``capture`` status of ``None`` renders ``not recorded``.
     """
     actors = record.get("actors") or {}
-    lines: list[str] = [f"## {HEADING}", ""]
+    lines: list[str] = [COMMENT_MARKER, "", f"## {HEADING}", ""]
     lines.extend(_target_line(record.get("target")))
     lines.append(f"- **Implementer:** {_value(actors.get('implementer'))}")
     lines.append(f"- **Reviewers:** {_reviewers(actors.get('reviewers'))}")

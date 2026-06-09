@@ -279,7 +279,12 @@ reviewer and log it (record the effective vendor that ran).
 
 **Post findings per `--review-comments` (inline default):** review findings are public PR
 evidence. The orchestrator MUST post each reviewer's final verdict to the GitHub PR through
-the selected transport; local/chat-only review output does not satisfy the step.
+the selected transport as a distinct PR review or PR comment. This applies on every path:
+operator-driven, delegated, every tier, and the TIER-1 single-reviewer path. A single
+reviewer still emits a posted verdict comment/review for the current PR head.
+Local/chat-only review output does not satisfy the step, a rich PR body is not a substitute
+for this s7 evidence, and the automated `keel ship` CI assessment block is not a substitute
+for the operator-posted review verdict.
 
 - `inline` → fetch the diff once; anchor each `critical`/`major` finding as an **inline
   review comment** on its `file:line` (resolve `RIGHT`/`LEFT` side; `line` is the new-file
@@ -356,12 +361,15 @@ queue. The merge lock and "never `gh pr merge` outside s10" are non-negotiable i
 ### s11 capture
 Record the run for `/keel:wrap`: the **effective** implementer + reviewer vendors/models,
 tier, rounds, window decision, and outcome. Post the **closure comment** to **both** the
-issue and the PR. Render it deterministically from the `ship_run` ledger record via the
-`result.closure_comment` field of `keel ship --json` (the `contract.closure_comment`
-contract describes its sections: heading, Implementer `vendor (model)`, Reviewers — noting
-AI Jury when present, Tester, PR number, changed files, capture outcome, run id). Do **not**
-hand-write closure prose: post the rendered markdown verbatim so the issue and PR comments
-mirror the ledger byte-for-byte. Run any post-merge
+issue and the PR as distinct comments. The PR closure comment MUST be a PR conversation
+comment, not appended to or folded into the PR body, and not represented by the automated
+`keel ship` CI assessment block. Render it deterministically from the `ship_run` ledger
+record via the `result.closure_comment` field of `keel ship --json` (the
+`contract.closure_comment` contract describes its stable marker plus sections: heading,
+Implementer `vendor (model)`, Reviewers — noting AI Jury when present, Tester, PR number,
+changed files, capture outcome, run id). Do **not** hand-write closure prose: post the
+rendered markdown verbatim so the issue and PR comments mirror the ledger byte-for-byte.
+Run any post-merge
 `capture` Lego (e.g. durable-learning capture: classify the merged PR's signal, optionally
 file a follow-up issue or hand off to a project-owned destination) fail-soft, emit its
 core marker, and do a post-merge worktree safety-net cleanup. **Marker discipline:** every
@@ -420,4 +428,4 @@ is set in exactly one place (s12, post-merge) · attribute the **effective** ven
 everywhere · a local-model implementer is orchestrator-driven, refused on tier-3, and never
 bypasses review/tester/merge gates or the lock.
 
-<!-- keel-generated: surface=plugin command=ship keel_version=1.0.1 source_sha256=be6eb58914e6cc1aceb37f9f3afe41d319a43365041b511dca67aee69aeea303 generated_sha256=be6eb58914e6cc1aceb37f9f3afe41d319a43365041b511dca67aee69aeea303 -->
+<!-- keel-generated: surface=plugin command=ship keel_version=1.0.1 source_sha256=c71ba0a048bb61c7e582fb611557841ca00ef19d0494fd8ce428b4830185269e generated_sha256=c71ba0a048bb61c7e582fb611557841ca00ef19d0494fd8ce428b4830185269e -->
