@@ -36,6 +36,30 @@ class TestReleaseDocs(unittest.TestCase):
                 self.assertTrue(tags, f"expected at least one versioned git install in {path}")
                 self.assertEqual(tags, [expected_tag])
 
+    def test_public_v1_surfaces_do_not_carry_stale_roadmap_claims(self):
+        public_paths = [
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "website/index.html",
+            REPO_ROOT / "docs/keel/comparison.md",
+            REPO_ROOT / "docs/keel/github-actions.md",
+            REPO_ROOT / "docs/keel/release.md",
+        ]
+        stale_phrases = [
+            "latest production PyPI release before the `1.0.0` tag",
+            "`keel-workflow==0.9.0`",
+            "First-class durable post-merge learning capture is planned",
+            "capture hooks today, durable learning capture planned",
+            "planned learning capture",
+            "folded into <code>/keel:ship</code> as extensions",
+            "once `keel ship --execute` lands",
+        ]
+
+        for path in public_paths:
+            text = path.read_text(encoding="utf-8")
+            for phrase in stale_phrases:
+                with self.subTest(path=str(path.relative_to(REPO_ROOT)), phrase=phrase):
+                    self.assertNotIn(phrase, text)
+
 
 if __name__ == "__main__":
     unittest.main()
