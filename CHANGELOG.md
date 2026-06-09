@@ -6,6 +6,8 @@ All notable changes to keel are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-06-09
+
 ### Fixed
 - **Ship comment evidence on every path** — the `ship` adapter now explicitly requires
   operator-driven runs, delegated runs, every tier, and the TIER-1 single-reviewer path to
