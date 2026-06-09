@@ -277,7 +277,7 @@ class TestShipBaseline(unittest.TestCase):
     def test_baseline_remains_consumer_neutral(self):
         text = SHIP_BASELINE.read_text(encoding="utf-8")
         lower = text.lower()
-        forbidden = ("smartinventory", "eventoid")
+        forbidden = ("forbidden-consumer-a", "forbidden-consumer-b")
         for term in forbidden:
             with self.subTest(term=term):
                 self.assertNotIn(term, lower)

@@ -129,6 +129,9 @@ the same consumer-neutrality coverage.
 
 **Tracking:** [#191](https://github.com/berkayturanci/keel/issues/191).
 
+**Status:** Resolved on 2026-06-09 by replacing concrete consumer-name deny-list literals
+with generic sentinel names in the consumer-neutrality guards and release-smoke checks.
+
 ## Accepted Risk
 
 ### Command gates execute configured shell commands
