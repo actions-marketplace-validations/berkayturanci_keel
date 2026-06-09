@@ -11,8 +11,8 @@ import tempfile
 from pathlib import Path
 
 CONSUMER_SPECIFIC_TERMS = (
-    "smartinventory",
-    "eventoid",
+    "forbidden-consumer-a",
+    "forbidden-consumer-b",
     "firebase",
     "realm",
     "billing",

@@ -20,8 +20,8 @@ CORE_WORKFLOW_SURFACES = (
 )
 
 CONSUMER_SPECIFIC_TERMS = (
-    "smartinventory",
-    "eventoid",
+    "forbidden-consumer-a",
+    "forbidden-consumer-b",
     "firebase",
     "realm",
     "billing",
