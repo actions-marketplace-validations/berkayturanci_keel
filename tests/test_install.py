@@ -327,6 +327,15 @@ class TestInstallAll(unittest.TestCase):
                     self.assertIn("Testing", text)
                     self.assertIn("Docs Impact", text)
                     self.assertIn("MUST POST", text)
+                    self.assertIn("operator-driven, delegated, every tier", text)
+                    self.assertIn("TIER-1 single-reviewer path", text)
+                    self.assertIn("rich PR body is not a substitute", text)
+                    self.assertIn(
+                        "automated `keel ship` CI assessment block is not a substitute",
+                        text,
+                    )
+                    self.assertIn("PR closure comment MUST be a PR conversation", text)
+                    self.assertIn("not appended to or folded into the PR body", text)
                     self.assertIn("single jury summary/verdict comment", text)
                     self.assertIn("GitHub PR via a body-file", text)
 
@@ -498,6 +507,12 @@ class TestClaudeCodePlugin(unittest.TestCase):
         body, _marker = install._split_marker(install.plugin_files()["commands/ship.md"])
         self.assertIn("The PR body MUST NOT be only a closing reference.", body)
         self.assertIn("MUST POST", body)
+        self.assertIn("operator-driven, delegated, every tier", body)
+        self.assertIn("TIER-1 single-reviewer path", body)
+        self.assertIn("rich PR body is not a substitute", body)
+        self.assertIn("automated `keel ship` CI assessment block is not a substitute", body)
+        self.assertIn("PR closure comment MUST be a PR conversation", body)
+        self.assertIn("not appended to or folded into the PR body", body)
         self.assertIn("single jury summary/verdict comment", body)
         self.assertIn("GitHub PR via a body-file", body)
 

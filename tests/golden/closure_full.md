@@ -1,3 +1,5 @@
+<!-- keel.closure-comment.v1 -->
+
 ## Ship outcome
 
 **Target:** issue #170

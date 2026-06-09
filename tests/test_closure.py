@@ -58,7 +58,8 @@ class TestRenderClosureComment(unittest.TestCase):
 
     def test_heading_and_sections_present(self):
         rendered = closure.render_closure_comment(_record())
-        self.assertTrue(rendered.startswith(f"## {closure.HEADING}\n"))
+        self.assertTrue(rendered.startswith(f"{closure.COMMENT_MARKER}\n\n## {closure.HEADING}\n"))
+        self.assertIn("<!-- keel.closure-comment.v1 -->", rendered)
         for label in (
             "**Target:**",
             "**Implementer:**",
@@ -304,6 +305,7 @@ class TestClosureContract(unittest.TestCase):
     def test_contract_shape(self):
         contract = closure.contract_as_dict()
         self.assertEqual(contract["schema_version"], closure.CLOSURE_SCHEMA_VERSION)
+        self.assertEqual(contract["comment_marker"], closure.COMMENT_MARKER)
         self.assertEqual(contract["heading"], closure.HEADING)
         self.assertTrue(contract["deterministic"])
         self.assertTrue(contract["consumer_neutral"])
