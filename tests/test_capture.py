@@ -16,6 +16,10 @@ def _config_with_capture_policy(policy):
     )
 
 
+def _config_with_learning_policy(policy):
+    return _config_with_capture_policy({"learning": policy})
+
+
 def _record(pr, *, issue=None, marker=None):
     return {
         "schema_version": "keel.run-ledger.v1",
@@ -46,6 +50,24 @@ class TestCaptureContract(unittest.TestCase):
 
         self.assertTrue(contract["policy_enabled"])
         self.assertEqual(contract["policy_mode"], "marker-only")
+
+    def test_contract_exposes_learning_quality_policy(self):
+        contract = capture.contract_as_dict(
+            _config_with_learning_policy({"enabled": True, "mode": "create-learning"})
+        )
+
+        learning = contract["learning_quality"]
+        self.assertEqual(learning["schema_version"], "keel.capture-learning.v1")
+        self.assertEqual(learning["decisions"], [
+            "create-learning",
+            "marker-only",
+            "defer",
+            "duplicate",
+        ])
+        self.assertTrue(learning["policy_enabled"])
+        self.assertEqual(learning["policy_mode"], "create-learning")
+        self.assertTrue(learning["marker_required_for_every_merge"])
+        self.assertTrue(learning["durable_learning_optional"])
 
     def test_marker_round_trip_for_applied(self):
         text = capture.marker_text(pr_number=167, status="applied")
@@ -195,6 +217,219 @@ class TestCaptureContract(unittest.TestCase):
         self.assertEqual(record["status"], "skipped")
         self.assertEqual(record["marker_reason"], "dry-run")
         self.assertIsNone(record["marker"])
+
+    def test_record_marker_without_status_still_records_learning_decision(self):
+        record = capture.record_marker(
+            pr_number=170,
+            status=None,
+            reason="not captured yet",
+        )
+
+        self.assertIsNone(record["status"])
+        self.assertIsNone(record["marker"])
+        self.assertEqual(record["learning"]["decision"], "marker-only")
+        self.assertEqual(record["learning"]["reason"], "policy-unavailable")
+
+    def test_learning_quality_policy_unavailable_records_marker_only(self):
+        record = capture.record_marker(
+            pr_number=170,
+            status="applied",
+            changed_files=["src/keel/capture.py"],
+        )
+
+        self.assertEqual(record["marker"], "compound-learning: pr=170 status=applied")
+        self.assertEqual(record["learning"]["decision"], "marker-only")
+        self.assertEqual(record["learning"]["reason"], "policy-unavailable")
+        self.assertFalse(record["learning"]["durable_artifact"])
+
+    def test_learning_quality_policy_can_create_learning(self):
+        decision = capture.learning_decision(
+            title="Fix recurring CI release failure",
+            labels=["enhancement"],
+            changed_files=["src/keel/release.py"],
+            capture_status="applied",
+            config=_config_with_learning_policy({
+                "enabled": True,
+                "mode": "create-learning",
+                "reason": "new release invariant",
+            }),
+        )
+
+        self.assertEqual(decision["decision"], "create-learning")
+        self.assertEqual(decision["reason"], "new release invariant")
+        self.assertTrue(decision["durable_artifact"])
+
+    def test_learning_quality_create_policy_is_marker_only_when_capture_skipped(self):
+        decision = capture.learning_decision(
+            title="Capture skipped by policy",
+            changed_files=["src/keel/capture.py"],
+            capture_status="skipped:no-policy",
+            config=_config_with_learning_policy({
+                "enabled": True,
+                "mode": "create-learning",
+            }),
+        )
+
+        self.assertEqual(decision["decision"], "marker-only")
+        self.assertEqual(decision["reason"], "capture-skipped")
+        self.assertFalse(decision["durable_artifact"])
+
+    def test_learning_quality_policy_can_defer(self):
+        decision = capture.learning_decision(
+            title="Needs human synthesis",
+            changed_files=["docs/keel/release.md"],
+            capture_status="applied",
+            config=_config_with_learning_policy({
+                "enabled": True,
+                "mode": "defer",
+            }),
+        )
+
+        self.assertEqual(decision["decision"], "defer")
+        self.assertEqual(decision["reason"], "policy-deferred")
+        self.assertFalse(decision["durable_artifact"])
+
+    def test_learning_quality_marker_only_policy(self):
+        decision = capture.learning_decision(
+            title="Routine generated adapter sync",
+            changed_files=[".claude/commands/keel/ship.md"],
+            capture_status="applied",
+            config=_config_with_learning_policy({
+                "enabled": True,
+                "mode": "marker-only",
+                "reason": "routine generated sync",
+            }),
+        )
+
+        self.assertEqual(decision["decision"], "marker-only")
+        self.assertEqual(decision["reason"], "routine generated sync")
+
+    def test_learning_quality_detects_duplicate_fingerprint(self):
+        fingerprint = capture.learning_fingerprint(
+            title="Release invariant",
+            labels=["enhancement"],
+            changed_files=["src/keel/release.py"],
+        )
+        existing = [{
+            "run_id": "RUN-1",
+            "pull_request": {"number": 1},
+            "capture": {
+                "learning": {
+                    "decision": "create-learning",
+                    "fingerprint": fingerprint,
+                },
+            },
+        }]
+
+        decision = capture.learning_decision(
+            title="  release   invariant ",
+            labels=["enhancement"],
+            changed_files=["SRC\\KEEL\\RELEASE.PY"],
+            capture_status="applied",
+            existing_records=existing,
+            config=_config_with_learning_policy({
+                "enabled": True,
+                "mode": "create-learning",
+            }),
+        )
+
+        self.assertEqual(decision["decision"], "duplicate")
+        self.assertEqual(decision["reason"], "duplicate-learning")
+        self.assertEqual(decision["duplicate_of"], "RUN-1")
+        self.assertFalse(decision["durable_artifact"])
+
+    def test_learning_quality_can_disable_dedupe(self):
+        fingerprint = capture.learning_fingerprint(
+            title="Release invariant",
+            labels=["enhancement"],
+            changed_files=["src/keel/release.py"],
+        )
+        existing = [{
+            "run_id": "RUN-1",
+            "capture": {
+                "learning": {
+                    "decision": "create-learning",
+                    "fingerprint": fingerprint,
+                },
+            },
+        }]
+
+        decision = capture.learning_decision(
+            title="Release invariant",
+            labels=["enhancement"],
+            changed_files=["src/keel/release.py"],
+            capture_status="applied",
+            existing_records=existing,
+            config=_config_with_learning_policy({
+                "enabled": True,
+                "mode": "create-learning",
+                "dedupe": {"enabled": False},
+            }),
+        )
+
+        self.assertEqual(decision["decision"], "create-learning")
+        self.assertNotIn("duplicate_of", decision)
+
+    def test_learning_quality_duplicate_scan_ignores_irrelevant_records(self):
+        fingerprint = capture.learning_fingerprint(
+            title="Release invariant",
+            labels=["enhancement"],
+            changed_files=["src/keel/release.py"],
+        )
+        existing = [
+            "not a record",
+            {"capture": "not a capture block"},
+            {"capture": {}},
+            {
+                "capture": {
+                    "learning": {
+                        "decision": "create-learning",
+                        "fingerprint": "different",
+                    },
+                },
+            },
+            {
+                "capture": {
+                    "learning": {
+                        "decision": "marker-only",
+                        "fingerprint": fingerprint,
+                    },
+                },
+            },
+            {
+                "pull_request": {"number": 12},
+                "capture": {
+                    "learning": {
+                        "decision": "duplicate",
+                        "fingerprint": fingerprint,
+                    },
+                },
+            },
+        ]
+
+        decision = capture.learning_decision(
+            title="Release invariant",
+            labels=["enhancement"],
+            changed_files=["src/keel/release.py"],
+            capture_status="applied",
+            existing_records=existing,
+            config=_config_with_learning_policy({
+                "enabled": True,
+                "mode": "create-learning",
+            }),
+        )
+
+        self.assertEqual(decision["decision"], "duplicate")
+        self.assertEqual(decision["duplicate_of"], "12")
+
+    def test_learning_result_rejects_unknown_decision(self):
+        with self.assertRaisesRegex(capture.CaptureError, "unsupported learning decision"):
+            capture._learning_result(  # noqa: SLF001 - exercising validation guard.
+                "unknown",
+                reason="test",
+                fingerprint="abc123",
+                policy={},
+            )
 
     def test_recursion_guard_detects_capture_work(self):
         self.assertTrue(capture.recursion_guard(title="Add capture contract"))
