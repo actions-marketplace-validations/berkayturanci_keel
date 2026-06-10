@@ -253,8 +253,11 @@ Log the decision (`jury: enabled (reason; mode) / disabled`).
 
 ### s6 ci
 Push the branch, open the **draft** PR, and wait for the project's `ci_workflows` to go
-green. Evaluate the rollup with **failure-before-pending** precedence — a mixed state with
-any failure is a failure, never poll past it. Three branches:
+green. When opening the PR the orchestrator MUST apply the evidence gate label — the
+`evidence_gate_label` knob (default `keel:ship`) — to the PR, so the required
+`keel evidence (required)` check engages for ship-driven PRs (hand-authored PRs that lack
+the label are not gated). Evaluate the rollup with **failure-before-pending** precedence — a
+mixed state with any failure is a failure, never poll past it. Three branches:
 - **all green** (`success`/`skipped`/`neutral`/`stale`) ⇒ proceed.
 - **empty check set** ⇒ allow only if every changed path is in `docs_gate_paths`, else
   mark blocked ("CI did not run on a non-docs PR").
@@ -436,4 +439,4 @@ is set in exactly one place (s12, post-merge) · attribute the **effective** ven
 everywhere · a local-model implementer is orchestrator-driven, refused on tier-3, and never
 bypasses review/tester/merge gates or the lock.
 
-<!-- keel-generated: surface=plugin command=ship keel_version=1.0.2 source_sha256=d9566d996812b8b73c2896e01f4b074250d36d2c9622c124f61100e017966099 generated_sha256=d9566d996812b8b73c2896e01f4b074250d36d2c9622c124f61100e017966099 -->
+<!-- keel-generated: surface=plugin command=ship keel_version=1.0.2 source_sha256=5f1b2908c2df6061c1b2b69a5e2954bcb53b6e9bd93ea90bf5a550e786ff3c60 generated_sha256=5f1b2908c2df6061c1b2b69a5e2954bcb53b6e9bd93ea90bf5a550e786ff3c60 -->
