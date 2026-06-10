@@ -7,6 +7,13 @@ All notable changes to keel are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **BREAKING:** removed the `keel ship-v2` command (`/keel:ship-v2`). The compound-engineering
+  profile is now a flag on `ship`: `keel ship --compound` (`/keel:ship --compound`), with
+  `--profile compound` as the long form. It is the same backbone, the same safety gates, and
+  the same s4/s7/s9/s11 step overrides — only the invocation surface changed (a removed
+  command became a profile flag). `keel plan --command ship --profile compound` renders the
+  same compound contract. The `ship-v2` adapter, plugin command, Claude slash command, and
+  `keel-ship-v2` skill were deleted. (#223)
 - **Required evidence gate is now opt-in** — `keel evidence-verify` enforces the fail-closed
   pre-merge evidence contract only when the PR carries the `evidence_gate_label` knob
   (default `keel:ship`), which `keel:ship` applies when it opens the PR. PRs without the
