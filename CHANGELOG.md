@@ -6,6 +6,23 @@ All notable changes to keel are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.2] — 2026-06-11
+
+### Fixed
+- **Capture redaction handles comma/semicolon-joined credential assignments.**
+  The credential-assignment redactor now stops before sibling assignments joined by
+  commas or semicolons, so audit counts and retained non-secret fields stay accurate
+  without over-redacting a whole compact object or statement. (#291)
+- **Scaffolded YAML values are rendered as safe scalars.** `keel init` / `keel setup`
+  now quote generated `project.yaml` scalar values through the YAML serializer, preventing
+  newline/key-shaped setup input from injecting sibling config keys. (#292)
+
+### Security
+- **Publish workflow no longer resolves runtime dependencies unhashed in the privileged
+  release job.** PyYAML is now included in the hash-locked release tooling file, and SBOM
+  generation installs the just-built wheel with `--no-deps`, closing the remaining
+  unhashed dependency resolution path in `publish.yml`. (#293)
+
 ## [1.2.1] — 2026-06-11
 
 ### Added
