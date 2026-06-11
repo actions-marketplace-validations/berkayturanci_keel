@@ -6,6 +6,8 @@ All notable changes to keel are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-06-11
+
 ### Changed
 - **BREAKING:** configured state file paths are now constrained to the project root.
   `policy_pack.reports.run_ledger` and `policy_pack.reports.checkpoint` must be relative
