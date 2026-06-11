@@ -16,6 +16,14 @@ PROJECTS = Path(__file__).resolve().parent.parent / "projects"
 REPO_ROOT = PROJECTS.parent
 
 
+def _trusted_comment(body):
+    return {"body": body, "author_association": "MEMBER"}
+
+
+def _write_json_fixture(path, value):
+    Path(_write_raw(json.dumps(value))).replace(path)
+
+
 def run(argv):
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -1075,17 +1083,17 @@ class TestShip(unittest.TestCase):
             issue_comments = root / "issue-comments.json"
             reviews = root / "reviews.json"
             body = root / "body.md"
-            pr_comments.write_text(json.dumps([
-                {"body": "<!-- keel.closure-comment.v1 -->"},
-                {"body": "keel.review-verdict.v1\nReviewer A LGTM"},
-                {"body": "keel.jury-verdict.v1\nAI Jury LGTM"},
-            ]), encoding="utf-8")
-            issue_comments.write_text(json.dumps([
-                {"body": "<!-- keel.closure-comment.v1 -->"},
-            ]), encoding="utf-8")
-            reviews.write_text(json.dumps([
-                {"body": "keel.review-verdict.v1\nReviewer B LGTM"},
-            ]), encoding="utf-8")
+            _write_json_fixture(pr_comments, [
+                _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+                _trusted_comment("keel.review-verdict.v1\nReviewer A LGTM"),
+                _trusted_comment("keel.jury-verdict.v1\nAI Jury LGTM"),
+            ])
+            _write_json_fixture(issue_comments, [
+                _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+            ])
+            _write_json_fixture(reviews, [
+                _trusted_comment("keel.review-verdict.v1\nReviewer B LGTM"),
+            ])
             body.write_text("Closes #212", encoding="utf-8")
             rc, out, _ = run([
                 "evidence-verify", str(PROJECTS / "example-android.yaml"),
@@ -1170,13 +1178,13 @@ class TestShip(unittest.TestCase):
             pr_comments = root / "pr-comments.json"
             issue_comments = root / "issue-comments.json"
             reviews = root / "reviews.json"
-            pr_comments.write_text(json.dumps([
-                {"body": "<!-- keel.closure-comment.v1 -->"},
-                {"body": "keel.review-verdict.v1\nreviewer: a\nLGTM"},
-            ]), encoding="utf-8")
-            issue_comments.write_text(json.dumps([
-                {"body": "<!-- keel.closure-comment.v1 -->"},
-            ]), encoding="utf-8")
+            _write_json_fixture(pr_comments, [
+                _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+                _trusted_comment("keel.review-verdict.v1\nreviewer: a\nLGTM"),
+            ])
+            _write_json_fixture(issue_comments, [
+                _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+            ])
             reviews.write_text("[]", encoding="utf-8")
             rc, out, _ = run([
                 "evidence-verify", str(PROJECTS / "example-android.yaml"),
@@ -1254,14 +1262,14 @@ class TestShip(unittest.TestCase):
             issue_comments = root / "issue-comments.json"
             reviews = root / "reviews.json"
             body = root / "body.md"
-            pr_comments.write_text(json.dumps([
-                {"body": "<!-- keel.closure-comment.v1 -->"},
-                {"body": "keel.review-verdict.v1\nreviewer: a\nLGTM"},
-                {"body": "keel.review-verdict.v1\nreviewer: b\nLGTM"},
-            ]), encoding="utf-8")
-            issue_comments.write_text(json.dumps([
-                {"body": "<!-- keel.closure-comment.v1 -->"},
-            ]), encoding="utf-8")
+            _write_json_fixture(pr_comments, [
+                _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+                _trusted_comment("keel.review-verdict.v1\nreviewer: a\nLGTM"),
+                _trusted_comment("keel.review-verdict.v1\nreviewer: b\nLGTM"),
+            ])
+            _write_json_fixture(issue_comments, [
+                _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+            ])
             reviews.write_text("[]", encoding="utf-8")
             body.write_text("Closes #212", encoding="utf-8")
             rc, out, _ = run([
@@ -1288,9 +1296,9 @@ class TestShip(unittest.TestCase):
             pr_comments = root / "pr-comments.json"
             issue_comments = root / "issue-comments.json"
             reviews = root / "reviews.json"
-            pr_comments.write_text(json.dumps([
-                {"body": "<!-- keel.closure-comment.v1 -->"},
-            ]), encoding="utf-8")
+            _write_json_fixture(pr_comments, [
+                _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+            ])
             issue_comments.write_text("[]", encoding="utf-8")
             reviews.write_text("[]", encoding="utf-8")
             rc, out, _ = run([
@@ -1357,17 +1365,20 @@ class TestShip(unittest.TestCase):
                 ]))
             if endpoint.endswith("/issues/300/comments"):
                 return Namespace(ok=True, output=json.dumps([
-                    {"body": "<!-- keel.closure-comment.v1 -->"},
-                    {"body": "keel.review-verdict.v1\nreviewer: a\nhead: abc123\nLGTM"},
+                    _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+                    _trusted_comment("keel.review-verdict.v1\nreviewer: a\nhead: abc123\nLGTM"),
                 ]))
             if endpoint.endswith("/pulls/300/reviews"):
                 return Namespace(ok=True, output=json.dumps([
-                    {"body": "keel.review-verdict.v1\nreviewer: b\nLGTM",
-                     "commit_id": "abc123"},
+                    {
+                        "body": "keel.review-verdict.v1\nreviewer: b\nLGTM",
+                        "commit_id": "abc123",
+                        "author_association": "MEMBER",
+                    },
                 ]))
             if endpoint.endswith("/issues/212/comments"):
                 return Namespace(ok=True, output=json.dumps([
-                    {"body": "<!-- keel.closure-comment.v1 -->"},
+                    _trusted_comment("<!-- keel.closure-comment.v1 -->"),
                 ]))
             return Namespace(ok=False, output="unexpected endpoint")
 
@@ -1404,15 +1415,15 @@ class TestShip(unittest.TestCase):
                 ]))
             if endpoint.endswith("/issues/300/comments"):
                 return Namespace(ok=True, output=json.dumps([
-                    {"body": "<!-- keel.closure-comment.v1 -->"},
-                    {"body": "keel.review-verdict.v1\nreviewer: a\nhead: abc123\nLGTM"},
-                    {"body": "keel.review-verdict.v1\nreviewer: b\nhead: abc123\nLGTM"},
+                    _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+                    _trusted_comment("keel.review-verdict.v1\nreviewer: a\nhead: abc123\nLGTM"),
+                    _trusted_comment("keel.review-verdict.v1\nreviewer: b\nhead: abc123\nLGTM"),
                 ]))
             if endpoint.endswith("/pulls/300/reviews"):
                 return Namespace(ok=True, output="[]")
             if endpoint.endswith("/issues/212/comments"):
                 return Namespace(ok=True, output=json.dumps([
-                    {"body": "<!-- keel.closure-comment.v1 -->"},
+                    _trusted_comment("<!-- keel.closure-comment.v1 -->"),
                 ]))
             return Namespace(ok=False, output="unexpected endpoint")
 
@@ -1439,16 +1450,16 @@ class TestShip(unittest.TestCase):
             issue_comments = root / "issue-comments.json"
             reviews = root / "reviews.json"
             body = root / "body.md"
-            pr_comments.write_text(json.dumps([
-                {"body": "<!-- keel.closure-comment.v1 -->"},
-                {"body": "keel.review-verdict.v1\nreviewer: a\nhead: abc123\nLGTM"},
-                {"body": "keel.review-verdict.v1\nreviewer: b\nhead: abc123\nLGTM"},
-                {"body": "keel.review-verdict.v1\nreviewer: c\nhead: abc123\nLGTM"},
-                {"body": "keel.jury-verdict.v1\nhead: abc123\nAI Jury LGTM"},
-            ]), encoding="utf-8")
-            issue_comments.write_text(json.dumps([
-                {"body": "<!-- keel.closure-comment.v1 -->"},
-            ]), encoding="utf-8")
+            _write_json_fixture(pr_comments, [
+                _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+                _trusted_comment("keel.review-verdict.v1\nreviewer: a\nhead: abc123\nLGTM"),
+                _trusted_comment("keel.review-verdict.v1\nreviewer: b\nhead: abc123\nLGTM"),
+                _trusted_comment("keel.review-verdict.v1\nreviewer: c\nhead: abc123\nLGTM"),
+                _trusted_comment("keel.jury-verdict.v1\nhead: abc123\nAI Jury LGTM"),
+            ])
+            _write_json_fixture(issue_comments, [
+                _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+            ])
             reviews.write_text("[]", encoding="utf-8")
             body.write_text("Closes #212", encoding="utf-8")
             rc, out, _ = run([
@@ -1487,15 +1498,15 @@ class TestShip(unittest.TestCase):
                 ]))
             if endpoint.endswith("/issues/300/comments"):
                 return Namespace(ok=True, output=json.dumps([
-                    {"body": "<!-- keel.closure-comment.v1 -->"},
-                    {"body": "keel.review-verdict.v1\nReviewer A LGTM"},
-                    {"body": "keel.review-verdict.v1\nReviewer B LGTM"},
+                    _trusted_comment("<!-- keel.closure-comment.v1 -->"),
+                    _trusted_comment("keel.review-verdict.v1\nReviewer A LGTM"),
+                    _trusted_comment("keel.review-verdict.v1\nReviewer B LGTM"),
                 ]))
             if endpoint.endswith("/pulls/300/reviews"):
                 return Namespace(ok=True, output="[]")
             if endpoint.endswith("/issues/99/comments"):
                 return Namespace(ok=True, output=json.dumps([
-                    {"body": "<!-- keel.closure-comment.v1 -->"},
+                    _trusted_comment("<!-- keel.closure-comment.v1 -->"),
                 ]))
             return Namespace(ok=False, output="unexpected endpoint")
 
