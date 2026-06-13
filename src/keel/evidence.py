@@ -22,6 +22,7 @@ JURY_VERDICT_MARKER = "keel.jury-verdict.v1"
 SHIP_ASSESSMENT_HEADING = "### \U0001f6a2 keel ship"
 DEFAULT_WAIVER_LABEL = "keel:evidence-waived"
 TRUSTED_AUTHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+TRUSTED_SHIP_ASSESSMENT_BOTS = frozenset({"github-actions", "github-actions[bot]"})
 
 _FIELD_RE = re.compile(r"^\s*(?P<key>reviewer|head)\s*:\s*(?P<value>\S+)\s*$",
                        re.IGNORECASE | re.MULTILINE)
@@ -78,6 +79,8 @@ def gate_decision(
         return _gate_decision(True, "gate-label", gate_label)
     if head_ref and _SHIP_BRANCH_RE.search(head_ref):
         return _gate_decision(True, "ship-branch", head_ref)
+    if _has_trusted_ship_assessment(pr_comments or []):
+        return _gate_decision(True, "ship-assessment-comment", SHIP_ASSESSMENT_HEADING)
     if _has_trusted_review_marker([*(pr_comments or []), *(pr_reviews or [])]):
         return _gate_decision(True, "review-verdict-marker", REVIEW_VERDICT_MARKER)
     if ledger_records:
@@ -99,6 +102,21 @@ def _gate_decision(
         "reason": reason,
         "source": source,
     }
+
+
+def _has_trusted_ship_assessment(items: list[dict[str, Any]]) -> bool:
+    return any(
+        _is_ship_assessment_source(item) and _is_ship_assessment(_body(item))
+        for item in items
+    )
+
+
+def _is_ship_assessment_source(item: dict[str, Any]) -> bool:
+    if _is_trusted_source(item, enforced=True):
+        return True
+    user = item.get("user") if isinstance(item.get("user"), dict) else {}
+    login = user.get("login") if isinstance(user.get("login"), str) else None
+    return bool(login and login.lower() in TRUSTED_SHIP_ASSESSMENT_BOTS)
 
 
 def contract_as_dict(

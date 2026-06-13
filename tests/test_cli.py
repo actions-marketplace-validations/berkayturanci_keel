@@ -1228,6 +1228,51 @@ class TestShip(unittest.TestCase):
             "review-verdict-1",
         ])
 
+    def test_evidence_verify_ship_assessment_arms_gate_without_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            pr_comments = root / "pr-comments.json"
+            issue_comments = root / "issue-comments.json"
+            reviews = root / "reviews.json"
+            body = root / "body.md"
+            _write_json_fixture(pr_comments, [
+                {
+                    "author_association": "NONE",
+                    "user": {"login": "github-actions[bot]"},
+                    "body": "### \U0001f6a2 keel ship\nstatus: pass",
+                },
+            ])
+            issue_comments.write_text("[]", encoding="utf-8")
+            reviews.write_text("[]", encoding="utf-8")
+            body.write_text("Closes #322", encoding="utf-8")
+            rc, out, _ = run([
+                "evidence-verify", str(PROJECTS / "example-android.yaml"),
+                "--root", str(REPO_ROOT),
+                "--pr", "324",
+                "--reviewers", "2",
+                "--head-ref", "issue-322-reveal",
+                "--changed-file", "website/index.html",
+                "--changed-file", "website/site.webmanifest",
+                "--changed-file", "website/workspace.css",
+                "--pr-comments-json", str(pr_comments),
+                "--issue-comments-json", str(issue_comments),
+                "--pr-reviews-json", str(reviews),
+                "--pr-body-file", str(body),
+                "--json",
+            ])
+
+        self.assertEqual(rc, 1)
+        data = json.loads(out)
+        self.assertTrue(data["enforced"])
+        self.assertEqual(data["gate"]["reason"], "ship-assessment-comment")
+        self.assertEqual(data["verification"]["status"], "fail")
+        self.assertEqual(data["verification"]["missing"], [
+            "closure-comment-pr",
+            "closure-comment-issue",
+            "review-verdict-1",
+            "review-verdict-2",
+        ])
+
     def test_evidence_verify_human_output_and_dry_run(self):
         rc, out, _ = run([
             "evidence-verify", str(PROJECTS / "example-android.yaml"),
@@ -1296,6 +1341,23 @@ class TestShip(unittest.TestCase):
         self.assertEqual(data["gate"]["reason"], "operator-waiver-label")
         self.assertEqual(data["verification"]["required_count"], 0)
 
+    def test_evidence_verify_waiver_human_output_reports_note(self):
+        rc, out, _ = run([
+            "evidence-verify", str(PROJECTS / "example-android.yaml"),
+            "--root", str(REPO_ROOT),
+            "--pr", "300",
+            "--head-ref", "fix/issue-266-evidence-arming",
+            "--pr-label", "keel:evidence-waived",
+            "--pr-comments-json", _write_raw("[]"),
+            "--issue-comments-json", _write_raw("[]"),
+            "--pr-reviews-json", _write_raw("[]"),
+        ])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("enforced      : false (operator-waiver-label)", out)
+        self.assertIn("required      : 0", out)
+        self.assertIn("note          : evidence gate disarmed by operator waiver label", out)
+
     def test_evidence_verify_hand_authored_pr_without_provenance_is_ungated(self):
         rc, out, _ = run([
             "evidence-verify", str(PROJECTS / "example-android.yaml"),
@@ -1309,6 +1371,8 @@ class TestShip(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertIn("enforced      : false (no-ship-provenance)", out)
+        self.assertIn("required      : 0", out)
+        self.assertIn("note          : evidence gate not enforced", out)
 
     def test_evidence_verify_fixture_keeps_explicit_issue(self):
         rc, out, _ = run([
