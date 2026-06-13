@@ -290,7 +290,7 @@ window.KEEL = {
       summary: "pip install keel-workflow (Python ≥3.11, one runtime dep: PyYAML), or pin a git tag.",
       body:
         "<p>keel is a Python (≥3.11) package with one runtime dependency (PyYAML).</p>" +
-        "<pre class='doc-pre'><code>pip install keel-workflow                                       <span class='cm'># from PyPI (provides the `keel` command)</span>\npip install \"git+https://github.com/berkayturanci/keel@v1.2.2\"  <span class='cm'># or pin an existing git tag</span></code></pre>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Install commands'><code>pip install keel-workflow                                       <span class='cm'># from PyPI (provides the `keel` command)</span>\npip install \"git+https://github.com/berkayturanci/keel@v1.2.2\"  <span class='cm'># or pin an existing git tag</span></code></pre>" +
         "<p>In a cloud agent session, install it from a <code>SessionStart</code> hook (or add keel to the session's repo scope) so the selected core ref is available before a run.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/README.md",
     },
@@ -298,7 +298,7 @@ window.KEEL = {
       group: "Start here", title: "Quickstart", slug: "quickstart",
       summary: "validate, plan, then dry-run ship to see tier, window, gates and the decision.",
       body:
-        "<pre class='doc-pre'><code>keel validate projects/example-flutter.yaml   <span class='cm'># validate a config against the schema</span>\nkeel plan     projects/example-flutter.yaml   <span class='cm'># show the backbone plan for a project</span>\nkeel version</code></pre>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Quickstart CLI commands'><code>keel validate projects/example-flutter.yaml   <span class='cm'># validate a config against the schema</span>\nkeel plan     projects/example-flutter.yaml   <span class='cm'># show the backbone plan for a project</span>\nkeel version</code></pre>" +
         "<p><code>keel plan</code> renders the fixed backbone with each project's gates / extensions slotted in — exactly what a dry-run executes.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/README.md",
     },
