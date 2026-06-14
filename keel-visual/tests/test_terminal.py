@@ -88,6 +88,18 @@ class TestFrame(unittest.TestCase):
         self.assertIn("at s6 · ci", out)
         self.assertIn("●", out)
 
+    def test_flow_long_ids_stay_aligned(self):
+        # overnight has word-length phase ids; the caret and the active label must
+        # land on the active node's column (adaptive cell width).
+        st = rs.build_run_state(None, command="overnight")
+        out = t.frame(st, 2, style="flow", color=False)
+        lines = out.split("\n")
+        pipeline = lines[2]
+        pointer = next(line for line in lines if "▲" in line)
+        cell_w = 10  # max(4, len("preflight")+1)
+        self.assertEqual(pointer.index("▲"), 2 * cell_w)
+        self.assertIn(pipeline[2 * cell_w], "●◉◆↻○")
+
     def test_wave_blocked_gate_glyph(self):
         out = t.frame(_state(checkpoint="s8", major=1), 8, style="wave", color=False)
         self.assertIn("at s8 · test", out)
@@ -121,9 +133,10 @@ class TestHeaderAndHelpers(unittest.TestCase):
         self.assertEqual(out.count("░"), 5)
 
     def test_exercised_indices(self):
-        st = rs.build_run_state(None, command="review")
+        # Every phase of a command's own flow is exercised.
+        st = rs.build_run_state(None, command="overnight")
         idxs = t.exercised_indices(st)
-        self.assertEqual(idxs, [0, 1, 7, 8, 12])
+        self.assertEqual(idxs, [0, 1, 2, 3, 4])
 
     def test_exercised_defaults_true(self):
         self.assertEqual(t.exercised_indices({"steps": [{"id": "s0"}]}), [0])
