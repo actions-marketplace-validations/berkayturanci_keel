@@ -167,6 +167,39 @@ def live_state_from_checkpoint(record: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+# The cross-vendor jury vocabulary keel writes (see keel.ship.resolve_jury):
+# "off" disabled; "advisory"/"gating" enabled. Recognised modes are the ONLY
+# values ever surfaced — an unrecognised mode is normalised to a safe literal so
+# no arbitrary record string reaches the DOM (mirrors how `command` falls back).
+_JURY_INACTIVE = {"off", "none", "disabled", ""}
+_JURY_KNOWN = {"off", "advisory", "gating", "none", "disabled"}
+
+# The backbone step the jury attaches to (s7 review).
+REVIEW_STEP_ID = "s7"
+
+
+def jury_from_record(record: dict[str, Any] | None) -> dict[str, Any]:
+    """Extract the cross-vendor jury state from a ship_run ``record``.
+
+    keel records ``run_context.jury_mode`` (``off`` / ``advisory`` / ``gating``)
+    when a ship run resolves the jury — tier-3 auto-enables it, ``--jury`` forces
+    it; the actual jury (``ai-jury`` when installed) is fail-soft, so this is read
+    from *keel's own ledger*, never from ai-jury. Returns ``{"mode", "active"}``:
+    ``active`` is true unless the mode is in the inactive set, and ``mode`` is
+    always a recognised token (``on`` for an unknown-but-enabled value) so no
+    untrusted record string is ever surfaced. Pure — reads only its argument.
+    """
+    rec = record if isinstance(record, dict) else None
+    run_context = rec.get("run_context") if rec else None
+    raw = run_context.get("jury_mode") if isinstance(run_context, dict) else None
+    norm = raw.strip().lower() if isinstance(raw, str) and raw.strip() else None
+    if norm is None:
+        return {"mode": None, "active": False}
+    active = norm not in _JURY_INACTIVE
+    mode = norm if norm in _JURY_KNOWN else ("on" if active else "off")
+    return {"mode": mode, "active": active}
+
+
 # Checkpoint merge_state -> merge-gate outcome shown by the visualizer.
 _MERGE_STATE_OUTCOME = {
     "merged": "pass", "pending": "pending", "failed": "fail",
@@ -269,6 +302,7 @@ def build_run_state(
 
     issue = rec.get("issue") if rec else None
     pr = rec.get("pull_request") if rec else None
+    jury = jury_from_record(rec) if is_ship else {"mode": None, "active": False}
     return {
         "schema_version": SCHEMA_VERSION,
         "command": command,
@@ -278,6 +312,7 @@ def build_run_state(
         "active_id": flow[active].id,
         "merged": merged,
         "merge_state": live_merge if isinstance(live_merge, str) else None,
+        "jury": jury,
         "steps": steps,
         "regression": _regression(flow, active, counts, is_ship=is_ship),
     }

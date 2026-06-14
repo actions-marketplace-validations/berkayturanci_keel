@@ -20,6 +20,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from .runstate import REVIEW_STEP_ID
+
 RESET = "\x1b[0m"
 _CODES = {
     "dim": "\x1b[38;5;245m",
@@ -102,7 +104,11 @@ def _header(run: dict[str, Any], *, enable: bool) -> str:
         tag = paint("merged", "green", enable=enable)
     else:
         tag = paint("in progress", "dim", enable=enable)
-    return f"{line}   [{tag}]"
+    head = f"{line}   [{tag}]"
+    jury = run.get("jury") or {}
+    if jury.get("active"):
+        head += f"   [{paint('jury', 'cyan', enable=enable)}]"
+    return head
 
 
 def frame(run: dict[str, Any], active: int, *, style: str = "flow", color: bool = True) -> str:
@@ -154,6 +160,9 @@ def _flow_body(
             word = f"  [{paint('merged', 'green', enable=color)}]"
     elif cur.get("kind") == "loop":
         word = f"  [{paint('fix loop ↩', 'amber', enable=color)}]"
+    jury = run.get("jury") or {}
+    if cur.get("id") == REVIEW_STEP_ID and jury.get("active"):
+        word += f"  [{paint('jury: ' + str(jury.get('mode', 'on')), 'cyan', enable=color)}]"
     caret = paint("▲", "cyan", enable=color)
     pointer = f"{pointer_pad}{caret} {cur.get('id')} · {cur.get('name')}{word}"
 
