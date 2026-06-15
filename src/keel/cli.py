@@ -3480,6 +3480,9 @@ def _fetch_latest_pypi_version(
     rather than crashing or blocking. The network seam (``_open``) is injectable so
     the parsing is unit-tested offline; the live ``urlopen`` boundary is excluded.
     """
+    if not url.startswith(("http://", "https://")):
+        return None  # restrict to http(s): no file://, ftp://, or custom schemes
+
     if _open is None:  # pragma: no cover - live network boundary
         from urllib.request import urlopen
         _open = lambda u, t: urlopen(u, timeout=t)  # noqa: E731
