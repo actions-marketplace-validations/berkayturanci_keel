@@ -6,6 +6,33 @@ All notable changes to keel-visual are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.4] — 2026-06-16
+
+### Added
+- **Filter box on the live dashboard.** A search field in the `serve` dashboard header
+  filters runs as you type — by project, label (`#PR`/issue/run-id), or command — and
+  composes with the all/active toggle. Useful when many projects' runs share the board.
+- **Favicon on the board pages.** The `serve` dashboard and the `render` board now
+  carry the keel mark as an inline SVG favicon, so the browser tab shows the brand
+  glyph instead of a blank icon (self-contained data URI — no extra file to serve).
+
+### Fixed
+- **A finished run is no longer mislabelled "merged".** The board mapped a `done`
+  activity record straight to `merged`, so any closed-out run — a `morning`/`triage`
+  that never merges, or a `ship`/`pr-loop` that **deferred** its merge to the next
+  window — showed a green "merged" badge it hadn't earned. A finished-but-not-merged
+  run is now a distinct **"done"** state: it still fades/filters like a completed run,
+  but carries a muted "done" badge, and only a real merge (checkpoint/ledger) shows
+  the green "merged". Applies to the live `serve` dashboard and the `render` board
+  (2D + 3D).
+
+### Changed
+- **Board de-duplicates a ship run's activity record against its checkpoint.** As of
+  keel 1.6.3 the `ship` adapter stamps the activity channel too (so agent-driven ship
+  runs reliably show live). A worktree that has both a ship checkpoint and a ship
+  activity record for the same run now lists that run once — keyed by the shared
+  run-id — preferring the checkpoint's richer detail (merge gate, jury, test gate).
+
 ## [0.5.3] — 2026-06-16
 
 ### Fixed
