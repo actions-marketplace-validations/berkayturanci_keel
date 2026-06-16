@@ -6,6 +6,19 @@ All notable changes to keel-visual are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.6] — 2026-06-16
+
+### Added
+- **A 3D-style switch inside the drawer's 3D view.** The per-run 3D scene now has a
+  `curve · helix · ring · line` picker — four distinct 3D arrangements of the same step
+  markers (the active step glows in each): the rising **curve**, a **helix** spiral, a
+  **ring**, and a flat **line**. The choice is remembered in `localStorage` and the
+  scene re-frames itself for whichever layout you pick. (runviz's particle styles —
+  plexus/aurora/comet — remain a heavier optional port for a future release.)
+- **Zoom in the drawer 3D** — scroll to zoom on desktop, pinch on touch (dolly, clamped).
+- **command / phase / status under the 3D too.** The run meta table moved out of the 2D
+  body into a shared footer, so it shows under both the 2D step list and the 3D scene.
+
 ## [0.5.5] — 2026-06-16
 
 ### Added
