@@ -53,9 +53,15 @@ contractual step — do not skip it. The one allowed exception is a core too old
 ```bash
 keel validate .keel/project.yaml --root .     # config + extensions must be valid
 keel plan     .keel/project.yaml --root .     # the backbone + this project's gates/Lego
-keel plan     .keel/project.yaml --root . --command ship --live --json
+keel plan     .keel/project.yaml --root . --command ship --live --json \
+              --run-id "$RUN_ID" --issue <N>  # ALSO stamps the activity board (run shows live)
 keel window   .keel/project.yaml              # is the merge window open right now?
 ```
+
+Passing `--run-id`/`--issue` to this Step 0 plan makes core write the activity record
+itself, so the run appears on `keel-visual`'s board the moment it plans — you do not
+depend on the per-phase `keel activity` calls below for the run to *show up* (they still
+advance it). Use the same `$RUN_ID` as the rest of the run (`ship-<issue-or-pr>`).
 
 The live plan is the operator-consent preflight. Before s1 and before any branch,
 worktree, GitHub write, delegation, secret, release, or production-adjacent access, parse
@@ -403,7 +409,8 @@ merge unless explicitly user-deferred), nit = advisory. The s9 loop-exit parser 
 reviewer's **returned findings**, not the comment shape, so it is mode-independent.
 
 ### s8 test (gates + jury)
-`keel run-gates .keel/project.yaml --root .` runs the project gates (`build_gate_cmd`,
+`keel run-gates .keel/project.yaml --root . --run-id "$RUN_ID" --command ship --phase s8 --issue <N>`
+runs the project gates (`build_gate_cmd`,
 `lint_cmd`, plus the `tester` Lego — the manual-test list, which may loop back to the
 implementer defensively without spending review budget unless it surfaces a blocking fix).
 When a gating or advisory jury is enabled and `result.artifact_bodies.jury_verdict_template`
@@ -473,7 +480,8 @@ gates-pass check must run deterministically inside core, not as adapter prose.
   under the repo root and registered in `git worktree list` before removing (never call
   `git worktree remove --force` directly on an implementer-supplied path).
 - **Core-owned merge:** run
-  `keel merge .keel/project.yaml --root . --pr <PR> --approve-scope <scopes> --operator <operator>`.
+  `keel merge .keel/project.yaml --root . --pr <PR> --run-id "$RUN_ID" --approve-scope <scopes> --operator <operator>`.
+  (The `--run-id` lets the merge advance the activity board to the merge step.)
   The command acquires the merge resource claim (atomic `mkdir`, single-host), re-checks
   the **merge window inside the claim**, reads the live PR check rollup with
   failure-before-pending precedence, runs `evidence-verify` against the current PR

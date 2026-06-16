@@ -6,7 +6,22 @@ All notable changes to keel are documented here. The format follows
 
 ## [Unreleased]
 
-## [1.6.3] — 2026-06-16
+## [1.6.4] — 2026-06-16
+
+### Added
+- **The backbone auto-stamps the activity board — runs show up *and advance* with no
+  agent dependence.** Real `keel ship` runs were going invisible on `keel-visual`'s board
+  because the agent orchestrates the backbone but reliably skips the per-phase
+  `keel activity` calls (and a project without checkpoint config writes no checkpoint
+  either). Now the commands the backbone *always* runs do the stamping themselves when
+  given a `--run-id`: **`keel plan`** (Step 0 → first phase), **`keel run-gates`** (the s8
+  test gate), and **`keel merge`** (s10). So a run appears the moment it plans and then
+  advances **start → test → merge** without the agent. Fail-soft (no run-id / unknown
+  command / unknown phase / write error / pre-activity core is a no-op, never an aborted
+  command) and it never moves a run backward. `plan` and `run-gates` gained
+  `--run-id`/`--issue`/`--pull-request` (run-gates also `--command`/`--phase`); `merge`
+  already had `--run-id`. The `ship` adapter's Step 0 plan, s8 run-gates, and s10 merge
+  calls now pass these; the per-phase `keel activity` calls still fill in the middle steps.
 
 ### Changed
 - **`ship` now stamps the live activity channel too.** Ship was the only command
