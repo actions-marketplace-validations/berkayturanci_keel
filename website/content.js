@@ -407,7 +407,7 @@ window.KEEL = {
       summary: "keel drives itself; CI runs keel on keel-core on every push and blocks its own merge on a failing gate.",
       body:
         "<p>keel drives <b>itself</b>. Its config is <code>.keel/project.yaml</code> (Python, <code>make test</code> + <code>make lint</code> gates) and CI runs keel on keel-core on every push.</p>" +
-        "<pre class='doc-pre'><code>keel plan      .keel/project.yaml          <span class='cm'># render keel's own backbone</span>\nkeel run-gates .keel/project.yaml --root . <span class='cm'># keel runs its own test + lint gates</span>\nkeel ship      .keel/project.yaml --root . <span class='cm'># full dry assessment</span>\n<span class='cm'>#   risk tier     : TIER-3  → 3 reviewer(s)</span>\n<span class='cm'>#   decision      : MERGE — clear to merge</span></code></pre>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Dogfooding CLI commands'><code>keel plan      .keel/project.yaml          <span class='cm'># render keel's own backbone</span>\nkeel run-gates .keel/project.yaml --root . <span class='cm'># keel runs its own test + lint gates</span>\nkeel ship      .keel/project.yaml --root . <span class='cm'># full dry assessment</span>\n<span class='cm'>#   risk tier     : TIER-3  → 3 reviewer(s)</span>\n<span class='cm'>#   decision      : MERGE — clear to merge</span></code></pre>" +
         "<p>If a step's gate fails, keel blocks its own merge — the same backbone every consumer gets.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/README.md",
     },
@@ -452,7 +452,7 @@ window.KEEL = {
       summary: "Add keel's /keel:&lt;command&gt; workflows in Claude Code with no pip install — this repo is its own plugin marketplace.",
       body:
         "<p>The same <code>/keel:&lt;command&gt;</code> flows are packaged as a <b>Claude Code plugin</b>, so you can add them to a session without <code>pip install</code> — straight from this repo's built-in marketplace:</p>" +
-        "<pre class='doc-pre'><code>/plugin marketplace add berkayturanci/keel   <span class='cm'># register the keel marketplace</span>\n/plugin install keel                          <span class='cm'># install → /keel:ship, /keel:regression, …</span></code></pre>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Claude Code plugin commands'><code>/plugin marketplace add berkayturanci/keel   <span class='cm'># register the keel marketplace</span>\n/plugin install keel                          <span class='cm'># install → /keel:ship, /keel:regression, …</span></code></pre>" +
         "<p>The plugin ships the <b>same</b> project-neutral command bodies as <code>keel install-adapter</code> — they read every value from <code>.keel/project.yaml</code>, so a project still needs <code>keel setup</code> for the flows to act. The two distribution paths are additive.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/plugin.md",
     },
