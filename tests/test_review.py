@@ -321,7 +321,7 @@ class TestReviewCli(unittest.TestCase):
 
     def test_invalid_config(self):
         reviews = _write(_two_reviews())
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".yaml", delete=False) as f:
             f.write("extends: keel\n")
             bad = f.name
         self.addCleanup(os.unlink, bad)
@@ -352,7 +352,7 @@ class TestReviewCli(unittest.TestCase):
         self.assertIn("cannot read --reviews", err)
 
     def test_malformed_json_reviews_file(self):
-        path = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        path = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False)
         path.write("{not json")
         path.close()
         self.addCleanup(os.unlink, path.name)
@@ -532,7 +532,7 @@ class TestReviewCli(unittest.TestCase):
 
     def test_live_owner_repo_missing(self):
         reviews = _write([{"reviewer": "Solo", "verdict": "LGTM"}])
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".yaml", delete=False) as f:
             f.write(_config_without_owner())
             cfg_path = f.name
         self.addCleanup(os.unlink, cfg_path)
@@ -610,7 +610,7 @@ def _live_fetch(argv, **_kw):
 
 
 def _config_without_owner() -> str:
-    lines = (PROJECTS / "example-android.yaml").read_text().splitlines()
+    lines = (PROJECTS / "example-android.yaml").read_text(encoding="utf-8").splitlines()
     kept = [line for line in lines
             if not line.startswith("owner:") and not line.startswith("repo:")]
     return "\n".join(kept) + "\n"
