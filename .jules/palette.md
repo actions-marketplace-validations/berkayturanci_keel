@@ -13,6 +13,10 @@
 **Learning:** In custom single-page applications, updating visual `.active` or `.on` classes for navigation links is insufficient for screen readers. The `aria-current="page"` attribute must be added or removed dynamically alongside visual cues for navigation links managed by JavaScript (e.g. IntersectionObserver or click handlers).
 **Action:** When updating active view states dynamically in JavaScript, always add or remove the `aria-current="page"` attribute in sync with the visual class change to maintain full screen reader accessibility.
 
+## 2024-06-25 - Syncing ARIA attributes for dynamic toggle states
+**Learning:** For dynamic toggle UI elements (like segmented controls), visually toggling an `.on` state is not enough; the corresponding ARIA attribute must be updated. For toggle buttons, this should be `aria-pressed="true"`.
+**Action:** When adding `.on` or `.active` dynamically to a UI toggle button via JavaScript (e.g. `classList.toggle("on", isActive)`), always set `aria-pressed="true"` when `isActive` is true, and remove it (or set to "false") when false to correctly convey state to screen reader users.
+
 ## 2026-06-15 - ARIA Labels on Buttons with Generic Text
 **Learning:** Copy buttons that just contain generic text like "copy" lack context for screen reader users when navigating interactively. Adding an `aria-label` provides a much more descriptive string.
 **Action:** Always add descriptive `aria-label`s to action buttons that rely solely on generic text strings (like "copy", "read more"), especially in technical documentation.
