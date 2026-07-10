@@ -216,7 +216,14 @@ def _is_out_of_scope(combined: str, labels: tuple[str, ...]) -> bool:
 def _is_blocked(combined: str, labels: tuple[str, ...]) -> bool:
     if not _BLOCKED_LABELS.isdisjoint(labels):
         return True
-    return any(_is_actionable_blocker(sentence) for sentence in _sentences(combined))
+
+    compact = " ".join(line.strip() for line in combined.splitlines() if line.strip())
+    # Fast path: bypass expensive sentence iteration if no
+    # blocked regex match exists globally in normalized text
+    if not _BLOCKED_RE.search(compact):
+        return False
+
+    return any(_is_actionable_blocker(sentence) for sentence in _sentences(compact))
 
 
 def _blocked_summary(combined: str) -> str:
