@@ -281,6 +281,139 @@ def jury_from_checkpoint(state: dict[str, Any] | None) -> dict[str, Any]:
     return _normalize_jury(raw)
 
 
+# ai-jury outcome verdicts surfaced by the visualizer (the vocabulary ai-jury's
+# own voting/CI layers use). These literals are the ONLY verdict strings that
+# ever reach a surface — anything else drops the whole block (same posture as
+# the jury modes above: no arbitrary file string reaches the DOM).
+JURY_VERDICT_BLOCKING = "REQUEST CHANGES"
+JURY_VERDICT_COMMENT = "COMMENT"
+JURY_VERDICT_APPROVE = "APPROVE"
+_JURY_VERDICTS = {JURY_VERDICT_BLOCKING, JURY_VERDICT_COMMENT, JURY_VERDICT_APPROVE}
+_JURY_SEVERITIES = ("critical", "major", "minor", "nit")
+
+
+def jury_verdict_from_outcome(data: Any) -> dict[str, Any] | None:
+    """Summarise a serialized ai-jury artifact into a small verdict block.
+
+    ``data`` is the parsed JSON of the file keel's jury gate saves to
+    ``.keel/state/jury/<run-id>.json``. Three accepted shapes:
+
+    * the ``jury --format json`` **report** (top-level ``consensus`` list with
+      ``representative.severity`` + ``verification_status``) — the shape
+      ai-jury's public CLI actually emits, and the one ship.md s8 saves;
+    * the bare ``outcome_to_dict`` dict (top-level ``reviews``/``groups``);
+    * a result-cache entry wrapping that dict under ``"outcome"``.
+
+    Verdict mapping (mirrors ai-jury's DEFAULT CI gate — ``evaluate_ci`` with
+    ``fail_on=[critical, major], ignore_unverified=True`` — and ship.md s8's
+    "only verified consensus findings fold into s9" rule):
+
+    * any **verified** critical/major group → ``REQUEST CHANGES`` (blocking)
+    * else any other non-``unsupported`` group of any severity (including an
+      unverified or disputed critical — real but not blocking under the
+      default gate) → ``COMMENT``
+    * else → ``APPROVE``
+
+    Returns ``{"verdict", "counts", "reviewers"}`` — ``counts`` is groups per
+    severity (unsupported excluded; note counts include unverified findings,
+    the verdict only blocks on verified ones), ``reviewers`` the distinct
+    review agents (report shape: the metadata panel size) — or ``None`` for
+    an unrecognised shape. Pure — reads only its argument, never raises.
+    """
+    if not isinstance(data, dict):
+        return None
+    norm = _normalized_groups(data)
+    if norm is None:
+        return None
+    group_rows, reviewers = norm
+    counts = dict.fromkeys(_JURY_SEVERITIES, 0)
+    blocking = False
+    commentable = False
+    for severity, status in group_rows:
+        if status == "unsupported":
+            continue  # verifier-rejected findings never count (ai-jury CI rule)
+        if severity in counts:
+            counts[severity] += 1
+        if status == "verified" and severity in ("critical", "major"):
+            blocking = True
+        elif severity in _JURY_SEVERITIES:
+            commentable = True
+        if severity in ("critical", "major") and status not in ("verified",):
+            commentable = True
+    if blocking:
+        verdict = JURY_VERDICT_BLOCKING
+    elif commentable or counts["minor"] or counts["nit"]:
+        verdict = JURY_VERDICT_COMMENT
+    else:
+        verdict = JURY_VERDICT_APPROVE
+    return {"verdict": verdict, "counts": counts, "reviewers": reviewers}
+
+
+def _normalized_groups(data: dict) -> tuple[list[tuple[str, str]], int] | None:
+    """Normalise any accepted artifact shape to ``([(severity, status)], reviewers)``."""
+    if isinstance(data.get("consensus"), list) and "schema_version" in data:
+        rows: list[tuple[str, str]] = []
+        for entry in data["consensus"]:
+            if not isinstance(entry, dict):
+                continue
+            rep = entry.get("representative")
+            severity = rep.get("severity") if isinstance(rep, dict) else None
+            status = entry.get("verification_status")
+            rows.append((
+                severity.strip().lower() if isinstance(severity, str) else "",
+                status.strip().lower() if isinstance(status, str) else "",
+            ))
+        metadata = data.get("metadata")
+        agents = metadata.get("agents") if isinstance(metadata, dict) else None
+        reviewers = len(agents) if isinstance(agents, list) else 0
+        return rows, reviewers
+    if isinstance(data.get("outcome"), dict):
+        inner = data["outcome"]  # result-cache entry wrapping the outcome dict
+    elif "reviews" in data:
+        inner = data  # bare outcome_to_dict shape
+    else:
+        return None
+    rows = []
+    groups = inner.get("groups")
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict):
+            continue
+        severity = group.get("severity")
+        status = group.get("status")
+        rows.append((
+            severity.strip().lower() if isinstance(severity, str) else "",
+            status.strip().lower() if isinstance(status, str) else "",
+        ))
+    reviews = inner.get("reviews")
+    agents = {
+        review["agent"].strip()
+        for review in (reviews if isinstance(reviews, list) else [])
+        if isinstance(review, dict)
+        and isinstance(review.get("agent"), str) and review["agent"].strip()
+    }
+    return rows, len(agents)
+
+
+def _jury_verdict_block(value: Any) -> dict[str, Any] | None:
+    """Validate a pre-computed jury-verdict summary for the RunState payload.
+
+    Defense-in-depth mirror of :func:`_normalize_jury`: only the recognised
+    verdict literals and non-negative int counts ever reach the payload/DOM.
+    Anything malformed drops the whole block — exactly the mode-only display.
+    Pure — reads only its argument.
+    """
+    if not isinstance(value, dict) or value.get("verdict") not in _JURY_VERDICTS:
+        return None
+    raw = value.get("counts")
+    raw = raw if isinstance(raw, dict) else {}
+    counts = {key: _count_or_none(raw.get(key)) or 0 for key in _JURY_SEVERITIES}
+    return {
+        "verdict": value["verdict"],
+        "counts": counts,
+        "reviewers": _count_or_none(value.get("reviewers")) or 0,
+    }
+
+
 # Checkpoint merge_state -> merge-gate outcome shown by the visualizer.
 _MERGE_STATE_OUTCOME = {
     "merged": "pass", "pending": "pending", "failed": "fail",
@@ -338,6 +471,7 @@ def build_run_state(
     checkpoint_step: str | None = None,
     checkpoint_state: dict[str, Any] | None = None,
     command: str = "ship",
+    jury_verdict: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project a keel ``record`` onto its command flow as a ``RunState``.
 
@@ -347,7 +481,10 @@ def build_run_state(
     :func:`live_state_from_checkpoint`). ``command`` selects the flow
     (:func:`keel.flows.flow_for`) — ``ship`` carries rich merge/test-gate and
     regression detail; every other command renders its own phases (position +
-    kinds), since only ship-style runs expose that data.
+    kinds), since only ship-style runs expose that data. ``jury_verdict`` is an
+    optional pre-computed summary of the run's saved ai-jury outcome (see
+    :func:`jury_verdict_from_outcome`) — the CLI does the file read; this stays
+    pure and only validates the block (ship-only, ``None`` otherwise).
 
     Returns a flat JSON-serialisable dict the front-end animates. Pure — reads
     only its arguments.
@@ -432,6 +569,7 @@ def build_run_state(
         "merged": merged,
         "merge_state": live_merge if isinstance(live_merge, str) else None,
         "jury": jury,
+        "jury_verdict": _jury_verdict_block(jury_verdict) if is_ship else None,
         "steps": steps,
         "regression": _regression(flow, active, counts, is_ship=is_ship),
     }
