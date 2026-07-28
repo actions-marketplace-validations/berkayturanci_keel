@@ -144,6 +144,7 @@ contracts, but executable project behavior remains in extension files or project
 | `evidence_gate_label` | string | | Legacy PR label that also arms the required pre-merge evidence gate (default `keel:ship`); ship provenance now arms the gate by default |
 | `evidence_require_distinct_vendors` | boolean | | When `true`, `evidence-verify` additionally requires each required review verdict to carry vendor provenance and that no two share a vendor (default `false`) |
 | `gate_timeout_s` | integer ≥ 1 | | wall-clock seconds a command gate may run before it is killed (default `600`) |
+| `jury_timeout_s` | integer ≥ 1 | | wall-clock seconds the `jury` built-in may run before it is killed (default `600`) |
 
 ### `knobs` field details
 
@@ -260,8 +261,34 @@ stops being red.
 
 > **Not the same as the run-control layer.** `runcontrols.contract_as_dict()` advertises
 > `"wall_clock_timeouts": False`. That refers to run budgets, step caps, and oscillation
-> halts — keel imposes no wall-clock limit on a *run*. `gate_timeout_s` is the subprocess
-> limit on a single command gate. The two are independent and do not contradict each other.
+> halts — keel imposes no wall-clock limit on a *run*. `gate_timeout_s` and `jury_timeout_s` are
+> subprocess limits on a single gate. The two are independent and do not contradict each other.
+
+#### `jury_timeout_s`
+
+Wall-clock seconds the **`jury` built-in** may run. Defaults to `600`, which is what keel
+used unconditionally before this knob existed. It is deliberately **separate** from
+`gate_timeout_s`: the jury is a cross-vendor agent CLI, not a project test command, so a
+panel that legitimately needs an hour should not force every test gate to wait an hour too.
+
+```yaml
+knobs:
+  gate_timeout_s: 1800    # this project's test suite is slow
+  jury_timeout_s: 3600    # ...and a full cross-vendor panel is slower still
+```
+
+A jury run killed by this limit — or one whose output carries no parseable verdict at all,
+whatever its exit code — **produced no review**. In `gating` mode that fails closed with a
+blocking `major`; in `advisory` mode it surfaces a non-blocking `minor`. That is the point
+of the knob: a panel that never reached a conclusion must not be reported as a clean pass.
+
+(`minor` rather than the oversize branch's `nit`: an oversize diff is a deterministic skip
+the operator can see from the diff itself, while an incomplete run is an invisible
+operational failure that will otherwise recur silently on every run.)
+
+A nonzero exit that *does* carry a parseable report is a completed review — ai-jury signals
+"request changes" that way — so its findings are used as-is. The test is deliberately
+"did we parse a verdict", not "was the exit code zero".
 
 ## `policy_pack`
 

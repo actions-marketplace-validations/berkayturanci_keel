@@ -60,7 +60,7 @@ from . import findings as fnd
 from . import orchestrator as orch
 from .extensions import ExtensionError, load_extensions
 from .gates import GateSpec
-from .model import DEFAULT_GATE_TIMEOUT_S
+from .model import DEFAULT_GATE_TIMEOUT_S, DEFAULT_JURY_TIMEOUT_S
 from .runner import command_gate_runner, run_argv
 
 
@@ -69,13 +69,16 @@ def _gate_runner(root: str, diff_text: str, *, jury_mode: str = "gating",
     """A gate runner that handles command gates plus the ``jury`` built-in (on the diff).
 
     ``timeout`` is the project's ``knobs.gate_timeout_s``; it covers any command spec
-    that reached the runner without a resolved per-gate limit.
+    that reached the runner without a resolved per-gate limit. The jury builtin reads
+    its own budget off ``spec.timeout``, which ``plan_gates`` resolves from
+    ``knobs.jury_timeout_s``.
     """
     commands = command_gate_runner(root, timeout=timeout)
 
     def run(spec: GateSpec):
         if spec.kind == "builtin" and spec.id == "jury":
-            return jury.run_gate(diff_text, cwd=root, mode=jury_mode)
+            jury_limit = spec.timeout if spec.timeout is not None else DEFAULT_JURY_TIMEOUT_S
+            return jury.run_gate(diff_text, cwd=root, mode=jury_mode, timeout=jury_limit)
         return commands(spec)
 
     return run
