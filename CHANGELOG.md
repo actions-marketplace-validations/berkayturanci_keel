@@ -6,6 +6,13 @@ All notable changes to keel are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.11.0] — 2026-07-28
+
+Most of what follows is one defect in different clothes: **a value meaning "we could not
+observe this" was spelled the same as the value meaning "we observed nothing wrong."** Every
+instance failed in the safe-looking direction, which is why the suite stayed green over all
+of them — and why several were found only by mutating the code and watching nothing die.
+
 ### Added
 - **`knobs.docs_only_allowlist` now does something** (#632): it was declared in the schema,
   parsed into `Knobs`, folded into `config_hash` and echoed into the adapter contract —
@@ -35,6 +42,19 @@ All notable changes to keel are documented here. The format follows
   `docs/keel/extensions.md` both permit.
 
 ### Fixed
+- **The release bump now covers every site surface, and cannot step over a stale one.**
+  Two separate gaps, with one symptom. `website/docs.html`, `coverage.html` and
+  `content.js` were **never registered with the tooling at all** — the runbook named them as
+  a manual step instead, and the manual step was missed, leaving them at `v1.6.5` for four
+  releases and then `v1.8.2` for three more. `website/index.html` *was* registered, but by
+  searching for the version currently in `pyproject.toml`; had it ever drifted it would have
+  matched neither the old nor the new string and been skipped forever, so the one file that
+  was wired up was wired up fragilely. All four are now matched by *shape*, which registers
+  the three missing ones and makes the literal-match fragility moot in the same stroke.
+  `tests/test_release_docs.py` derives its list from the script's own table and fails if any
+  surface falls behind; `docs/keel/release.md` drops the manual step and documents the repair
+  path (`make release-bump VERSION=<current>`).
+
 - **Re-running the ledger append no longer bricks the session** (found in review): the
   append was unconditional, so the natural retry after a crash mid-s11 wrote a *second*
   capture marker for the PR. "Exactly one marker per merged PR" was enforced nowhere at
@@ -108,6 +128,25 @@ All notable changes to keel are documented here. The format follows
   a JSON-round-tripped `None`, and an unknown severity name all mean "we cannot tell this
   was optional", and this is the certification path — only an explicit `warn`/`suggest`
   now clears it.
+
+- **`capture-verify` refuses to certify when its transport failed** (#630): the command
+  computed `transport_failed`, recorded it in the payload, and ignored it. A `gh` hiccup
+  empties the *derived* merged-PR set, so the union degenerates to exactly the list the
+  agent supplied and the anti-shrink defence the command exists to provide silently
+  evaporates — reported as `complete`, exit 0, with an un-captured PR simply absent from the
+  accounting. It is now a distinct `transport-unavailable` status with `certified: false`
+  and a non-zero exit: an audit that could not observe must say so.
+
+- **An unreadable lock owner no longer disables the ownership guard** (#631):
+  `lock._holder` returned `None` for "nobody holds this", "`owner.json` is corrupt",
+  "`owner.json` is missing" and "the read failed" alike, and the guard was written so a
+  `None` holder made the check *vanish* rather than fail closed — letting a second run
+  release a live merge claim and take the lock. Since every caller reaches `_holder` only
+  with the claim directory present, there is no "unheld" answer to give: an unreadable owner
+  is now `UNKNOWN_HOLDER` and refuses a named release, while `owner=None` stays the
+  deliberate any-owner escape for clearing a stuck claim. The window needs no disk
+  corruption — `_claim_path` creates the directory before it writes the owner file, so any
+  crash in between leaves the lock held but ownerless.
 
 - **`git` warnings on stderr no longer corrupt every parsed value** (#629): `run_argv`
   returned only `stdout + stderr` concatenated, and every `git` wrapper parsed *that*. git
