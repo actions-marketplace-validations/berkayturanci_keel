@@ -60,12 +60,18 @@ from . import findings as fnd
 from . import orchestrator as orch
 from .extensions import ExtensionError, load_extensions
 from .gates import GateSpec
+from .model import DEFAULT_GATE_TIMEOUT_S
 from .runner import command_gate_runner, run_argv
 
 
-def _gate_runner(root: str, diff_text: str, *, jury_mode: str = "gating"):
-    """A gate runner that handles command gates plus the ``jury`` built-in (on the diff)."""
-    commands = command_gate_runner(root)
+def _gate_runner(root: str, diff_text: str, *, jury_mode: str = "gating",
+                 timeout: int = DEFAULT_GATE_TIMEOUT_S):
+    """A gate runner that handles command gates plus the ``jury`` built-in (on the diff).
+
+    ``timeout`` is the project's ``knobs.gate_timeout_s``; it covers any command spec
+    that reached the runner without a resolved per-gate limit.
+    """
+    commands = command_gate_runner(root, timeout=timeout)
 
     def run(spec: GateSpec):
         if spec.kind == "builtin" and spec.id == "jury":
@@ -277,13 +283,16 @@ def _cmd_run_gates(args: argparse.Namespace) -> int:
         print(evaluation.render(), file=sys.stderr)
 
     diff_text = git.diff(config.base_branch, "HEAD", cwd=args.root)
-    outcomes = gates.run_gates(specs, _gate_runner(args.root, diff_text, jury_mode="gating"))
+    outcomes = gates.run_gates(specs, _gate_runner(args.root, diff_text, jury_mode="gating",
+                                                   timeout=config.knobs.gate_timeout_s))
     _autostamp(config, args.root, args.gate_command, getattr(args, "run_id", None),
                args.gate_phase, issue=getattr(args, "issue", None),
                pr=getattr(args, "pull_request", None))   # the run reached the test gate (s8)
     for o in outcomes:
-        status = "ok" if o.ok else "FAIL"
-        print(f"  {status:>4}  {o.gate}")
+        # A timeout still blocks; it is labelled apart so a slow host does not read
+        # as a broken test (and a hanging command still reads as red).
+        status = "ok" if o.ok else ("TIMEOUT" if o.timed_out else "FAIL")
+        print(f"  {status:>7}  {o.gate}")
 
     verdict = fnd.summarize(gates.collect_findings(outcomes))
     for f in verdict.findings:
@@ -917,7 +926,8 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     diff_text = git.diff(config.base_branch, "HEAD", cwd=args.root)
     outcomes = gates.run_gates(
         specs,
-        _gate_runner(args.root, diff_text, jury_mode=review_contract["jury"]["mode"]),
+        _gate_runner(args.root, diff_text, jury_mode=review_contract["jury"]["mode"],
+                     timeout=config.knobs.gate_timeout_s),
     )
     verdict = fnd.summarize(gates.collect_findings(outcomes))
     ci_conclusion = (
@@ -1072,7 +1082,8 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     if transport.degraded:
         print(f"  github degraded: {', '.join(transport.degraded)}")
     for o in outcomes:
-        print(f"  gate {o.gate:<14} {'ok' if o.ok else 'FAIL'}")
+        state = "ok" if o.ok else ("TIMEOUT" if o.timed_out else "FAIL")
+        print(f"  gate {o.gate:<14} {state}")
     if evaluation.missing_optional:
         print(f"  degraded opt. : {', '.join(evaluation.missing_optional)}")
     if a.halted:  # pragma: no cover - display only; logic covered in ship.assess tests

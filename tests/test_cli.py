@@ -7,6 +7,7 @@ import itertools
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -409,6 +410,22 @@ def _run_git(root: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=root, check=True, capture_output=True, text=True)
 
 
+#: A gate command that outlives the 1s limit these tests use, driven by this interpreter
+#: rather than a `sleep` binary: `shell=True` means cmd.exe on Windows, where `sleep` only
+#: resolves via Git-for-Windows happening to be on PATH. Double quotes group correctly in
+#: both sh and cmd.exe.
+#:
+#: 5s, not longer: on Windows the child is cmd.exe and the interpreter is a *grandchild*
+#: holding the inherited pipes, so subprocess's timeout path kills cmd.exe and then blocks
+#: in communicate() until the orphan exits. That bounds the real cost at this value per
+#: test on the Windows matrix legs; a 4s margin over the 1s limit is ample. POSIX is
+#: unaffected — sh execs the command, so the killed process is the sleeper itself.
+_SLOW_CMD = f'"{sys.executable}" -c "import time; time.sleep(5)"'
+#: Same command as a YAML scalar. json.dumps is valid YAML and escapes correctly, so an
+#: interpreter path containing an apostrophe cannot break the document.
+_SLOW_CMD_YAML = json.dumps(_SLOW_CMD)
+
+
 class TestRunGates(unittest.TestCase):
     def test_passing_gate(self):
         rc, out, _ = run(["run-gates", _write_config("'true'"), "--root", "."])
@@ -421,6 +438,28 @@ class TestRunGates(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL", out)
         self.assertIn("BLOCKED", out)
+
+    def test_ship_also_renders_a_timeout_apart_from_a_failure(self):
+        # #622 must land on the ship surface too, not only run-gates.
+        p = _write_raw("extends: keel\ncore_version: '^0.1'\nbase_branch: main\n"
+                       "repo: tmp\ngates: [build]\nknobs:\n"
+                       f"  build_gate_cmd: {_SLOW_CMD_YAML}\n  gate_timeout_s: 1\n")
+        with tempfile.TemporaryDirectory() as d:
+            _, out, _ = run(["ship", p, "--root", d])
+        self.assertIn("TIMEOUT", out)
+        self.assertNotIn("FAIL", out)
+
+    def test_timed_out_gate_renders_apart_from_a_failure_but_still_blocks(self):
+        # End-to-end proof of #622: knob -> plan_gates -> runner -> outcome -> render.
+        p = _write_raw("extends: keel\ncore_version: '^0.1'\nbase_branch: main\n"
+                       "repo: tmp\ngates: [build]\nknobs:\n"
+                       f"  build_gate_cmd: {_SLOW_CMD_YAML}\n  gate_timeout_s: 1\n")
+        rc, out, _ = run(["run-gates", p, "--root", "."])
+        self.assertEqual(rc, 1)             # a timeout blocks exactly as a failure does
+        self.assertIn("TIMEOUT", out)       # ...but the operator can see which it is
+        self.assertIn("BLOCKED", out)
+        self.assertIn("timed out after 1s", out)
+        self.assertNotIn("FAIL", out)
 
     def test_missing_config(self):
         rc, _, err = run(["run-gates", "/no/such.yaml"])
@@ -6440,8 +6479,21 @@ class TestGateRunner(unittest.TestCase):
     def test_command_branch_runs(self):
         from keel.gates import GateSpec
         run_gate = cli._gate_runner(".", "")
-        ok, _ = run_gate(GateSpec("build", "command", "test", "block", run="true"))
+        ok, _, timed_out = run_gate(GateSpec("build", "command", "test", "block", run="true"))
         self.assertTrue(ok)
+        self.assertFalse(timed_out)
+
+    def test_project_timeout_is_threaded_to_specs_without_their_own(self):
+        # plan_gates resolves a timeout onto every command spec, so this fallback is
+        # only reachable for a spec built elsewhere — pin it, or the wiring is dead code
+        # that nothing would notice being deleted or set to the wrong value.
+        from keel.gates import GateSpec
+        run_gate = cli._gate_runner(".", "", timeout=1)
+        ok, findings, timed_out = run_gate(
+            GateSpec("build", "command", "test", "block", run=_SLOW_CMD, timeout=None))
+        self.assertFalse(ok)
+        self.assertTrue(timed_out)
+        self.assertIn("timed out after 1s", findings[0].message)
 
     def test_jury_branch_noop_without_diff(self):
         from keel.gates import GateSpec

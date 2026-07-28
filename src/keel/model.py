@@ -4,11 +4,24 @@ This module is the single source of truth for the step IDs, the named slots an
 extension may register into, and the invariants the backbone always preserves.
 It is pure data — no I/O, no config — so consumers (config, extensions,
 orchestrator) and tests can all agree on one definition.
+
+It also holds :data:`DEFAULT_GATE_TIMEOUT_S`. That constant is not part of the step
+machine; it lives here because this is the only module with no intra-package imports,
+so ``config``, ``gates``, and ``runner`` can share one value without any of them
+importing each other. If more such shared constants appear, move them to a dedicated
+leaf module rather than letting this one accrete them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+#: Wall-clock seconds a command gate may run before it is killed, when neither the
+#: gate's own ``timeout:`` nor the project's ``knobs.gate_timeout_s`` overrides it.
+#: Lives here — the one module with no intra-package imports — so the pure planner
+#: (``gates``), the config layer, and the thin subprocess wrapper (``runner``) can
+#: share one value without any of them importing each other.
+DEFAULT_GATE_TIMEOUT_S: int = 600
 
 
 @dataclass(frozen=True)
