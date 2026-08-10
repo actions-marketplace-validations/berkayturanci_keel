@@ -20,7 +20,18 @@ def open_pr(
 
 
 def ci_conclusion(pr: int | str, *, cwd: str | None = None, _run=None) -> str | None:
-    """Return the PR's check-rollup state (e.g. SUCCESS/FAILURE/PENDING), or ``None``.
+    """Return the PR's check-rollup state (e.g. SUCCESS/FAILURE/PENDING).
+
+    Three distinct answers, because collapsing them is what let a PR with **no
+    checks at all** read as clear to merge (issue #675):
+
+    * a conclusion string — checks reported, here is what they said
+    * ``""`` — ``gh`` answered and the rollup is **empty**: nothing ran for this
+      head. A fact about the *PR*.
+    * ``None`` — ``gh`` could not be asked. A fact about the *runner*.
+
+    Only the caller can weigh those, so this returns the empty string rather than
+    folding it into ``None``. :func:`keel.ship.ci_ran` reads the distinction.
 
     ``statusCheckRollup`` retains every historical run of a check, not just the
     latest — a check that failed once and was later rerun to green still carries
@@ -65,7 +76,61 @@ def ci_conclusion(pr: int | str, *, cwd: str | None = None, _run=None) -> str | 
     )
     if not result.ok:
         return None
-    return result.stdout.strip() or None
+    return result.stdout.strip()
+
+
+def ci_check_names(pr: int | str, *, cwd: str | None = None, _run=None) -> list[str] | None:
+    """The distinct check identities reported for ``pr``, or ``None`` when ``gh`` failed.
+
+    Used for the **count** an operator sees, so "0 checks" is a visible fact rather
+    than something inferred from a blank word. Identity is ``context`` for legacy
+    commit statuses and ``name`` for check runs — the same identity
+    :func:`ci_conclusion` dedupes on, so the two views agree about what "one check"
+    is. ``[]`` means the rollup is genuinely empty; ``None`` means ``gh`` could not
+    be asked.
+    """
+    jq = (
+        "[.statusCheckRollup[] "
+        "| (.context | select(. != null and . != \"\")) "
+        "// (.name | select(. != null and . != \"\")) "
+        "// empty] "
+        "| unique | .[]"
+    )
+    return _rollup_strings(pr, jq, cwd=cwd, _run=_run)
+
+
+def ci_workflow_names(pr: int | str, *, cwd: str | None = None, _run=None) -> list[str] | None:
+    """The distinct **workflow** names that reported for ``pr``, or ``None`` on failure.
+
+    Deliberately not :func:`ci_check_names`. ``knobs.ci_workflows`` is keyed by the
+    *workflow* name (``CI``, ``CodeQL``), but the rollup reports *job* names — a
+    matrix job appears as ``test (py3.13 / ubuntu-latest)``, never as ``CI``. Asking
+    the presence question against job names would report every declared workflow
+    missing on a repo that uses a matrix, which is most of them.
+
+    ``workflowName`` is what a check run carries for this; legacy commit statuses have
+    none, so they fall back to ``context``/``name`` — a project that declares a bare
+    status-check name still matches.
+    """
+    jq = (
+        "[.statusCheckRollup[] "
+        "| (.workflowName | select(. != null and . != \"\")) "
+        "// (.context | select(. != null and . != \"\")) "
+        "// (.name | select(. != null and . != \"\")) "
+        "// empty] "
+        "| unique | .[]"
+    )
+    return _rollup_strings(pr, jq, cwd=cwd, _run=_run)
+
+
+def _rollup_strings(pr, jq: str, *, cwd: str | None, _run) -> list[str] | None:
+    result = run_argv(
+        ["gh", "pr", "view", str(pr), "--json", "statusCheckRollup", "--jq", jq],
+        cwd=cwd, **_kw(_run),
+    )
+    if not result.ok:
+        return None
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def merged_prs(
