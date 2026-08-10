@@ -21,8 +21,8 @@ obvious.
 Project-neutral flagship workflow. **Every project value comes from `.keel/project.yaml`
 via the `keel` CLI** — never hardcode a branch, command, glob, agent, timezone, window,
 allowlist, or workflow name here. Reference knobs by name: `base_branch`, `build_gate_cmd`,
-`lint_cmd`, `implementer_agents`, `tier3_globs`, `ci_workflows`, `docs_gate_paths`,
-`merge_window`, `merge_window_mode`, `timezone`. Anything truly app-specific stays in the
+`lint_cmd`, `implementer_agents`, `delegate_profiles`, `tier3_globs`, `ci_workflows`,
+`docs_gate_paths`, `merge_window`, `merge_window_mode`, `timezone`. Anything truly app-specific stays in the
 project (config knobs, or a `.keel/extensions/` Lego), never inlined here.
 
 All committed/published artifacts (commits, branch names, PR/issue titles + bodies,
@@ -101,8 +101,8 @@ credential approval from project knowledge. Store `operator_consent.delegated_ag
 for every later delegated-agent brief.
 
 `keel validate`/`plan` resolve `base_branch`, the knob commands (`build_gate_cmd`,
-`lint_cmd`), `implementer_agents`, `tier3_globs`, `ci_workflows`, `docs_gate_paths`,
-and the `tester` / `pre-merge` / `reviewers` / `capture` extensions. `keel window`
+`lint_cmd`), `implementer_agents`, `delegate_profiles`, `tier3_globs`, `ci_workflows`,
+`docs_gate_paths`, and the `tester` / `pre-merge` / `reviewers` / `capture` extensions. `keel window`
 evaluates `merge_window` in the project `timezone` and reports `merge_window_mode`
 (`pause` = halt outside the window; `freeze` = defer to the morning queue). The merge
 resource claim is acquired and released by `keel merge` at the merge step (s10) only.
@@ -198,12 +198,16 @@ capture.
   `standard`; `--compound` is an alias for `--profile compound`. The compound profile swaps
   the `s4`/`s7`/`s9`/`s11` steps to compound behavior (see the **Compound profile** section)
   without forking the backbone. Composes with every other flag (e.g. `--compound --jury`).
-- `--delegate <claude|codex|agy|ollama:MODEL|anthropic-api:MODEL|openai-api:MODEL>` — the
+- `--delegate <claude|codex|agy|ollama:MODEL|anthropic-api:MODEL|openai-api:MODEL|PROFILE>` — the
   **implementer**. Per-run override of any issue role/delegate label. `ollama:` and the
   `*-api:` values require a non-empty model. The `*-api:` values are the **hosted-API
   delegates** (no agent CLI needed — just `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` in the
-  environment; see s4). Default: the **host agent** (the CLI driving this run).
-- `--review-delegate <…>` — the **reviewer** vendor (same value set). Default: host agent.
+  environment; see s4). `PROFILE` is the name of a `knobs.delegate_profiles` entry — a
+  **generic CLI vendor** configured in `.keel/project.yaml` (e.g. `--delegate cursor`;
+  see s4). Built-in vendor names always win over a profile name. Default: the **host
+  agent** (the CLI driving this run).
+- `--review-delegate <…>` — the **reviewer** vendor (same value set, profile names
+  included). Default: host agent.
 - `--review-comments <inline|summary>` — how reviewer findings post (s7). Default `inline`.
 - `--reviewers <1|2|3>` — override the tier-derived reviewer count. Default: auto (from tier).
 - `--jury` / `--no-jury` / `--jury-advisory` — control the cross-vendor jury gate (s8).
@@ -213,7 +217,9 @@ capture.
 - `--wizard` — interactive opt-in only; runs the guided pre-s1 config collector (see
   `--wizard` section). In any non-interactive context it degrades to a logged no-op.
 
-Reject unknown `--flags`, out-of-range `--reviewers`, an empty `ollama:`/`*-api:` model, a flag
+Reject unknown `--flags`, out-of-range `--reviewers`, an empty `ollama:`/`*-api:` model, a
+`--delegate`/`--review-delegate` value that is neither a built-in vendor nor a configured
+`knobs.delegate_profiles` name, a flag
 missing its value, or a negative/zero positional. A flag and its value must appear
 together; positionals are everything not consumed by a flag. Repeated single-value flags
 (e.g. `--reviewers 2 --reviewers 3`) are user error. With **no issue numbers**, run in
@@ -297,6 +303,54 @@ Resolve the implementer: `implementer_agents` by the issue's role label, **overr
   diff, then fall back. **Local-model implementers are refused on tier-3** (high-risk,
   per `tier3_globs`; pre-classified from the issue's target paths/labels before the diff
   exists, ambiguous ⇒ treat as tier-2 and let s7 gate) — fall back to `HOST_AGENT` there.
+- **Generic CLI implementer** (a `knobs.delegate_profiles` name, e.g. `--delegate cursor`)
+  — resolve the delegate value against `knobs.delegate_profiles` **after** the built-in
+  vendors above: built-ins always win, and a profile that shadows a built-in name is a
+  `keel validate` error, never a silent override. Run the profile's `command` from the
+  project root under the **same no-tools contract as the local-model path** — the
+  orchestrator does every git/PR step itself and asks the CLI only for code generation
+  (unified diff against a size-limited slice of the in-scope files, apply it, run gates,
+  then commit/push/open the PR). Deliver the prompt per the profile's `prompt_mode`:
+  **`stdin`** (the default) writes the prompt to a temp file and pipes it in
+  (positional-arg passing hangs some CLIs), **`arg`** passes it as a positional argument
+  for CLIs whose usage requires it (`cursor-agent`'s is `agent [options] [command]
+  [prompt...]`). Model precedence: a per-run `--delegate <profile>:<model>` wins, else the
+  profile's `model`, else the CLI's own default — so one profile serves a whole family
+  (`--delegate cursor:cursor-grok-4.5-high` vs `--delegate cursor:composer-2.5`) without
+  editing config per run. Pass the effective model as **`<model_arg> <model>`**, where
+  `model_arg` is the profile's (default `--model`) — set it for a CLI that spells model
+  selection differently, because nothing guarantees the flag across arbitrary CLIs. When
+  no model is effective, pass neither, and attribute no model rather than the one that
+  was merely asked for. **Validate the model token before it reaches argv** (`keel`'s
+  `agents.is_safe_model_token`: `[A-Za-z0-9._-]`, no leading dash): unlike the profile's
+  `command`, the model can arrive from a `delegate-model:<name>` issue label, which is a
+  lower-trust source — refuse the run rather than escaping it. Retry up to 2 times on a
+  bad/unapplicable diff, then fall soft
+  back to `HOST_AGENT`. **Treat any verification a delegate reports as unperformed until
+  you reproduce it.** Not just external references — a delegate emitting the *artefact* of
+  a check instead of the check is one failure mode with several costumes, all observed:
+  specific-looking citations (registry reference numbers, archive snapshot ids) stated as
+  verified when nothing verified them; a fabricated `keel.review-verdict.v1` marker written
+  into a shipped file; "tests pass" with no run behind it. Re-run the check yourself, or
+  record the claim as unverified — never promote it to a fact in a commit, a comment, or a
+  PR body because a delegate asserted it. **Generic-CLI implementers are refused on
+  tier-3**, same rule and fallback as local models — an unvetted CLI is not a
+  high-risk-path implementer. No new
+  consent scope: this is the `shell`/subprocess surface `codex`/`agy` already use, and
+  the profile's `command` is operator-authored config exactly like `build_gate_cmd` —
+  never take it from PR content or agent output. Attribution: `agent:<vendor>` (i.e.
+  `agent:cli`) + versionless `model:<base>` for the **effective** model — the per-run
+  `--delegate <profile>:<model>` if given, else the profile's `model` — plus the profile
+  name so the s11 closure says *which* CLI ran, not just `cli`. Record that name under
+  **`delegate_profile`**, never `profile`: the run record's `profile` field already means
+  the workflow profile (`standard`/`compound`), and writing the CLI's name there would
+  overwrite it. `agents.profile_attribution()` returns the right shape already.
+  **Write the ledger's `actors.implementer` as the vendor string `cli` (or
+  `cli:<effective-model>`), never the profile name.** The evidence gate splits
+  `actors.implementer` on the first colon and cross-checks the result against the PR's
+  `agent:*` labels, so recording `cursor` there against an `agent:cli` label reads as a
+  vendor contradiction and blocks the merge. The profile name goes in `delegate_profile`,
+  as above, which is what the closure comment reads.
 - **Hosted-API implementer** (`anthropic-api:MODEL`, `openai-api:MODEL`) — the same
   no-tools contract as the local-model path with the endpoint swapped: the orchestrator
   does every git/PR step itself and requests only code generation via
@@ -409,7 +463,19 @@ read-only mode, local endpoint, or — for `anthropic-api:`/`openai-api:` — on
 call via the `api_delegate` wrapper: diff + rubric in, structured verdict out; same
 `secrets`-scope and no-retry-on-429 rules as s4, no tier restriction since review output
 is advisory, not a mutation), the orchestrator still posts — the **orchestrator owns
-all writes**; reviewers never call a GitHub write API. Spawn all reviewers in a **single
+all writes**; reviewers never call a GitHub write API.
+A **`knobs.delegate_profiles` reviewer is the one case keel cannot make read-only for
+you.** Every other non-host vendor has a mechanism behind that promise — a vendor
+read-only flag, a local endpoint, a single hosted-API call — but a profile is an
+arbitrary binary, and the same `command` serves both roles. Its `args` typically carry
+the *implementer's* write-enabling flags (`cursor-agent`'s `--force` approves edits
+non-interactively), so reusing them for review hands a reviewer permission to edit the
+checkout. Invoke a profile reviewer with **`review_args`** when set, else `args`
+(`DelegateProfile.role_args(review=True)`), and set `review_args` to a read-only
+invocation for any profile used as a reviewer. keel validates neither — this is
+operator-configured, not enforced. Treat a profile reviewer's diff as advisory and
+**re-check the worktree is clean afterwards** rather than assuming it was untouched.
+Spawn all reviewers in a **single
 Agent message** so they run concurrently; each gets a fresh codename, the PR head SHA, its
 focus slice, and a no-cross-reading instruction. Coverage invariant: when the count drops,
 focus dimensions **merge, never drop** (a 1-reviewer slot covers all dimensions; suitable
@@ -726,4 +792,4 @@ is set in exactly one place (s12, post-merge) · attribute the **effective** ven
 everywhere · a local-model implementer is orchestrator-driven, refused on tier-3, and never
 bypasses review/tester/merge gates or the lock.
 
-<!-- keel-generated: surface=skills command=ship keel_version=1.11.0 source_sha256=28030ef04fccaada2d9012d490765954c2163b87484a661d4fa5cb467d0ca118 generated_sha256=a7a63c674f8c127b73fdc2d29e16199af62acab291c8d9da360c580a5a9458f3 -->
+<!-- keel-generated: surface=skills command=ship keel_version=1.11.0 source_sha256=3bd80c5cc0e783ec71c46b991ac777b0303278feb55691b6a3b5745dc2b5c1d4 generated_sha256=be229f6905657c1ffe5b32147581c9920bdd5f857987a33f9ef343e3690a641b -->

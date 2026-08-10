@@ -28,9 +28,27 @@ SCHEMA_PATH = Path(__file__).parent / "schema" / "project.schema.json"
 
 DEFAULT_EXTENSIONS_DIR = ".keel/extensions"
 
-__all__ = ["SLOTS", "DEFAULT_EXTENSIONS_DIR", "Automation", "Knobs", "ProjectConfig",
-           "ConfigError", "load_config", "parse_config", "validate_data", "load_schema",
-           "config_hash"]
+#: Vendors a ``knobs.delegate_profiles`` entry may declare. Only the generic local-CLI
+#: vendor today (issue #659); ``openai-compatible``/``google-api`` are designed in
+#: ``docs/proposals/generic-delegate-vendors.md`` but deliberately deferred.
+DELEGATE_PROFILE_VENDORS = ("cli",)
+
+#: How a ``cli`` profile's prompt reaches the command. ``stdin`` stays the default
+#: (positional-arg passing hangs some CLIs); ``arg`` is the opt-in for CLIs whose usage
+#: makes the prompt a positional argument (e.g. ``cursor-agent``).
+DELEGATE_PROMPT_MODES = ("stdin", "arg")
+DEFAULT_PROMPT_MODE = "stdin"
+
+#: Flag a ``cli`` profile's command takes the model on. Near-universal across coding-agent
+#: CLIs (``cursor-agent``, ``gemini``, Aider all spell it ``--model``), but configurable
+#: because "arbitrary CLI" is the whole point and nothing guarantees the spelling.
+DEFAULT_MODEL_ARG = "--model"
+
+__all__ = ["SLOTS", "DEFAULT_EXTENSIONS_DIR", "DELEGATE_PROFILE_VENDORS",
+           "DELEGATE_PROMPT_MODES", "DEFAULT_PROMPT_MODE", "DEFAULT_MODEL_ARG",
+           "Automation", "DelegateProfile",
+           "Knobs", "ProjectConfig", "ConfigError", "load_config", "parse_config",
+           "validate_data", "load_schema", "config_hash", "delegate_profiles_dict"]
 
 
 class ConfigError(ValueError):
@@ -54,12 +72,53 @@ def validate_data(data: Any, schema: dict | None = None) -> list[str]:
 
 
 @dataclass(frozen=True)
+class DelegateProfile:
+    """A named generic-delegate vendor, referenced as ``--delegate <name>``.
+
+    Turns provider support into configuration: a ``cli`` profile names a local
+    coding-agent CLI (``command``) and how its prompt is delivered (``prompt_mode``),
+    so ``cursor-agent``/``gemini``/Aider/Goose become config entries rather than code
+    changes. ``command`` is operator-authored config with the same trust level as
+    ``build_gate_cmd`` — it is never taken from PR content or agent output.
+    """
+
+    vendor: str
+    command: str | None = None
+    #: Fixed flags the command always needs, e.g. ``["-p", "--force"]`` for
+    #: ``cursor-agent`` (print mode + non-interactive approval). ``command`` is one
+    #: executable, so without this an operator would have to smuggle flags into it as a
+    #: string keel would then treat as a filename.
+    args: tuple[str, ...] = ()
+    #: Flags for the **reviewer** role, when they must differ from ``args``. s7 asks a
+    #: reviewer for findings only, but ``args`` typically carries the implementer's
+    #: write-enabling flags (``--force`` approves edits non-interactively). Falls back to
+    #: ``args`` when unset — and keel cannot *enforce* read-only for an arbitrary CLI, so
+    #: this is the operator's lever, not a guarantee. See :meth:`role_args`.
+    review_args: tuple[str, ...] | None = None
+    prompt_mode: str = DEFAULT_PROMPT_MODE
+    model: str | None = None
+    #: How the effective model reaches the command: ``<model_arg> <model>``. Without it
+    #: the documented model precedence would be unimplementable for an arbitrary CLI —
+    #: attribution would record a model that was never actually selected.
+    model_arg: str = DEFAULT_MODEL_ARG
+
+    def role_args(self, *, review: bool = False) -> tuple[str, ...]:
+        """Flags for this role: ``review_args`` for a reviewer when set, else ``args``."""
+        if review and self.review_args is not None:
+            return self.review_args
+        return self.args
+
+
+@dataclass(frozen=True)
 class Knobs:
     """Per-project values consumed by the (otherwise neutral) backbone steps."""
 
     build_gate_cmd: str
     lint_cmd: str | None = None
     implementer_agents: dict[str, str] = field(default_factory=dict)
+    #: Profile name -> generic delegate vendor config. Never shadows a built-in vendor
+    #: (``claude``/``codex``/``agy``/``ollama``/``*-api``); that is a validation error.
+    delegate_profiles: dict[str, DelegateProfile] = field(default_factory=dict)
     tier3_globs: tuple[str, ...] = ()
     ci_workflows: dict[str, str] = field(default_factory=dict)
     docs_gate_paths: tuple[str, ...] = ()
@@ -119,6 +178,24 @@ def _build(data: dict) -> ProjectConfig:
         build_gate_cmd=k["build_gate_cmd"],
         lint_cmd=k.get("lint_cmd"),
         implementer_agents=dict(k.get("implementer_agents", {})),
+        delegate_profiles={
+            name: DelegateProfile(
+                vendor=profile["vendor"],
+                command=profile.get("command"),
+                args=tuple(profile.get("args", ())),
+                # An explicit null round-trips as "unset" — distinct from [], which
+                # means "the reviewer takes no flags at all".
+                review_args=(
+                    tuple(profile["review_args"])
+                    if profile.get("review_args") is not None
+                    else None
+                ),
+                prompt_mode=profile.get("prompt_mode", DEFAULT_PROMPT_MODE),
+                model=profile.get("model"),
+                model_arg=profile.get("model_arg") or DEFAULT_MODEL_ARG,
+            )
+            for name, profile in k.get("delegate_profiles", {}).items()
+        },
         tier3_globs=tuple(k.get("tier3_globs", [])),
         ci_workflows=dict(k.get("ci_workflows", {})),
         docs_gate_paths=tuple(k.get("docs_gate_paths", [])),
@@ -172,6 +249,10 @@ def parse_config(data: Any, *, source: str = "<dict>", schema: dict | None = Non
             tuple(knobs.get("optional_capabilities", [])),
             source=f"{source}: knobs.optional_capabilities",
         ))
+        errors.extend(_validate_delegate_profiles(
+            knobs.get("delegate_profiles", {}),
+            source=f"{source}: knobs.delegate_profiles",
+        ))
     if isinstance(data, dict) and isinstance(data.get("policy_pack"), dict):
         for path, names in _policy_capability_fields(data["policy_pack"]):
             errors.extend(validate_names(tuple(names), source=f"{source}: {path}"))
@@ -193,6 +274,88 @@ def config_hash(config: ProjectConfig) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _validate_delegate_profiles(profiles: Any, *, source: str) -> list[str]:
+    """Return semantic errors for ``knobs.delegate_profiles`` (empty == valid).
+
+    The schema owns the *shape* (object of objects, `vendor` required, field types);
+    this owns the *meaning*: which vendors exist, what each vendor requires, and the
+    fail-closed rule that a profile may never shadow a built-in delegate vendor.
+    """
+    # Local import on purpose: ``agents`` imports this module for ``ProjectConfig``, so
+    # naming it at module scope would close a real config <-> agents cycle. The vendor
+    # vocabulary belongs next to the dispatch logic in ``agents``, so the import moves
+    # instead of the constant (same pattern as ``runtime._api_token_capability``).
+    from .agents import BUILTIN_DELEGATE_VENDORS
+
+    errors: list[str] = []
+    if not isinstance(profiles, dict):
+        return errors  # the schema already reported the wrong shape
+    for name, profile in profiles.items():
+        where = f"{source}.{name}"
+        # A YAML mapping key is not necessarily a string: SafeLoader resolves an
+        # unquoted ``on:``/``2:``/``~:`` to bool/int/None, and the JSON schema validates
+        # property *values* only, never key types. So this has to be the first check —
+        # everything below assumes ``str`` methods, and reaching them with a bool raised
+        # an uncaught AttributeError out of ``keel validate``.
+        if not isinstance(name, str):
+            errors.append(
+                f"{source}: delegate profile name {name!r} is {type(name).__name__}, not a "
+                "string — quote the key (YAML reads a bare on/off/yes/no/true/false as a "
+                "boolean and a bare number as an int)"
+            )
+            continue
+        if name in BUILTIN_DELEGATE_VENDORS:
+            errors.append(
+                f"{where}: profile name {name!r} shadows a built-in delegate vendor; "
+                f"built-ins always win and may not be redefined "
+                f"({', '.join(BUILTIN_DELEGATE_VENDORS)}) — rename the profile"
+            )
+        elif name in DELEGATE_PROFILE_VENDORS:
+            # `delegate_profile` exists to say *which* CLI ran. A profile named after its
+            # own vendor makes every attribution field read "cli", which is exactly the
+            # ambiguity the field was added to remove.
+            errors.append(
+                f"{where}: profile name {name!r} is a delegate vendor name and would make "
+                "attribution ambiguous — agent:cli, system 'cli' and delegate_profile "
+                "'cli' would all say the same nothing. Name it after the CLI, e.g. "
+                "'cursor'"
+            )
+        # A name that can never be selected is a config error, not a silent dead entry:
+        # ``--delegate`` is split on the first colon, so a name containing one resolves
+        # to a different (missing) profile, and an empty name reads as no delegate at all.
+        if not name.strip():
+            errors.append(
+                f"{source}: a delegate profile name may not be empty or blank — "
+                "an empty --delegate reads as no delegate at all"
+            )
+        elif ":" in name:
+            errors.append(
+                f"{where}: profile name {name!r} may not contain ':' — --delegate splits "
+                "on the first colon to separate the profile from a per-run model, so this "
+                "name could never be selected"
+            )
+        if not isinstance(profile, dict) or "vendor" not in profile:
+            continue  # shape + required-field errors are the schema's job
+        vendor = profile["vendor"]
+        if vendor not in DELEGATE_PROFILE_VENDORS:
+            errors.append(
+                f"{where}: unknown delegate vendor {vendor!r}; "
+                f"valid: {', '.join(DELEGATE_PROFILE_VENDORS)}"
+            )
+        elif not profile.get("command"):
+            errors.append(
+                f"{where}: vendor {vendor!r} requires a non-empty 'command' — the "
+                "executable keel runs (e.g. cursor-agent)"
+            )
+        prompt_mode = profile.get("prompt_mode", DEFAULT_PROMPT_MODE)
+        if prompt_mode not in DELEGATE_PROMPT_MODES:
+            errors.append(
+                f"{where}: invalid prompt_mode {prompt_mode!r}; "
+                f"valid: {', '.join(DELEGATE_PROMPT_MODES)}"
+            )
+    return errors
+
+
 def _policy_capability_fields(value: Any, path: str = "policy_pack") -> list[tuple[str, list]]:
     fields: list[tuple[str, list]] = []
     if isinstance(value, dict):
@@ -209,6 +372,35 @@ def _policy_capability_fields(value: Any, path: str = "policy_pack") -> list[tup
         for i, child in enumerate(value):
             fields.extend(_policy_capability_fields(child, f"{path}[{i}]"))
     return fields
+
+
+def delegate_profiles_dict(config: ProjectConfig) -> dict:
+    """``{"delegate_profiles": {...}}``, or ``{}`` when none are configured.
+
+    Shared by :func:`_canonical` and ``contracts.project_as_dict`` so the hashed form
+    and the published contract cannot drift apart. Empty means **absent**, not ``{}``:
+    an added optional field must not change ``config_hash`` for projects that never
+    used it.
+    """
+    profiles = config.knobs.delegate_profiles
+    if not profiles:
+        return {}
+    return {
+        "delegate_profiles": {
+            name: {
+                "vendor": profile.vendor,
+                "command": profile.command,
+                "args": list(profile.args),
+                "review_args": (
+                    list(profile.review_args) if profile.review_args is not None else None
+                ),
+                "prompt_mode": profile.prompt_mode,
+                "model": profile.model,
+                "model_arg": profile.model_arg,
+            }
+            for name, profile in sorted(profiles.items())
+        }
+    }
 
 
 def _canonical(config: ProjectConfig) -> dict:
@@ -235,6 +427,10 @@ def _canonical(config: ProjectConfig) -> dict:
             "build_gate_cmd": config.knobs.build_gate_cmd,
             "lint_cmd": config.knobs.lint_cmd,
             "implementer_agents": dict(sorted(config.knobs.implementer_agents.items())),
+            # Omitted entirely when empty: emitting "delegate_profiles": {} would rotate
+            # config_hash for every project that has never configured one, which is the
+            # normal treatment for an added optional field.
+            **delegate_profiles_dict(config),
             "tier3_globs": list(config.knobs.tier3_globs),
             "ci_workflows": dict(sorted(config.knobs.ci_workflows.items())),
             "docs_gate_paths": list(config.knobs.docs_gate_paths),

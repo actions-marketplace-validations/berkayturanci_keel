@@ -134,6 +134,7 @@ contracts, but executable project behavior remains in extension files or project
 | `build_gate_cmd` | string | ✅ | command the `build` gate runs |
 | `lint_cmd` | string | | command the `lint` gate runs (gate skipped if absent) |
 | `implementer_agents` | map role→agent | | role to local agent mapping |
+| `delegate_profiles` | map name→profile | | named generic delegate vendors, referenced as `--delegate <name>` |
 | `tier3_globs` | string[] | | high-risk paths that force full scrutiny |
 | `ci_workflows` | map name→glob | | CI workflow display name → gating path glob |
 | `docs_gate_paths` | string[] | | the docs surface: paths that trigger the docs gate |
@@ -161,6 +162,85 @@ Command run by the built-in `lint` gate. If absent, the lint gate is skipped.
 
 Map from a role label or project role to the local implementer agent name. `keel ship` and
 `keel implement` use it when choosing the implementation delegate.
+
+#### `delegate_profiles`
+
+Named **generic delegate vendors**, referenced by name as `--delegate <name>` /
+`--review-delegate <name>`. Without them every provider is a code change; with them any
+local coding-agent CLI is a config entry:
+
+```yaml
+knobs:
+  delegate_profiles:
+    cursor:
+      vendor: cli
+      command: cursor-agent
+      args: ["-p", "--force"]   # implementer: print mode + non-interactive approval
+      review_args: ["-p"]       # reviewer: same, minus permission to approve edits
+      prompt_mode: arg          # "stdin" (default) | "arg"
+      model: null               # optional default model for this profile
+      model_arg: --model        # flag the model is passed on (default "--model")
+    gemini-cli:
+      vendor: cli
+      command: gemini
+      prompt_mode: arg
+```
+
+Then: `/keel:ship 123 --delegate cursor`.
+
+| field | type | required | description |
+|---|---|---|---|
+| `vendor` | string | ✅ | the generic vendor. Only `cli` today |
+| `command` | string | ✅ for `cli` | the executable keel runs, e.g. `cursor-agent` |
+| `args` | string[] | | standing flags the command always takes, e.g. `["-p", "--force"]` |
+| `review_args` | string[] \| null | | flags for the **reviewer** role; falls back to `args` when unset (`null` ≠ `[]`) |
+| `prompt_mode` | `stdin` \| `arg` | | how the prompt reaches the command (default `stdin`) |
+| `model` | string \| null | | default model for this profile; a per-run `--delegate <name>:<model>` beats it |
+| `model_arg` | string | | flag the model is passed on, as `<model_arg> <model>` (default `--model`) |
+
+**`prompt_mode` exists because stdin is not universal.** `stdin` (the default) writes the
+prompt to a temp file and pipes it in, because positional-arg passing hangs some CLIs. But
+`cursor-agent`'s usage is `agent [options] [command] [prompt...]` — the prompt *is* a
+positional argument — so those CLIs need `arg`.
+
+**`model_arg` exists for the same reason.** Model precedence is per-run
+`--delegate <name>:<model>` > the profile's `model` > the CLI's own default, so one
+`cursor` profile serves `cursor-grok-4.5-high`, `composer-2.5` and the rest without a
+config edit. But an *arbitrary* CLI shares no guaranteed model-selection syntax, so the
+profile has to say how: the effective model is applied as `<model_arg> <model>`. The
+default `--model` covers `cursor-agent`, `gemini` and Aider; set it for anything else.
+
+**keel cannot make a generic CLI reviewer read-only — `review_args` is your lever.**
+Every other non-host reviewer vendor has a mechanism behind the "read-only / findings
+only" promise: a vendor read-only flag, a local endpoint, a single hosted-API call. A
+profile is an arbitrary binary, and the same `command` serves both the implementer and
+the reviewer role. `args` typically carries the implementer's write-enabling flags —
+`cursor-agent`'s `--force` approves edits non-interactively — so a reviewer invoked with
+them can edit the checkout. Set `review_args` to a read-only invocation for any profile
+you use as a reviewer. keel validates neither list; this is operator-configured, not
+enforced.
+
+**Quote a profile name that YAML would not read as a string.** A bare `on:`, `yes:`,
+`2:` or `~:` key parses as a boolean, integer or null, not a name — `keel validate`
+rejects those with an explicit message. A name may also not be blank or contain `:`,
+since `--delegate` splits on the first colon to separate the profile from a per-run
+model, which would make such a name unselectable.
+
+**Name resolution is fail-closed.** A profile name is resolved *after* the built-in
+delegate vendors (`claude`, `codex`, `agy`, `ollama`, `anthropic-api`, `openai-api`), and a
+profile that shadows one of those names is a **`keel validate` error**, not a silent
+override. So config can never redefine a built-in, and the operator is told at validation
+time instead of discovering it mid-run.
+
+A `cli` delegate inherits the local-model contract exactly: the orchestrator owns every
+git/PR step and asks the CLI only for code generation, retries twice on an unusable result
+then falls back to the host agent, and is **refused on tier-3** — an unvetted CLI is not a
+high-risk-path implementer. No new consent scope is needed: this is the same subprocess
+surface `codex`/`agy` already use, and `command` is operator-authored config with the same
+trust level as `build_gate_cmd` — it is never taken from PR content or agent output.
+
+Design and the deferred `openai-compatible` / `google-api` vendors:
+[`docs/proposals/generic-delegate-vendors.md`](../proposals/generic-delegate-vendors.md).
 
 #### `tier3_globs`
 

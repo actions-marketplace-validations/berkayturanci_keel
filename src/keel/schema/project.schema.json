@@ -55,6 +55,51 @@
           "additionalProperties": { "type": "string" },
           "description": "Role -> agent name, e.g. {mobile: flutter-developer}."
         },
+        "delegate_profiles": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["vendor"],
+            "properties": {
+              "vendor": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Generic delegate vendor. Only 'cli' is implemented today."
+              },
+              "command": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Executable keel runs for vendor 'cli', e.g. cursor-agent. Required for 'cli'. Operator-authored config, same trust level as build_gate_cmd."
+              },
+              "args": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "description": "Fixed flags the command always takes, e.g. [\"-p\", \"--force\"] for cursor-agent. Operator-authored config, same trust level as command."
+              },
+              "review_args": {
+                "type": ["array", "null"],
+                "items": { "type": "string", "minLength": 1 },
+                "description": "Flags for the reviewer role when they must differ from args, e.g. dropping --force so the CLI cannot approve edits. Falls back to args when absent. keel cannot enforce read-only on an arbitrary CLI; this is the operator's lever. null means unset (fall back to args), which is not the same as [] (pass no flags)."
+              },
+              "prompt_mode": {
+                "type": "string",
+                "minLength": 1,
+                "description": "How the prompt reaches the command: 'stdin' (default) or 'arg' for CLIs that take the prompt as a positional argument."
+              },
+              "model": {
+                "type": ["string", "null"],
+                "description": "Optional model override passed through to the command."
+              },
+              "model_arg": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Flag the command takes the effective model on, applied as '<model_arg> <model>'. Defaults to --model; set it for a CLI that spells model selection differently."
+              }
+            }
+          },
+          "description": "Named generic delegate profiles, referenced as --delegate <name>. A profile name may not shadow a built-in delegate vendor (claude, codex, agy, ollama, anthropic-api, openai-api) - that is a validation error, not a silent override."
+        },
         "build_gate_cmd": { "type": "string", "minLength": 1 },
         "lint_cmd": { "type": "string" },
         "tier3_globs": { "type": "array", "items": { "type": "string" } },
