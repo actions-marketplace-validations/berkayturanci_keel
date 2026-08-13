@@ -1,11 +1,12 @@
 """Thin I/O: hosted-API code-generation delegate (issue #548).
 
 Lets the s4 implement / s7 review steps run with **only an API token in the
-environment** (``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY``) and no agent CLI
-installed. The delegate follows the same no-tools contract as ``ollama:MODEL``
-in ship.md s4: the orchestrator owns every git/PR step and calls this module
-exactly once per attempt to turn a prompt into text (a unified diff for the
-implementer, a structured verdict for the reviewer).
+environment** (``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` / ``GEMINI_API_KEY``,
+or a configured OpenAI-compatible key) and no agent CLI installed. The delegate
+follows the same no-tools contract as ``ollama:MODEL`` in ship.md s4: the
+orchestrator owns every git/PR step and calls this module exactly once per attempt
+to turn a prompt into text (a unified diff for the implementer, a structured
+verdict for the reviewer).
 
 Design (docs/proposals/api-token-delegate.md):
 
@@ -79,7 +80,7 @@ def _unsafe_model_reason(model: str) -> str | None:
     """
     if not model:
         return "model is empty"
-    if not all(ch in _MODEL_PATH_OK for ch in model):
+    if not _MODEL_PATH_OK.issuperset(model):
         return "model contains characters that are not URL-path safe"
     if ".." in model:
         return "model contains a path traversal sequence"

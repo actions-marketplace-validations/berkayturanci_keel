@@ -259,7 +259,7 @@ since `--delegate` splits on the first colon to separate the profile from a per-
 model, which would make such a name unselectable.
 
 **Name resolution is fail-closed.** A profile name is resolved *after* the built-in
-delegate vendors (`claude`, `codex`, `agy`, `ollama`, `anthropic-api`, `openai-api`), and a
+delegate vendors (`claude`, `codex`, `agy`, `ollama`, `anthropic-api`, `openai-api`, `google-api`), and a
 profile that shadows one of those names is a **`keel validate` error**, not a silent
 override. So config can never redefine a built-in, and the operator is told at validation
 time instead of discovering it mid-run.
@@ -271,8 +271,8 @@ high-risk-path implementer. No new consent scope is needed: this is the same sub
 surface `codex`/`agy` already use, and `command` is operator-authored config with the same
 trust level as `build_gate_cmd` — it is never taken from PR content or agent output.
 
-Design and the deferred `openai-compatible` / `google-api` vendors:
-[`docs/proposals/generic-delegate-vendors.md`](../proposals/generic-delegate-vendors.md).
+For full model options and provider configurations, see the [Supported AI Models & Providers Guide](models.md).
+Design and proposals: [`docs/proposals/generic-delegate-vendors.md`](../proposals/generic-delegate-vendors.md).
 
 #### `tier3_globs`
 

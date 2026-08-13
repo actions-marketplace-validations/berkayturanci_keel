@@ -54,10 +54,14 @@ Changing the backbone is a keel-core change. Projects only ever touch layers 2�
   the panel that actually ran: a cross-vendor gate needs ≥2 distinct vendors, so a short panel
   downgrades to advisory instead of blocking on a jury that never convened.
 - **Headless with just an API key** — the hosted-API delegates
-  (`--delegate anthropic-api:MODEL` / `openai-api:MODEL`) drive the implement/review steps
-  with only `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` in the environment — no agent CLI
-  installed. Same consent, attribution, and tier-3 rules as every other delegate
-  ([design](docs/proposals/api-token-delegate.md)).
+  (`--delegate anthropic-api:MODEL` / `openai-api:MODEL` / `google-api:MODEL`) drive the implement/review steps
+  with only `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`/`GEMINI_API_KEY` in the environment — no agent CLI
+  installed. Connect any OpenAI-compatible provider (OpenRouter, DeepSeek, Groq, local vLLM/Ollama) or custom CLI
+  via `knobs.delegate_profiles` ([design](docs/proposals/api-token-delegate.md)).
+- **Auditable evidence chain & compliance** — every PR merged through Keel carries a
+  tamper-evident, commit-SHA-bound record of reviewer verdicts, test results, and model
+  attributions ([guide](docs/keel/evidence.md)). Approvals are locked to the exact HEAD commit,
+  preventing approval drift across subsequent pushes, with first-class, audited exception tracking.
 - **Safe merges by construction** — the core-owned `keel merge` path (resource claim,
   window re-check, live CI rollup, and evidence verification before the merge), timezone-aware
   night no-merge window, risk-tier → reviewer count, hotfix bypass with an audit line,
@@ -119,7 +123,7 @@ database the standard library has no system source for there.)
 
 ```bash
 pip install keel-workflow                                     # from PyPI (provides the `keel` command)
-pip install "git+https://github.com/berkayturanci/keel@v1.11.0"  # or pin an existing git tag
+pip install "git+https://github.com/berkayturanci/keel@v1.12.0"  # or pin an existing git tag
 ```
 
 In a cloud agent session, install it from a `SessionStart` hook (or add keel to the
@@ -215,6 +219,8 @@ If a step's gate fails, keel blocks its own merge — the same backbone every co
   `pages.yml` workflow). Locally, `make site` builds the coverage HTML into
   `website/coverage/` and serves it at <http://localhost:8000>.
 - [`docs/keel/configuration.md`](docs/keel/configuration.md) — `project.yaml` reference
+- [`docs/keel/evidence.md`](docs/keel/evidence.md) — evidence chain, commit-SHA binding, and compliance auditability
+- [`docs/keel/models.md`](docs/keel/models.md) — supported AI models, providers, and delegate profiles (Claude, OpenAI, Gemini, OpenRouter, DeepSeek, Groq, Ollama, CLI tools)
 - [`docs/keel/parameter-reference.md`](docs/keel/parameter-reference.md) — exhaustive per-flag reference for every CLI command and the `/keel:ship` adapter arguments
 - [`docs/keel/onboarding.md`](docs/keel/onboarding.md) — one-command consumer setup and follow-up checks
 - [`docs/keel/keel-visual.md`](docs/keel/keel-visual.md) — the live run board (`dash`/`render`/`serve`, the per-run 2D/3D drawer, `--all` multi-project, the auto-stamped `keel activity` channel)

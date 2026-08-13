@@ -12,9 +12,9 @@ window.KEEL = {
     tagline: "Turn coding agents into work owners.",
     blurb:
       "A project-neutral, multi-agent workflow backbone that drives a GitHub issue from intake to done — projects set values and snap in their own Lego.",
-    version: "v1.11.0",
+    version: "v1.12.0",
     install: "pip install keel-workflow",
-    installAlt: "pip install \"git+https://github.com/berkayturanci/keel@v1.11.0\"",
+    installAlt: "pip install \"git+https://github.com/berkayturanci/keel@v1.12.0\"",
     pluginAdd: "/plugin marketplace add berkayturanci/keel",
     pluginInstall: "/plugin install keel",
     repo: "https://github.com/berkayturanci/keel",
@@ -58,7 +58,7 @@ window.KEEL = {
       cmd: "keel:ship",
       one: "Drive a GitHub issue end-to-end through the whole backbone.",
       detail:
-        "Select → branch → implement → CI → review → test → merge → close → capture. The full flow: per-round review, inline file:line comments, --delegate / --review-delegate (incl. hosted-API anthropic-api:MODEL / openai-api:MODEL — no agent CLI, just an API key), --reviewers N, the <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>ai-jury</a> gate, the timezone-aware merge window + mkdir merge lock, and vendor+model attribution. <b>--compound</b> selects the compound-engineering profile — same backbone and safety primitives, with implement / review / fixloop / capture (s4·s7·s9·s11) as compound step overrides.",
+        "Select → branch → implement → CI → review → test → merge → close → capture. The full flow: per-round review, inline file:line comments, --delegate / --review-delegate (incl. hosted-API anthropic-api:MODEL / openai-api:MODEL / google-api:MODEL — no agent CLI, just an API key; plus generic OpenAI-compatible and CLI profiles), --reviewers N, the <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>ai-jury</a> gate, the timezone-aware merge window + mkdir merge lock, and vendor+model attribution. <b>--compound</b> selects the compound-engineering profile — same backbone and safety primitives, with implement / review / fixloop / capture (s4·s7·s9·s11) as compound step overrides.",
     },
     {
       slug: "implement", name: "/keel:implement", group: "Per-step", featured: true, scene: "implement",
@@ -291,7 +291,7 @@ window.KEEL = {
       summary: "pip install keel-workflow (Python ≥3.11, Linux/macOS/Windows, one runtime dep: PyYAML), or pin a git tag.",
       body:
         "<p>keel is a Python (≥3.11) package for Linux, macOS, and Windows, with one runtime dependency (PyYAML; on Windows it also installs <code>tzdata</code> for the timezone database).</p>" +
-        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Install commands'><code>pip install keel-workflow                                       <span class='cm'># from PyPI (provides the `keel` command)</span>\npip install \"git+https://github.com/berkayturanci/keel@v1.11.0\"  <span class='cm'># or pin an existing git tag</span></code></pre>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Install commands'><code>pip install keel-workflow                                       <span class='cm'># from PyPI (provides the `keel` command)</span>\npip install \"git+https://github.com/berkayturanci/keel@v1.12.0\"  <span class='cm'># or pin an existing git tag</span></code></pre>" +
         "<p>In a cloud agent session, install it from a <code>SessionStart</code> hook (or add keel to the session's repo scope) so the selected core ref is available before a run.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/README.md",
     },
@@ -343,6 +343,20 @@ window.KEEL = {
         "<p>A keel consumer is configured with <b>values, not copied command bodies</b>. Top-level fields choose the core version, repository, base branch, timezone, merge window, built-in gates, extension directory and add-only hooks. <code>knobs</code> declares runnable commands, risk globs, docs paths, CI workflow mapping, local agent roles and runtime capabilities. <code>policy_pack</code> is durable project-owned data. Unknown keys are rejected by the bundled schema, so the reference is intentionally strict.</p>",
       render: "config",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/configuration.md",
+    },
+    {
+      group: "Architecture", title: "Evidence chain & auditability", slug: "evidence",
+      summary: "How keel guarantees commit-SHA-bound review provenance, model attribution, and auditable exceptions.",
+      body:
+        "<p>Every PR merged through Keel carries an unbroken, tamper-evident record of reviewer verdicts, test results, and agent attribution. Approvals are cryptographically locked to the exact <code>HEAD_SHA</code> commit to prevent approval drift across subsequent pushes, with fully audited exception tracking via <code>--deferral</code>.</p>",
+      source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/evidence.md",
+    },
+    {
+      group: "Architecture", title: "Supported AI models & providers", slug: "models",
+      summary: "How to use any AI model: hosted APIs (Claude, OpenAI, Gemini), OpenAI-compatible gateways (OpenRouter, Groq, DeepSeek), local Ollama/vLLM, and agent CLIs.",
+      body:
+        "<p>Keel is model-neutral. Drive implementations (<code>s4</code>) or reviews (<code>s7</code>) using direct hosted APIs (<code>anthropic-api:</code>, <code>openai-api:</code>, <code>google-api:</code>), OpenAI-compatible profiles for OpenRouter, DeepSeek, Groq, Together AI and local vLLM, local offline Ollama models, or official agent CLIs (Claude, Codex, Antigravity).</p>",
+      source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md",
     },
     {
       group: "Authoring", title: "Extensions (your Lego)", slug: "extensions",

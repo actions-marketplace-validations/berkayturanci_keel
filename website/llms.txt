@@ -5,7 +5,7 @@
 > branch → implement → CI → review → test → merge → close → capture. Projects set
 > their values in `project.yaml` and snap their own logic into named extension
 > slots. Stdlib-first Python CLI, single runtime dependency, 100% test coverage,
-> 16 `/keel` commands. Works across Claude Code, Codex, and Gemini.
+> 16 `/keel` commands. Works across Claude Code, Codex, Antigravity, Gemini, and any OpenAI-compatible API or CLI.
 
 ## Docs
 
@@ -22,4 +22,5 @@
 - Fixed backbone: the invariant step sequence every issue flows through
 - Project-neutral core: all project specifics live in `project.yaml`, read via the `keel` CLI
 - Extension slots: named hooks where a project snaps in its own implementers/reviewers
+- Auditable evidence chain: commit-SHA-bound review provenance, model attribution, and audited deferrals
 - Pure-core / thin-I/O split with a strict 100% coverage bar
