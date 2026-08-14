@@ -12,9 +12,9 @@ window.KEEL = {
     tagline: "Turn coding agents into work owners.",
     blurb:
       "A project-neutral, multi-agent workflow backbone that drives a GitHub issue from intake to done — projects set values and snap in their own Lego.",
-    version: "v1.12.0",
+    version: "v1.13.0",
     install: "pip install keel-workflow",
-    installAlt: "pip install \"git+https://github.com/berkayturanci/keel@v1.12.0\"",
+    installAlt: "pip install \"git+https://github.com/berkayturanci/keel@v1.13.0\"",
     pluginAdd: "/plugin marketplace add berkayturanci/keel",
     pluginInstall: "/plugin install keel",
     repo: "https://github.com/berkayturanci/keel",
@@ -270,7 +270,7 @@ window.KEEL = {
       group: "Start here", title: "What keel is", slug: "what-keel-is",
       summary: "A project-neutral, multi-agent workflow core: one fixed backbone, projects set values and snap in Lego.",
       body:
-        "<p><b>keel</b> is a project-neutral, multi-agent <b>workflow backbone</b>. A <i>fixed backbone</i> of steps drives a unit of work — a GitHub issue — from backlog to done: branch → implement → CI → review → test → merge → close. Projects never fork the backbone; they set per-project <b>values</b> in <code>project.yaml</code> and snap their own <b>Lego pieces</b> into named extension slots.</p>" +
+        "<p><b>keel</b> closes the <b>vision-to-production gap</b> in agentic AI. While most coding agents stop at opening a PR, keel is a project-neutral, multi-agent <b>workflow backbone</b> that drives a unit of work from backlog to production: branch → implement → CI → review → test → merge → close → capture. Projects never fork the backbone; they set per-project <b>values</b> in <code>project.yaml</code> and snap their own <b>Lego pieces</b> into named extension slots.</p>" +
         "<p>The keel is a ship's backbone — the fixed spine every project builds on. The flagship command is <code>/keel:ship</code>; keel is where ships are built.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/README.md",
     },
@@ -291,7 +291,7 @@ window.KEEL = {
       summary: "pip install keel-workflow (Python ≥3.11, Linux/macOS/Windows, one runtime dep: PyYAML), or pin a git tag.",
       body:
         "<p>keel is a Python (≥3.11) package for Linux, macOS, and Windows, with one runtime dependency (PyYAML; on Windows it also installs <code>tzdata</code> for the timezone database).</p>" +
-        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Install commands'><code>pip install keel-workflow                                       <span class='cm'># from PyPI (provides the `keel` command)</span>\npip install \"git+https://github.com/berkayturanci/keel@v1.12.0\"  <span class='cm'># or pin an existing git tag</span></code></pre>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Install commands'><code>pip install keel-workflow                                       <span class='cm'># from PyPI (provides the `keel` command)</span>\npip install \"git+https://github.com/berkayturanci/keel@v1.13.0\"  <span class='cm'># or pin an existing git tag</span></code></pre>" +
         "<p>In a cloud agent session, install it from a <code>SessionStart</code> hook (or add keel to the session's repo scope) so the selected core ref is available before a run.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/README.md",
     },

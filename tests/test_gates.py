@@ -56,6 +56,33 @@ class TestPlan(unittest.TestCase):
         self.assertEqual([s.phase for s in specs],
                          ["guard", "test", "test", "test", "pre-merge"])
 
+    def test_policy_pack_presets_slotted(self):
+        data = {
+            "extends": "keel",
+            "core_version": "^0.1",
+            "base_branch": "main",
+            "knobs": {"build_gate_cmd": "make test"},
+            "gates": ["build"],
+            "policy_pack": {
+                "name": "sec",
+                "presets": ["gitleaks", "semgrep", "bandit", "trivy"],
+            },
+        }
+        specs = gates.plan_gates(cfg.parse_config(data), {})
+        self.assertEqual(
+            [s.id for s in specs],
+            ["gitleaks", "build", "semgrep", "bandit", "trivy"],
+        )
+        self.assertEqual(
+            [s.phase for s in specs],
+            ["guard", "test", "test", "test", "test"],
+        )
+        self.assertEqual(specs[0].on_fail, "block")
+        self.assertEqual(specs[1].on_fail, "block")
+        self.assertEqual(specs[2].on_fail, "suggest")
+        self.assertEqual(specs[3].on_fail, "suggest")
+        self.assertEqual(specs[4].on_fail, "warn")
+
 
 class TestRun(unittest.TestCase):
     def _specs(self):
@@ -360,6 +387,43 @@ class TestNotRunPropagation(unittest.TestCase):
 
         outcomes = gates.run_gates([self._spec("block")], runner)
         self.assertTrue(outcomes[0].not_run)
+
+    def test_concurrent_execution_preserves_order(self):
+        import time
+
+        def runner(spec):
+            # simulate variable duration
+            if spec.id == "slow":
+                time.sleep(0.05)
+            return True, [Finding("nit", f"note from {spec.id}", spec.id)]
+
+        specs = [
+            gates.GateSpec("slow", "command", "test", "warn", run="sleep 0.05"),
+            gates.GateSpec("fast1", "command", "test", "warn", run="echo 1"),
+            gates.GateSpec("fast2", "command", "test", "warn", run="echo 2"),
+        ]
+        outcomes = gates.run_gates(specs, runner, concurrency=3)
+        self.assertEqual([o.gate for o in outcomes], ["slow", "fast1", "fast2"])
+        self.assertTrue(all(o.ok for o in outcomes))
+
+    def test_concurrent_execution_handles_exceptions_fail_soft(self):
+        def runner(spec):
+            if spec.id == "broken":
+                raise RuntimeError("gate crashed")
+            return True, []
+
+        specs = [
+            gates.GateSpec("ok1", "command", "test", "block", run="echo 1"),
+            gates.GateSpec("broken", "command", "test", "block", run="boom"),
+            gates.GateSpec("ok2", "command", "test", "block", run="echo 2"),
+        ]
+        outcomes = gates.run_gates(specs, runner, concurrency=2)
+        self.assertEqual([o.gate for o in outcomes], ["ok1", "broken", "ok2"])
+        self.assertTrue(outcomes[0].ok)
+        self.assertFalse(outcomes[1].ok)
+        self.assertEqual(outcomes[1].error, "gate crashed")
+        self.assertTrue(outcomes[2].ok)
+
 
 if __name__ == "__main__":
     unittest.main()
