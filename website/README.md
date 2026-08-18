@@ -1,7 +1,7 @@
 # keel website — handoff notes
 
 Static site for [keel](https://github.com/berkayturanci/keel), deployed to GitHub Pages at
-<https://berkayturanci.github.io/keel/>. Drop this folder in as the repo's `website/`
+<https://keel-ship.dev/>. Drop this folder in as the repo's `website/`
 directory (replacing the existing one) — the existing `pages.yml` workflow / `make site`
 flow keeps working.
 
@@ -12,6 +12,7 @@ flow keeps working.
 | `index.html` | Landing page, workspace-style: Overview, What it is, The backbone, How it compares, Workflow commands (16, each with an animated scene + args/flags), CLI, Configuration, Dogfooding, FAQ |
 | `docs.html` | Documentation — generated entirely from `content.js` (`KEEL.docs[]`) |
 | `coverage.html` | Animated coverage report with a per-module table |
+| `silent-revert.html` | Article: a squash merge silently reverted a release |
 | `404.html` | Not-found page |
 
 ## How content updates work (important)
@@ -49,26 +50,27 @@ by CI.
   Use in the repo README with:
   ```html
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://berkayturanci.github.io/keel/assets/hero-dark.svg">
-    <img alt="keel — drive every issue to merged" src="https://berkayturanci.github.io/keel/assets/hero-light.svg">
+    <source media="(prefers-color-scheme: dark)" srcset="https://keel-ship.dev/assets/hero-dark.svg">
+    <img alt="keel — drive every issue to merged" src="https://keel-ship.dev/assets/hero-light.svg">
   </picture>
   ```
 - `index.html` carries JSON-LD (`SoftwareApplication`) structured data
 - `sitemap.xml`, `robots.txt`, `site.webmanifest` — URLs point at
-  `https://berkayturanci.github.io/keel/`; update if the site moves
+  `https://keel-ship.dev/`; update if the site moves
 - Each page has full meta description / OG / Twitter tags + canonical
 
-## Google Analytics
+## Analytics
 
-Every page has a GA4 snippet guarded to run **only on `berkayturanci.github.io`**
-(previews/forks send nothing). It uses **Consent Mode with `analytics_storage:
-"denied"`** — GA receives cookieless pings only, sets **no cookies**, so **no
-consent banner is required** (counts are modeled/approximate; you still get
-pageviews, country, and referrer source). To activate: create a GA4 property
-(analytics.google.com → Admin → Data streams → Web), then replace both
-`G-XXXXXXXXXX` occurrences in each HTML file with your Measurement ID.
-If you ever want precise per-user analytics, flip `analytics_storage` to
-`"granted"` — but then EU visitors need a consent banner.
+Four of the five pages load Cloudflare Web Analytics
+(`static.cloudflareinsights.com/beacon.min.js`), which is cookieless and needs no
+consent banner. `silent-revert.html` is the exception — it carries no beacon, so
+that article's traffic is not counted. There is no hostname guard on the four that
+do, so a fork or a local preview also reports; filter by hostname in the Cloudflare
+dashboard rather than trusting the raw total.
+
+There is no Google Analytics on this site. An earlier revision of this file
+described a GA4 setup with Consent Mode; no page has ever carried a `gtag`
+snippet, so that section was fiction and has been removed.
 
 ## Theming
 
