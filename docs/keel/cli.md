@@ -1589,6 +1589,33 @@ keel swarm-land .keel/project.yaml --root . --mode auto
 
 - **Direct Batch Mode**: Orthogonal disjoint diff trees land concurrently.
 - **Adaptive Funnel Mode**: Overlapping trees land sequentially with automatic fail-soft rebase healing.
+- **Review evidence (#828)**: before a live landing, every cluster branch's open PR must pass
+  the same pre-merge review-evidence verification `keel merge` enforces — armed gate label,
+  tier-derived verdict count, verdicts pinned to the PR head. A cluster that does not verify is
+  **held** (reported with its reason, never merged); held clusters degrade the wave status like
+  failures without being counted as one. Fail-closed at every step: no open PR, a transport
+  error, an unarmed gate, an ambiguous branch (more than one open PR), and a
+  local branch tip that does not match the reviewed PR head all hold; a
+  cluster whose PR is already merged holds with an "already landed in an
+  earlier run" reason instead of a misleading one. In funnel mode a rebase always
+  rewrites SHAs, so re-pinning to the old head would make the mode a permanent
+  no-op; what matters is whether a *content* decision was made. A clean replay
+  of the reviewed commits lands; a rebase whose conflicts the resolver
+  auto-resolved holds, because those bytes were never reviewed. The merge
+  re-reads the branch tip locally inside the lock — on both paths, and on the
+  funnel path *before* the rebase, since the rebase itself voids the pin — and
+  holds if it moved since the (network-bound) check, which runs before the
+  lock is taken. A funnel hold rewinds the branch to the reviewed commit so a
+  rejected cluster is not left rewritten and un-landable. Everything
+  targets `base_branch` from the project config — the PR lookup, the merge and
+  the rebase — so the diff verified is the diff that lands. A *live* wave with any
+  held cluster exits non-zero, so automation cannot read "refused to land
+  unreviewed code" as success. The gate also runs in **dry runs** — the checks
+  are read-only — so a preview reports `would hold: <reason>` per cluster
+  instead of promising a landing that a live run would refuse; a dry run still
+  exits 0, because predicting correctly is not a failure. The explicit opt-out is `knobs.swarm_review_evidence:
+  false`, which `swarm-land` announces loudly — the exception lives in config, never in a
+  driver's judgement call.
 
 ## `keel-visual swarm <project.yaml> [--root DIR] [--swarm-id ID] [--out FILE] [--serve] [--port PORT] [--json]`
 

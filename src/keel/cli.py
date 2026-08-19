@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from . import (
@@ -4395,6 +4396,112 @@ def _cmd_swarm_run(args: argparse.Namespace) -> int:
     return 0 if result.status == "success" else (1 if result.status == "failed" else 0)
 
 
+def _swarm_land_evidence_checker(
+    args: argparse.Namespace, config: cfg.ProjectConfig
+) -> Callable[[str], tuple[bool, str, str | None]]:
+    """The per-branch review-evidence check swarm-land applies before landing.
+
+    Resolves the cluster branch's open PR against the project's own base
+    branch, then runs the same pre-merge evidence verification ``keel merge``
+    enforces — tier-derived reviewer count, verdicts pinned to the PR head,
+    armed gate label. Fail closed at every step: no PR, an ambiguous branch, a
+    transport error, an unarmed gate, a failed verification and a local tip
+    that is not the reviewed head all *hold* the cluster rather than land it
+    (#828). The reviewed sha travels back with the answer so the merge can
+    re-confirm it locally inside the lock.
+    """
+    from . import swarm_landing
+
+    def check(branch_name: str) -> swarm_landing.EvidenceCheck:
+        hold = lambda why: swarm_landing.EvidenceCheck(False, why)  # noqa: E731
+        lookup = run_argv(
+            ["gh", "pr", "list", "--head", branch_name,
+             "--base", config.base_branch, "--state", "all",
+             "--json", "number,state"],
+            cwd=args.root,
+        )
+        if not lookup.ok:
+            return hold(f"PR lookup failed: {lookup.output.strip()[:120]}")
+        try:
+            prs = json.loads(lookup.stdout or lookup.output or "[]")
+        except json.JSONDecodeError:
+            return hold("PR lookup returned invalid JSON")
+        if not isinstance(prs, list):
+            prs = []
+        open_prs = [
+            p for p in prs
+            if isinstance(p, dict) and p.get("state") == "OPEN"
+            and isinstance(p.get("number"), int)
+        ]
+        if len(open_prs) > 1:
+            numbers = ", ".join(f"#{p['number']}" for p in open_prs)
+            return hold(
+                f"ambiguous: {len(open_prs)} open PRs for the cluster branch "
+                f"({numbers}) — close the strays before landing"
+            )
+        if not open_prs:
+            merged = [
+                p for p in prs
+                if isinstance(p, dict) and p.get("state") == "MERGED"
+                and isinstance(p.get("number"), int)
+            ]
+            if merged:
+                return hold(
+                    f"PR #{merged[0]['number']} is already merged — this "
+                    "cluster likely landed in an earlier run"
+                )
+            return hold(
+                "no open PR for the cluster branch — open one, arm the gate "
+                "label and post review verdicts before landing"
+            )
+        number = open_prs[0]["number"]
+        # Field-for-field parity with `keel merge`'s own argparse defaults;
+        # review_comments in particular is validated against the posting modes
+        # and must never be None.
+        evidence_ns = argparse.Namespace(
+            pr=number, issue=None, reviewers=None, review_comments="inline",
+            jury=False, no_jury=False, jury_advisory=False,
+            gate_label=None, root=args.root,
+        )
+        try:
+            payload = _verify_merge_evidence(evidence_ns, config)
+        # SystemExit too: the namespace is hand-built, and argparse-style
+        # validation raises it — that would abort the whole wave mid-flight
+        # instead of holding one cluster.
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - one cluster holds, wave survives
+            return hold(
+                f"evidence verification errored: {type(exc).__name__}: {exc}"[:160]
+            )
+        if not payload.get("enforced"):
+            return hold(f"PR #{number}: evidence gate is not armed")
+        verification = payload.get("verification") or {}
+        if verification.get("status") != "pass":
+            missing = ", ".join(verification.get("missing") or ()) or "unknown"
+            return hold(f"PR #{number}: missing evidence: {missing}")
+        # The verdicts are pinned to the remote PR head; the landing merges the
+        # local ref. Unless they are the same commit, "verified" would bless
+        # bytes nobody reviewed.
+        reviewed_sha = payload.get("head_sha")
+        local = run_argv(["git", "rev-parse", branch_name], cwd=args.root)
+        local_sha = (local.stdout or local.output or "").strip()
+        if not local.ok or not local_sha:
+            return hold(
+                f"PR #{number}: cannot resolve the local branch tip to pin "
+                "against the reviewed head"
+            )
+        if not isinstance(reviewed_sha, str) or local_sha != reviewed_sha:
+            return hold(
+                f"PR #{number}: local branch tip {local_sha[:12]} is not the "
+                f"reviewed PR head {str(reviewed_sha)[:12]} — push or re-review "
+                "before landing"
+            )
+        return swarm_landing.EvidenceCheck(
+            True, f"PR #{number}: evidence verified at {local_sha[:12]}", local_sha
+        )
+
+    return check
+
+
 def _cmd_swarm_land(args: argparse.Namespace) -> int:
     try:
         config = cfg.load_config(args.path)
@@ -4464,18 +4571,44 @@ def _cmd_swarm_land(args: argparse.Namespace) -> int:
 
     from . import swarm_landing
 
+    evidence_checker = None
+    if config.knobs.swarm_review_evidence:
+        # Built for dry runs too: the checks are read-only, and a preview that
+        # cannot see the gate tells the operator a wave will land when it
+        # would be held entirely.
+        evidence_checker = _swarm_land_evidence_checker(args, config)
+    elif args.live:
+            # The opt-out must be impossible to miss in the transcript: the
+            # whole point of #828 is that skipping review is a visible,
+            # configured exception, never a silent default.
+            print(
+                "swarm review evidence: OFF by config "
+                "(knobs.swarm_review_evidence: false) — clusters land "
+                "unverified (swarm-land checks no CI of its own)",
+                file=sys.stderr,
+            )
+
     result = swarm_landing.land_wave_clusters(
         plan,
         wave_index=args.wave,
         project_yaml=args.path,
         root=args.root,
         dry_run=not args.live,
+        evidence_checker=evidence_checker,
+        base_branch=config.base_branch,
     )
 
     if args.json:
         print(json.dumps(result.to_dict(), indent=2))
     else:
         print(swarm.render_swarm_landing_result(result))
+
+    # A *live* wave that refused to land unreviewed code must not read as
+    # success to the automation above it (overnight/swarm drivers key on the
+    # exit code). A dry run that predicts holds succeeded at predicting: its
+    # job is to answer "what would happen", so it reports and exits 0.
+    if args.live and result.held_clusters:
+        return 1
 
     return 0 if result.status == "success" else (1 if result.status == "failed" else 0)
 
