@@ -83,9 +83,75 @@ To provide honest optics during in-flight pull requests while strictly preservin
 
 | Status | CLI Exit | GitHub Check-Run | Meaning | Merge Allowed? |
 |---|---|---|---|---|
-| **`waiting`** | `2` | `neutral` (⚪ grey dot) | Review / jury verdicts are simply not posted yet (pre-verdict early PR lifecycle). No invalidity findings or tampered evidence. | ❌ Blocked |
+| **`waiting`** | `2` | *incomplete* (🟡 yellow dot) | Required evidence for the active phase is not posted yet, or a verdict is pinned to a commit that is not the head. | ❌ Blocked |
 | **`pass`** | `0` | `success` (✅ green check) | All required evidence items for the active phase are verified and match `HEAD_SHA`. | ✅ Allowed |
-| **`fail`** | `1` | `failure` (❌ red mark) | Explicit violations detected: wrong commit SHA, closure comment mismatch with ledger record, missing attribution label, or unarmed gate. | ❌ Blocked |
+| **`fail`** | `1` | `failure` (❌ red mark) | Explicit violations detected: closure comment mismatch with the ledger record, missing attribution label, or an unarmed gate. | ❌ Blocked |
+
+The `keel-ship` workflow publishes these as a real check-run named
+**`keel evidence (required)`**, against the PR head, on every run. That check —
+not the workflow job's own exit code — is the one to put in branch protection.
+The job that runs the verification is deliberately named something else
+(`keel evidence (verify)`), because Actions names a job's own check after the
+job and that check can only ever report "the job ran": two same-named checks on
+one commit would be indistinguishable to branch protection, which matches by
+name.
+
+Two decisions are worth stating outright, because both are easy to get wrong:
+
+* **The waiting state is published as an *incomplete* check, not as a
+  conclusion.** GitHub's branch protection accepts three conclusions as
+  satisfying a required check: *"Required status checks must have a
+  `successful`, `skipped`, or `neutral` status before collaborators can make
+  changes to a protected branch."* So concluding the waiting state as `neutral`
+  — the obvious reading of "grey, not red" — would let a merge through with no
+  evidence at all. An incomplete run blocks the merge and still renders as a
+  yellow dot rather than a red X, which is the signal actually wanted. It
+  completes to `success` or `failure` once the evidence resolves.
+* **Being unable to report is not a pass.** If the check-run cannot be
+  published the step fails rather than exiting 0, in every state including the
+  passing one — with one deliberate exception, below, for pull requests from a
+  fork, where publishing is impossible rather than broken.
+
+Two consequences of how GitHub's check-runs API works, both load-bearing:
+
+* **The check is upserted, not re-created.** `POST /check-runs` has no upsert on
+  (name, head SHA), so publishing blindly would leave one check per run stacked
+  under the gating name — at least one of them permanently incomplete. Branch
+  protection matches by name, which is the same ambiguity the separate job name
+  avoids. The workflow looks the check up first (`--method GET`; `-f` alone
+  switches `gh` to POST, which 404s) and `PATCH`es it when it exists.
+* **A fork PR cannot publish at all.** Its token is read-only whatever
+  `permissions:` declares. Failing the step unconditionally there would leave
+  every fork contribution red with no route forward, including one whose
+  evidence verified — so on a fork the job's own exit code carries the verdict
+  instead: green only for a real pass, red while waiting or on a violation.
+
+  Recovery is **Run workflow** (`workflow_dispatch`) from the base repository
+  with the pull request's number — not "Re-run all jobs", which replays the same
+  read-only token. Expect it to come back red once: a fork branch does not match
+  the ship-branch pattern and there is no assessment comment or ledger, so the
+  gate is unarmed and refuses to report success for a check that verified
+  nothing. Generate real provenance by running the ship adapter against the pull
+  request, or apply the operator waiver label. See
+  [github-actions.md](github-actions.md) for the full path, and do not make this
+  check *required* until you have it.
+
+The workflow re-runs on `issue_comment` as well as on pushes, because that is
+what a verdict *is*: `keel post-comment` calls `POST /issues/{n}/comments`.
+Without it, posting a verdict fires no event, so the incomplete check on that
+SHA would never be revisited — and the only self-service retrigger, a new
+commit, changes the head SHA and invalidates the very verdicts that would have
+let it pass. Subscribing to `pull_request_review` instead reads tidier and fires
+never: across the last twelve merged pull requests here, all 33 verdict markers
+were issue comments and none were reviews.
+
+One consequence worth knowing before you try to verify this: like `schedule`,
+`issue_comment` always runs the workflow file from the **default branch**, never
+the pull request's copy. (`workflow_dispatch` is not in that group — it runs the
+file from whichever ref you dispatch.) So a change to this
+trigger cannot be exercised on the pull request that makes it — it starts working
+once merged. The same rule is why the path is safe: the comment event never checks
+out contributor-authored code, even though it holds `checks: write`.
 
 ---
 
