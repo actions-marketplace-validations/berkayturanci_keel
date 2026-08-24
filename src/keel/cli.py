@@ -2454,23 +2454,43 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
     return 1
 
 
-def _overtaking_prs(args: argparse.Namespace, timing: dict) -> dict:
-    """Map each path to a PR that changed it after ``args.pr`` branched (#561).
+def _overtaking_prs(args: argparse.Namespace, timing: dict) -> tuple[dict, bool]:
+    """Paths changed by a PR merged after ``args.pr`` branched, and whether that
+    list is complete (#561).
 
     The window is (branch point, this merge). A pull request merged inside it landed
     work the branch does not contain, so a squash of that branch can undo it — which
     is precisely how #543 reverted #550 while every gate stayed green.
+
+    Returns ``(overtaken, complete)``. ``or []`` here meant a rate-limited ``gh``
+    produced "no overtaking pull requests", which reads downstream as ``clean`` —
+    a pass for a question the check never got to ask (#933).
+
+    Partial results are kept rather than discarded. Aborting on the first unreadable
+    pull request would throw away collisions already found, downgrading a named
+    ``drift`` to an anonymous ``unknown`` because some *unrelated* PR in the window
+    was rate-limited. A collision found is a collision; incompleteness cannot unmake
+    it. Incompleteness only matters when nothing was found, and the caller decides
+    that — which is the same rule ``judge_pins`` applies to unreachable repositories
+    in ``tests/test_action_pins.py``.
     """
     others = github.prs_merged_between(
         timing["base"], timing["branched_at"], timing["merged_at"], cwd=args.root
-    ) or []
+    )
+    if others is None:
+        return {}, False
     overtaken: dict = {}
+    complete = True
     for number in others:
         if number == args.pr:
             continue
-        for path in github.pr_files(number, cwd=args.root) or []:
+        files = github.pr_files(number, cwd=args.root)
+        if files is None:
+            complete = False
+            continue
+        for path in files:
             overtaken.setdefault(path, number)
-    return overtaken
+    return overtaken, complete
 
 
 def _cmd_verify_merge(args: argparse.Namespace) -> int:
@@ -2499,21 +2519,80 @@ def _cmd_verify_merge(args: argparse.Namespace) -> int:
             f"pull request #{args.pr} has no merge commit yet, or gh could not be asked"
         )
     else:
-        report = mergeverify.verify_merge(
-            github.commit_files(merge_sha, cwd=args.root),
-            overtaken=_overtaking_prs(args, timing),
-            intended=github.pr_files(args.pr, cwd=args.root),
-        )
+        # Every read this check depends on, gathered before any of them is judged.
+        # A missing input silently downgrades a real check into a weaker one that
+        # still prints `clean`: the drift signal needs the overtaking set, and the
+        # out-of-scope signal needs the PR's own file list (#933).
+        landed = github.commit_files(merge_sha, cwd=args.root)
+        overtaken, overtaken_complete = _overtaking_prs(args, timing)
+        intended = github.pr_files(args.pr, cwd=args.root)
+        # Each input answers a specific question, so an unreadable one leaves that
+        # question open rather than the whole report meaningless. Saying "no
+        # conclusion about drift is possible" when only the PR's own file list was
+        # missing is simply false — drift was checked, and found nothing.
+        unreadable = [
+            (name, question)
+            for name, question, ok in (
+                ("the merge commit's file list", None, landed is not None),
+                (
+                    "the pull requests merged alongside this one",
+                    "drift",
+                    overtaken_complete,
+                ),
+                ("this pull request's own file list", "scope", intended is not None),
+            )
+            if not ok
+        ]
+        report = mergeverify.verify_merge(landed, overtaken=overtaken, intended=intended)
+        if unreadable:
+            note = "could not read " + ", ".join(name for name, _ in unreadable)
+            if report["status"] in ("drift", "out-of-scope"):
+                # A finding is an answer, and incompleteness cannot unmake it.
+                # Replacing the report here would reset `unexpected` and
+                # `landed_count` to empty — deleting the evidence the operator
+                # needs — because some *other* read failed. Same rule the drift
+                # arm gets, and the same rule `judge_pins` applies to unreachable
+                # repositories: keep what was found, say what was missed.
+                report["reason"] = f"{report['reason']} — {note}, so other checks are incomplete"
+                report["incomplete"] = True
+            else:
+                questions = [q for _, q in unreadable if q]
+                # A missing merge-commit file list takes every question with it,
+                # so it is recorded as `None` rather than as one more open item.
+                unanswered = (
+                    " and ".join(dict.fromkeys(questions))
+                    if len(questions) == len(unreadable)
+                    else "nothing"
+                )
+                report = mergeverify.verify_merge(None)
+                report["reason"] = (
+                    f"{note} from GitHub, so "
+                    + (f"{unanswered} could not be checked" if unanswered != "nothing"
+                       else "nothing could be checked")
+                )
     report["pull_request"] = args.pr
     report["merge_commit"] = merge_sha
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(mergeverify.render(report))
-    # Loud on drift, quiet otherwise. `incomplete` is usually an identical change
-    # already on the base, and `unknown` is a fact about the runner — neither is
-    # evidence that something was reverted, so neither fails the command.
-    return 1 if mergeverify.is_drift(report) else 0
+    # Three exit codes. 1 is the loud drift case; 2 is "could not look" — the same
+    # shape as `keel evidence-verify`'s 2, though not the same meaning: there it is
+    # `waiting`, a state that resolves on its own; here it is a read that failed.
+    # `unknown` used to exit 0 on the reasoning that not
+    # looking is not evidence of a revert — true of the *verdict*, but a caller
+    # wiring this in after s10 reads the exit code, and 0 there is a pass this
+    # command never earned. `out-of-scope` keeps exiting 0: it is a real answer to
+    # the question asked, and usually an identical change already on the base.
+    if mergeverify.is_drift(report):
+        return 1
+    # `incomplete` too, not just `unknown`. A kept `out-of-scope` finding answers
+    # the *scope* question; it says nothing about drift, and when the overtaking
+    # list could not be read, drift is exactly what went unchecked. Exiting 0
+    # there would mean the same unreadable input blocks a clean merge at 2 and
+    # waves through one that also has a second, weaker problem — this issue's own
+    # defect, inverted.
+    return 2 if report.get("status") == "unknown" or report.get("incomplete") else 0
 
 
 def _cmd_scope_verify(args: argparse.Namespace) -> int:

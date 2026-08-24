@@ -26,6 +26,7 @@ import json
 import os
 import re
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -73,6 +74,25 @@ def _declared_version() -> str | None:
     return match.group(1) if match else None
 
 
+def _could_not_look(case, what: str, exc: Exception):
+    """An I/O failure in a check the operator asked for is a failure, not a skip.
+
+    These guards used to raise ``SkipTest`` here, reasoning that "being unable to
+    look is not evidence the promise is broken". True of the *verdict* and
+    irrelevant to the *signal*: a skipped test does not fail CI, so nothing
+    downstream can tell a skip from a pass, and a genuinely broken formula could
+    ship during any transient network failure (#933).
+
+    These classes only run under ``KEEL_CHECK_EXTERNAL=1``. The operator asked
+    for the online check; "I could not ask" is a failure of the check.
+    """
+    case.fail(
+        f"could not check {what}: {exc}. Reported as a failure rather than skipped, "
+        "because a skipped test does not fail CI and so reads as a pass. Re-run when "
+        "the network is available."
+    )
+
+
 def _reachable(url: str) -> bool:
     request = urllib.request.Request(url, method="HEAD")
     try:
@@ -81,9 +101,73 @@ def _reachable(url: str) -> bool:
     except urllib.error.HTTPError as exc:
         return exc.code < 400
     except OSError as exc:
-        # A network problem is not evidence that the promise is broken; the
-        # subject/instrument distinction that #675 turned on.
-        raise unittest.SkipTest(f"network unavailable while checking {url}") from exc
+        # The subject/instrument distinction #675 turned on is real, but skipping
+        # is the wrong way to record it: a skipped test does not fail CI, so every
+        # caller of this helper fail-opened on any network blip (#933). Raising an
+        # AssertionError keeps the distinction in the message and out of the
+        # verdict — these callers only run under KEEL_CHECK_EXTERNAL=1, so the
+        # operator asked for the check.
+        raise AssertionError(
+            f"could not check whether {url} resolves: {exc}. Reported as a failure "
+            "rather than skipped, because a skipped test does not fail CI and so "
+            "reads as a pass. Re-run when the network is available."
+        ) from exc
+
+
+class TestNotLookingIsNotAPass(unittest.TestCase):
+    """The rule itself, asserted hermetically.
+
+    The checks below fail on an I/O error instead of skipping, because a skipped
+    test does not fail CI and so reads as a pass — a broken formula could ship
+    during any network blip (#933). That rule lived only in the call sites, so
+    reverting all of them to ``SkipTest`` left the suite identically green. It
+    is pinned here instead, offline.
+    """
+
+    def test_an_unreachable_url_fails_rather_than_skipping(self):
+        # The network is stubbed rather than relied on. Reaching for a
+        # guaranteed-unresolvable host would still be a live DNS call in a suite
+        # that claims to be hermetic, and a stalled resolver would spend the
+        # 20-second timeout to prove something that is a pure branch.
+        with unittest.mock.patch.object(
+            urllib.request, "urlopen", side_effect=OSError("simulated outage")
+        ):
+            with self.assertRaises(AssertionError) as caught:
+                _reachable("https://example.test/nope")
+        self.assertIn("reads as a pass", str(caught.exception))
+
+    def test_the_shared_helper_fails_rather_than_skipping(self):
+        with self.assertRaises(AssertionError) as caught:
+            _could_not_look(self, "the formula's tarball", OSError("boom"))
+        self.assertIn("the formula's tarball", str(caught.exception))
+        self.assertIn("reads as a pass", str(caught.exception))
+
+    def test_neither_raises_a_skip(self):
+        """`SkipTest` is not an `AssertionError`, so the guards above would not
+
+        catch a revert that swapped one for the other if they only asserted
+        "something was raised".
+        """
+        stub = unittest.mock.patch.object(
+            urllib.request, "urlopen", side_effect=OSError("simulated outage")
+        )
+        for call in (
+            lambda: _reachable("https://example.test/nope"),
+            lambda: _could_not_look(self, "x", OSError("boom")),
+        ):
+            with self.subTest(call=call), stub:
+                try:
+                    call()
+                except unittest.SkipTest:  # pragma: no cover - the regression
+                    self.fail("the guard skips instead of failing")
+                except AssertionError:
+                    # The expected outcome. Written as an explicit `except`
+                    # rather than `assertRaises`, because a `SkipTest` escaping
+                    # that context manager would *skip* this test instead of
+                    # failing it — which is precisely the regression under
+                    # guard, so the guard would hide it.
+                    continue
+                self.fail("the guard raised nothing at all")
 
 
 class TestActionReferences(unittest.TestCase):
@@ -182,10 +266,9 @@ class TestHomebrewPromise(unittest.TestCase):
                         "cannot be verified until the release is tagged"
                     )
                 self.fail(f"the formula points at {url.group(0)}, which does not exist")
-            raise self.skipTest(f"cannot fetch the tarball: {exc}") from exc
+            _could_not_look(self, "the formula's tarball", exc)
         except (urllib.error.URLError, OSError) as exc:
-            # Being unable to look is not evidence the checksum is wrong.
-            raise self.skipTest(f"cannot fetch the tarball: {exc}") from exc
+            _could_not_look(self, "the formula's tarball", exc)
         self.assertEqual(
             hashlib.sha256(payload).hexdigest(),
             declared.group(1),
@@ -223,10 +306,9 @@ class TestHomebrewPromise(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 self.fail(f"{HOMEBREW_TAP} has no Formula/keel.rb; brew install would fail")
-            raise self.skipTest(f"cannot reach the tap: {exc}") from exc
+            _could_not_look(self, "the published tap formula", exc)
         except (urllib.error.URLError, OSError) as exc:
-            # Being unable to look is not evidence the copies disagree.
-            raise self.skipTest(f"cannot reach the tap: {exc}") from exc
+            _could_not_look(self, "the published tap formula", exc)
 
         local = (REPO_ROOT / "Formula" / "keel.rb").read_text(encoding="utf-8")
         published_version_match = re.search(r"/tags/v([0-9]+\.[0-9]+\.[0-9]+)\.tar\.gz", published)
@@ -268,7 +350,7 @@ class TestPublishedVersion(unittest.TestCase):
             ) as response:
                 published = set(json.load(response)["releases"])
         except OSError as exc:
-            raise unittest.SkipTest("PyPI unreachable") from exc
+            _could_not_look(self, "the versions published on PyPI", exc)
 
         latest = max(published, key=lambda v: [int(p) for p in v.split(".") if p.isdigit()])
         current = [int(p) for p in __version__.split(".") if p.isdigit()]

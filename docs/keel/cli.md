@@ -830,12 +830,32 @@ keel verify-merge .keel/project.yaml --root . --pr 543 --json
 | status | meaning | exit |
 | --- | --- | --- |
 | `drift` | wrote to files another PR changed after this one branched — read the diff | 1 |
-| `out-of-scope` | changed files the PR's own diff did not list | 0 |
+| `out-of-scope` | changed files the PR's own diff did not list | 0, or 2 when `incomplete` |
 | `clean` | neither | 0 |
-| `unknown` | not merged yet, or `gh` unreadable — **not** a pass | 0 |
+| `unknown` | not merged yet, or `gh` unreadable — **not** a pass | 2 |
 
 `drift` is a *stop and look* signal, not proof: two PRs editing one file in sequence
 is ordinary. The report names the colliding PR for each file so a human can judge.
+
+`unknown` exits **2**, not 0. The status line has always said "not a pass", but the
+exit code said otherwise, and the exit code is what a caller wiring this in after
+s10 actually reads.
+
+Every input the check depends on — the merge commit's file list, the pull requests
+merged alongside it, and this PR's own file list — is gathered before any is judged.
+A single unreadable one used to leave the check quietly downgraded to a weaker one
+that still printed `clean` (#933). Now:
+
+* a **finding survives** an unreadable input. `drift` and `out-of-scope` are answers,
+  computed from inputs that *were* read, so the report keeps them — and keeps
+  `overtaken` / `unexpected` / `landed_count`, which replacing it would erase — with
+  `incomplete: true` added;
+* the exit code still reports that something went unchecked: `incomplete` exits **2**
+  as `unknown` does, because an `out-of-scope` finding says nothing about drift, and
+  drift is usually what the unreadable input cost. Only `drift` keeps its own exit 1;
+* the reason names **only** the questions actually left open. Saying "no conclusion
+  about drift is possible" when only this PR's file list was missing is false — drift
+  was checked, and found nothing.
 
 ## `keel resume <project.yaml> [--root DIR] [--live-pr-state STATE] [--live-worktree-state STATE] [--no-observe] [--json]`
 

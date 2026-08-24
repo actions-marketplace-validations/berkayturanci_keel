@@ -6114,7 +6114,7 @@ class TestVerifyMergeCommand(unittest.TestCase):
 
     def test_an_unmerged_pr_is_unknown_not_clean(self):
         rc, out, _ = self._run(window=None)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 2, "not looking is not a pass")
         self.assertIn("unknown", out)
         self.assertIn("no merge commit", out)
 
@@ -6140,9 +6140,154 @@ class TestVerifyMergeCommand(unittest.TestCase):
         self.assertIn("clean", out)
 
     def test_an_unreadable_overtaking_list_does_not_claim_clean_falsely(self):
-        # gh failing yields no overtaking data; the scope check still applies.
+        """The inputs are otherwise a textbook `clean`, so only the guard can save it.
+
+        The previous version of this test passed for the wrong reason: it also
+        supplied mismatched file lists, so the report landed in `out-of-scope`
+        and would have read the same with the guard deleted. Here the landed and
+        intended lists are identical and there is nothing overtaking — every
+        other signal says `clean` — so `unknown` can only come from noticing
+        that the overtaking list could not be read.
+        """
         rc, out, _ = self._run(
             others=None,
+            files_by_pr={543: ["a.py"]},
+            commit_files=["a.py"],
+        )
+        self.assertEqual(rc, 2, "an unreadable input must not exit 0")
+        self.assertIn("unknown", out)
+        self.assertNotIn("clean", out)
+        self.assertIn("merged alongside", out, "the report must name what it could not read")
+
+    def test_an_unreadable_file_list_for_an_overtaking_pr_is_also_unknown(self):
+        """The second `or []`: the inner per-PR lookup could fail on its own."""
+        rc, out, _ = self._run(
+            others=[550],
+            files_by_pr={543: ["a.py"]},  # 550 resolves to None
+            commit_files=["a.py"],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown", out)
+        self.assertNotIn("clean", out)
+
+    def test_a_collision_already_found_survives_an_unreadable_sibling(self):
+        """Incompleteness must not bury a positive finding.
+
+        #999 is unreadable, but #550 was read and genuinely collides on `a.py`.
+        Aborting the scan at #999 — or letting "something was unreadable" override
+        the verdict — downgrades a named `drift` to an anonymous `unknown` because
+        an *unrelated* pull request was rate-limited, silencing the one signal this
+        command exists to raise. This is the same rule `judge_pins` applies to
+        unreachable repositories: collect, keep judging, report what you found.
+        """
+        rc, out, _ = self._run(
+            others=[550, 999],
+            files_by_pr={543: ["a.py"], 550: ["a.py"]},  # 999 resolves to None
+            commit_files=["a.py"],
+        )
+        self.assertEqual(rc, 1, "a collision that was seen must stay loud")
+        self.assertIn("drift", out)
+        self.assertIn("a.py", out)
+        self.assertIn("#550", out)
+
+    def test_an_unreadable_merge_commit_is_unknown(self):
+        rc, out, _ = self._run(
+            others=[],
+            files_by_pr={543: ["a.py"]},
+            commit_files=None,
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown", out)
+        self.assertNotIn("clean", out)
+        self.assertIn("merge commit", out)
+        # `verify_merge(None)` emits its own "could not read the merge commit's
+        # file list" reason, so asserting that phrase alone cannot tell whether
+        # this input was accounted for. The tail naming the open questions can.
+        self.assertIn("nothing could be checked", out)
+
+    def test_the_reason_names_every_input_that_could_not_be_read(self):
+        """One line per unreadable input, so a human knows what to retry."""
+        rc, out, _ = self._run(
+            others=None,
+            files_by_pr={},
+            commit_files=None,
+        )
+        self.assertEqual(rc, 2)
+        for phrase in (
+            "the merge commit's file list",
+            "the pull requests merged alongside this one",
+            "this pull request's own file list",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, out)
+
+    def test_an_unreadable_intended_list_is_unknown_not_clean(self):
+        """Losing the PR's own file list silently downgrades the check.
+
+        With `intended` missing, `verify_merge` skips the out-of-scope signal
+        entirely and still prints `clean` — a weaker check reporting the same
+        word as the full one.
+        """
+        rc, out, _ = self._run(
+            others=[],
+            files_by_pr={},  # 543 itself resolves to None
+            commit_files=["a.py"],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown", out)
+        self.assertNotIn("clean", out)
+
+    def test_an_out_of_scope_finding_survives_an_unreadable_sibling(self):
+        """The same rule as drift: a finding is an answer.
+
+        `b.py` landed and the PR never listed it — that is a complete answer to
+        the scope question, using only inputs that were read. Replacing the
+        report because the *overtaking* lookup failed resets `unexpected` and
+        `landed_count` to empty, deleting the evidence for a question that was
+        answered.
+        """
+        rc, out, _ = self._run(
+            others=None,  # unreadable, and unrelated to the scope question
+            files_by_pr={543: ["a.py"]},
+            commit_files=["a.py", "b.py"],
+            argv_extra=("--json",),
+        )
+        report = json.loads(out)
+        self.assertEqual(report["status"], "out-of-scope")
+        self.assertEqual(report["unexpected"], ["b.py"], "the finding was erased")
+        self.assertEqual(report["landed_count"], 2, "the counts were reset")
+        self.assertTrue(report["incomplete"], "incompleteness is not recorded")
+        self.assertIn("could not read", report["reason"])
+        # The finding is kept, and the exit code still says "could not look".
+        # Drift is what the unreadable input cost us, and `out-of-scope` says
+        # nothing about drift — exiting 0 would wave through the merge whose
+        # riskier question went unanswered.
+        self.assertEqual(rc, 2, "an incomplete check must not report a pass")
+
+    def test_the_reason_names_only_the_questions_it_could_not_answer(self):
+        """Claiming drift was unanswerable when it was answered is a false report.
+
+        Only the PR's own file list is missing here. The merge commit was read
+        and the overtaking set was complete, so drift *was* checked.
+        """
+        rc, out, _ = self._run(
+            others=[],
+            files_by_pr={},  # 543 itself unreadable
+            commit_files=["a.py"],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("scope could not be checked", out)
+        self.assertNotIn("drift could not be checked", out)
+
+    def test_a_complete_out_of_scope_check_still_exits_zero(self):
+        """The counterweight: incompleteness is what raises the code, not the finding.
+
+        With every input readable, `out-of-scope` is a full answer — usually an
+        identical change already on the base. If it started exiting 2, the code
+        would stop meaning "could not look".
+        """
+        rc, out, _ = self._run(
+            others=[],
             files_by_pr={543: ["a.py"]},
             commit_files=["a.py", "b.py"],
         )
