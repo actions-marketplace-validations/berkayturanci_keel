@@ -536,6 +536,41 @@ def _hotfix_justification(
 
 CHECKPOINT_MERGE_STEP = "s10"
 
+#: ``--capture-status`` value for a live run that never reached s11, so it has no
+#: capture outcome to report. Deliberately **not** a member of
+#: :data:`keel.capture.STATUSES`: those are outcomes of a capture that happened,
+#: and adding a fourth would make :func:`keel.capture.parse_marker` accept a
+#: marker that asserts a capture nobody performed.
+#:
+#: Without it, ``--live --append-ledger`` forced every run to claim one of the
+#: three real outcomes, which broke two things (#945):
+#:
+#: * a **rebased PR could never be merged again**. The gates record is keyed on
+#:   ``(pr, head_sha)`` so a new head needs a new record, but
+#:   :func:`keel.ledger.existing_capture_marker` refuses a second record carrying
+#:   a marker for the same PR — and every accepted status produced one. Both
+#:   guards are right; the record just had no way to satisfy one without
+#:   violating the other.
+#: * a record **asserted a capture that never happened**. A real status is read
+#:   back as a capture outcome — including by
+#:   :func:`keel.ledger._is_merged_ship_run`, which treats one as evidence the PR
+#:   merged — so a run that died at s10 had to lie about reaching s11.
+#:
+#: Resolving to ``None`` fixes both: the record is built with ``marker: None``
+#: (:func:`keel.capture.record_marker` already handles this), which no
+#: ``existing_capture_marker`` clash can match and no capture reader mistakes for
+#: an outcome. The flag itself stays **required**, so the operator still states
+#: explicitly that this run did not capture rather than silently omitting it.
+#:
+#: The record also carries ``capture.not_run: True``, which
+#: :func:`keel.ledger._is_merged_ship_run` reads as settling the question before
+#: the assessment is consulted. Without it the assessment branch — which treats a
+#: recommendation to merge as proof the PR merged — counted a rebase re-record as
+#: a merged PR whose marker had gone missing, reporting a capture gap that is not
+#: there. Only the explicit declaration does this; a bare ``status: None`` still
+#: falls through, so a marker that genuinely went missing is still reported.
+CAPTURE_STATUS_NOT_RUN = "not-run"
+
 
 def _checkpoint_gate(
     args: argparse.Namespace,
@@ -933,6 +968,21 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         else:
             print(message, file=sys.stderr)
         return 1
+    if args.capture_status == CAPTURE_STATUS_NOT_RUN and args.capture_artifact:
+        # An artifact is the proof an `applied` capture produced something, so the
+        # pair states both that no capture happened and that here is its output.
+        # The ledger is evidence; a record contradicting itself is worse than a
+        # record that says less, and reconcile would have to pick a side.
+        message = (
+            f"--capture-artifact contradicts --capture-status {CAPTURE_STATUS_NOT_RUN}: "
+            "a run that never reached capture produced no artifact"
+        )
+        if args.json:
+            print(json.dumps({"contract": contract, "error": message}, indent=2,
+                             sort_keys=True))
+        else:
+            print(message, file=sys.stderr)
+        return 1
     run_context_warnings = _run_context_warnings(args)
     if args.live and args.append_ledger and args.strict_run_context and run_context_warnings:
         message = "; ".join(run_context_warnings)
@@ -1078,7 +1128,8 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         pr_number=args.ledger_pr or args.pr,
         branch=args.branch,
         head_sha=args.head_sha,
-        capture_status=args.capture_status,
+        capture_status=_resolved_capture_status(args.capture_status),
+        capture_not_run=args.capture_status == CAPTURE_STATUS_NOT_RUN,
         capture_reason=args.capture_reason,
         capture_artifact=args.capture_artifact,
         issue_title=args.issue_title,
@@ -5981,7 +6032,10 @@ def _add_ship_parser(parser: argparse.ArgumentParser, *, command: str) -> None:
                         help="implementer's declared in-scope file path (repeatable); "
                              "recorded for keel scope-verify branch-contamination checks")
     parser.add_argument("--capture-status", type=_capture_status_arg, default=None,
-                        help="capture outcome to store in the run ledger record")
+                        help="capture outcome to store in the run ledger record; pass "
+                             f"'{CAPTURE_STATUS_NOT_RUN}' for a run that never reached "
+                             "capture (e.g. re-recording gates after a rebase), which "
+                             "records no marker and does not count as a merge")
     parser.add_argument("--capture-reason", default=None,
                         help="capture outcome reason to store in the run ledger record")
     parser.add_argument("--capture-artifact", default=None,
@@ -6055,8 +6109,19 @@ def _parse_pr_issue_mapping(value: str) -> tuple[int, int]:
     return pr, issue
 
 
+def _resolved_capture_status(value: str | None) -> str | None:
+    """The capture status to store, resolving the not-run sentinel to ``None``.
+
+    ``None`` is the ledger's existing representation of "this record makes no
+    capture claim" — :func:`keel.capture.record_marker` already returns a block
+    with ``marker: None`` for it. See :data:`CAPTURE_STATUS_NOT_RUN` for why the
+    sentinel is resolved here rather than added to ``capture.STATUSES``.
+    """
+    return None if value == CAPTURE_STATUS_NOT_RUN else value
+
+
 def _capture_status_arg(value: str) -> str:
-    if value == "skipped":
+    if value in (CAPTURE_STATUS_NOT_RUN, "skipped"):
         return value
     try:
         capture.normalize_status(value)
