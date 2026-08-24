@@ -30,7 +30,10 @@ filesystem.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 KEEL_DIRNAME = ".keel"
@@ -119,6 +122,66 @@ def ensure_runtime_gitignore_for(artifact_path: str | Path) -> bool:
         if ancestor.name == KEEL_DIRNAME and ancestor.is_dir():
             return ensure_runtime_gitignore(ancestor)
     return False
+
+
+def write_text_atomic(path: str | Path, content: str, *, encoding: str = "utf-8") -> None:
+    """Write ``content`` to ``path`` atomically **and durably**.
+
+    One writer for every runtime artifact that must survive a crash mid-write:
+    the checkpoint, activity records, and swarm run state. Each had its own copy
+    of the temp-file-and-rename dance, which is how the third one
+    (:func:`keel.swarm.save_swarm_state`) was still a bare ``write_text`` — a
+    torn file on interruption, the exact bug class #872 was filed about (#932).
+
+    ``os.replace`` makes the *swap* atomic: a reader sees the old file or the new
+    one, never a partial. It does not make the new bytes **durable** — after a
+    power loss the rename can survive with the file's contents still in the page
+    cache. #872's own Impact section named that scenario and only the atomicity
+    half shipped, so the data is fsynced before the rename and the directory
+    entry after it.
+
+    The directory fsync is best-effort: Windows cannot open a directory with
+    ``os.open``, and there the rename's durability is the filesystem's business
+    rather than something this call can request. Failing the write over it would
+    trade a real guarantee on POSIX for a broken one everywhere.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ensure_runtime_gitignore_for(target)
+    fd, temp_file = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_file, target)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_file)
+        raise
+    _fsync_directory(target.parent)
+
+
+def _fsync_directory(directory: Path) -> bool:
+    """Flush a directory entry so a completed rename survives a power loss.
+
+    Best-effort, and its own function so the success path is reachable by a test
+    on every platform: Windows cannot ``os.open`` a directory, so leaving this
+    inline left three lines uncovered there and dropped the Windows coverage run
+    below the 100% bar — a real failure hidden behind #953's masked job.
+
+    Returns whether the sync happened, so a caller (today only a test) can tell
+    "flushed" from "this platform would not let us ask".
+    """
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+    return True
 
 
 def scratch_dir(root: str | Path = ".", *, create: bool = True) -> Path:
