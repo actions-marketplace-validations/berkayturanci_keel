@@ -44,6 +44,28 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
 DEFAULT_FALLBACK_PRICE = (1.00, 3.00)
 FRONTIER_BENCHMARK_PRICE = (15.00, 75.00)  # Used for computing savings vs Claude Opus/o1
 
+#: Pricing keys longest-first, so ``gpt-4o-mini`` wins over ``gpt-4o`` on a
+#: substring match — a real pair from this table, and one where getting it wrong
+#: bills a cheap model at the expensive rate. The order is a property of the
+#: table, not of the string being matched, so it is computed once here rather
+#: than inside the match loop: #898 introduced the sort in the loop, and
+#: `keel cost-report` calls :func:`normalize_model_name` **twice** per ledger
+#: record — once inside :func:`estimate_token_cost` and again for the breakdown
+#: key — which is measured, not assumed (#930). Hoisting that duplicate is a
+#: larger free win than this sort and is left for its own change.
+#:
+#: Frozen at import, so ``MODEL_PRICING`` must not be mutated afterwards — a key
+#: added at runtime would never be matched. Nothing in this tree does that, and
+#: the extension loader parses text rather than Python, so no plugin can.
+#:
+#: Longest-first is provably sufficient for *key-versus-key* shadowing, since a
+#: proper substring is always strictly shorter. It says nothing about a key
+#: colliding with a real model string that is not itself a key — ``o1-mini``
+#: matching ``o1`` is not an ordering problem and is not fixed here.
+_PRICING_KEYS_BY_LENGTH: tuple[str, ...] = tuple(
+    sorted(MODEL_PRICING, key=len, reverse=True)
+)
+
 
 def normalize_model_name(model: str) -> str:
     """Normalize vendor:model strings to model pricing keys."""
@@ -53,7 +75,7 @@ def normalize_model_name(model: str) -> str:
     if ":" in raw:
         raw = raw.split(":", 1)[1]
     raw = raw.replace("/", "-")
-    for key in sorted(MODEL_PRICING, key=len, reverse=True):
+    for key in _PRICING_KEYS_BY_LENGTH:
         if key in raw:
             return key
     return raw or "default"
