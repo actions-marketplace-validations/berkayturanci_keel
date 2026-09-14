@@ -952,10 +952,20 @@ Adapters should pass the selected issue title, body, and labels into `keel plan`
 - `needs-input` — missing or ambiguous scope; adapters must ask the generated questions
   and must not mutate code for that issue.
 - `blocked` — a dependency or waiting condition is present; adapters must not mutate code.
-- `out-of-scope` — an out-of-scope label or an explicit sentence in the issue's title,
-  opening paragraph, or objective declares the issue not planned; structural headings
-  such as `## Out of scope` and the bullets beneath them are exclusions, not verdicts.
-  Adapters must not mutate code.
+- `out-of-scope` — an out-of-scope label; a **title** opening with `Out of scope`,
+  `Not planned`, `Wontfix` or `Not in scope`; or a sentence anywhere in the body
+  naming the issue itself — `this issue is out of scope`. The short form is the
+  title's alone: in a body it cannot be told from a boundary (`Out of scope for v1:
+  the Android client.`) or a carve-out (`Not in scope for Windows.`). The body requires the issue to be
+  named, because `Out of scope: mobile UI` and `Out of scope: closing` are the same
+  string and only one of them is a verdict. A section whose heading *starts with*
+  `Out of scope`, `Non-goals`, `Not in scope` or `Not in this change` has its own prose
+  dropped, because it bounds the change; a nested heading under it is read on its own
+  merits, which is safe because a bullet there naming no issue matches nothing. Everything
+  else is read,
+  heading text included, so `## Decision — this issue is out of scope` is a verdict. A
+  close-reason heading (`## Not planned`, `## Status`, `## Decision`) is **not** an
+  exclusion. Adapters must not mutate code.
 
 The block records `objective`, `deliverable`, `acceptance_criteria`, `risk_tier_inputs`,
 `required_docs_tests`, `missing_info`, `blockers`, `questions`, and a compact
