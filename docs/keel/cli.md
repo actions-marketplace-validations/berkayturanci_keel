@@ -601,6 +601,139 @@ On a live append, a missing `--host-agent` emits a run-context warning by defaul
 fields would degrade. `--transport` is auto-filled from the resolved GitHub transport when
 omitted, so adapters should not echo a stale transport value.
 
+## `keel capture-land <project.yaml> [--root <dir>] [--pr <N>] [--issue <N>] [--artifact <path>] [--remote <name>] [--attempts <N>] [--dry-run] [--json]`
+
+Land this run's learning document on `origin/<base_branch>` (#1163).
+
+`policy_pack.capture.learning.sink` writes one Markdown learning per applied capture, and
+with a **relative** sink path — `.keel/learning/`, the default keel dogfoods — the file
+lands in the working tree untracked. Before this command keel stopped there, so the lesson
+was written and thrown away: s2 cuts the next worktree from `origin/<base_branch>`, every
+CI runner clones fresh, and s10's pre-clean deletes the worktree outright. The capture
+contract's `durable_artifacts.commit_required` said the file *had* to be committed;
+`durable_artifacts.land_command` now names what commits it.
+
+**This is not a merge path.** It pushes one commit carrying one file to the base branch.
+`keel merge` at s10 remains the only way a pull request reaches that branch, and the
+landing touches no pull request, no merge claim, and no merge window.
+
+```bash
+keel capture-land .keel/project.yaml --root . --pr 456 --issue 123 --json
+```
+
+With no `--artifact`, the path is read from the `capture.artifact` field of the newest
+`ship_run` ledger record for `--pr`, so s11 passes the pull request and nothing else.
+
+### Why plumbing, and not a checkout
+
+The obvious recipe — switch to the base branch, pull, add, commit, push — cannot run on
+the topology keel uses for itself. s2, `overnight` and `swarm` all execute s0–s12 **inside
+a worktree** while the primary checkout holds the base branch:
+
+```
+$ git switch main            # from inside .claude/worktrees/<wt>
+fatal: 'main' is already used by worktree at '/…/keel'
+```
+
+So the commit is built with plumbing instead — `hash-object`, `ls-tree`, `mktree`,
+`commit-tree` against `<remote>/<base_branch>` — and the base branch is never checked out.
+The same command therefore runs unchanged from a worktree, from the primary checkout, and
+from a fresh CI clone.
+
+### Concurrency
+
+Two ships finishing s11 at once both land their lesson. The push is a plain
+fast-forward, never forced: a rejected push means another ship pushed first, so the
+command re-reads the base branch, rebuilds its commit on top of what it now carries, and
+pushes again — up to `--attempts` (default 3) times. Forcing would discard the other
+ship's lesson, and on a base branch whatever arrived with it.
+
+**Only a ref that moved is retried.** git exits 1 for every rejection, so the two are told
+apart by what it says: `fetch first` and `non-fast-forward` mean the branch moved and
+rebuilding will work, and anything else — a protected branch, a declining `pre-receive`
+hook, a permission error — is a refusal that will refuse again. Retrying those burned three
+pushes on something that could not succeed and then reported the branch as having *"moved
+under every one of 3 attempt(s)"*, naming a cause that had not happened and hiding the
+server's own reason. An unrecognised failure counts as a refusal, not as contention: this
+pushes to a shared branch, so it stops and reports rather than guessing.
+
+### Branch protection
+
+A base branch that requires pull requests refuses this push, and so does one with required
+status checks — the commit is built with `commit-tree` and has never been through CI. The
+command reports `failed` with the server's reason and does not retry. This repository's own
+`main` is in exactly that position, so keel writes its lessons and does not land them; see
+[`configuration.md`](configuration.md) for what a project in that position can do instead.
+
+### Safety
+
+The landing commit is composed from the base branch's own tree objects, and the command
+verifies that the finished commit differs from its parent by **exactly** the artifact path
+before pushing. A commit that touches anything else, or a diff that cannot be read at all,
+is refused rather than pushed.
+
+An artifact path that is absolute or climbs out of the checkout (`../x`, `/etc/x`, `C:\x`,
+`~/x`) is refused, not normalised — this command's whole job is to push to a shared branch.
+The refusal is tested on the path as written **and** on the path after backslashes become
+slashes, because those disagree: `\etc\hostname` is drive-relative rather than absolute, so
+no flavour of `PurePath` calls it anchored, and the rewrite then turns it into `/etc/hostname`.
+
+The path must also be **inside the configured sink**, not merely inside the repository.
+The sink's `path` is a template, and only the directory-shaped placeholders are resolvable
+here: `{owner}`, `{repo}`, `{base_branch}` and `{pr}`. One that still holds `{date}`,
+`{slug}` or `{fingerprint}` after those are filled in names a place nobody can point at, so
+the landing refuses it rather than guessing — matching such a component as a wildcard was
+tried and is not a boundary at all: a sink of `{date}` makes the first component match
+anything, so `config/private.env` is "inside" it. Per-run placeholders belong in `filename`.
+A sink of `.` is refused for the same reason: it names the whole checkout.
+Every other test here asks whether git could address it, and the answer is yes for
+`config/private.env` as much as for a lesson — so a ledger record naming one would have
+fast-forwarded the shared base branch with it, and the exactly-one-file check downstream
+would have agreed, because it *was* exactly one file. Containment is compared by path
+component, so a sibling directory whose name merely begins the same way
+(`.keel/learning-notes/`) is outside.
+
+Containment is also checked on the **resolved** path, not only on its spelling: `git
+hash-object` follows symlinks, and the exactly-one-file check downstream counts paths in the
+finished commit rather than where their bytes came from — so a link inside the sink would
+have published whatever it pointed at to the base branch under a lesson's name. The resolved
+path has to be inside the **sink**, not merely inside the checkout: an untracked `.env`
+beside the code is in the repository, and a checkout-wide test says yes to a link to it. A
+sink configured as the repository root (`path: '.'`) therefore names no directory to confine
+anything to, and the landing refuses rather than falling back to the wider boundary.
+
+### Identifying the commit on the base branch
+
+This is the one commit keel pushes to a base branch outside a pull request, so it says so
+in a line a machine can read:
+
+```
+chore(learning): record the lesson from PR #456
+
+keel.capture-land.v1: pr=456 issue=123 path=.keel/learning/2026-09-14-pr456-....md
+```
+
+The marker **is** the schema version, which keeps it from drifting from the record it
+describes and makes it greppable against the contract that defines it. The subject and the
+message carry no vendor trailer: this commit lands on every consumer's base branch, and a
+core command cannot know whose co-authorship to stamp on one.
+
+### Statuses and exit codes
+
+| `status` | exit | meaning |
+| --- | --- | --- |
+| `landed` | 0 | the lesson is on `<remote>/<base_branch>` |
+| `already-landed` | 0 | that exact content is already there; nothing was pushed |
+| `not-required` | 0 | the sink is outside the checkout, so git never sees it |
+| `no-artifact` | 0 | this run captured nothing to land |
+| `would-land` | 0 | `--dry-run` |
+| `contended` | — | a single attempt's outcome, never the command's: the branch moved, so the next attempt rebuilds |
+| `failed` | 1 | the lesson was not landed; `detail` carries the last push's own reason |
+
+The five non-`failed` statuses exit 0 on purpose: s11 runs after the merge already
+happened, and a capture that had nothing to do must not fail it. Capture is fail-soft, so
+a `failed` landing is reported and does not roll anything back.
+
 ## `keel capture-verify <project.yaml> [--merged-pr <N>] [--from-transport] [--json]`
 
 Verify that merged PRs have exactly one valid capture marker in the configured run ledger.

@@ -139,6 +139,18 @@ def contract_as_dict(config: _HasPolicyPack | None = None) -> dict[str, Any]:
             # the failure classifying `.keel/learning` as committed was for. An
             # absolute or `~` path is outside the checkout and git never sees it.
             "commit_required": learning_sink_in_worktree(config),
+            # **How a `commit_required` artifact reaches the base branch (#1163).**
+            # `commit_required` answered *whether* the file has to be committed and
+            # nothing answered *how*, so keel wrote a learning on every merge and
+            # threw it away: s2 cuts the next worktree from `origin/<base>`, every CI
+            # runner clones fresh, and s10's pre-clean deletes the worktree outright.
+            # The recipe cannot be "switch to the base branch and commit" — s2,
+            # `overnight` and `swarm` all run inside a worktree while the primary
+            # checkout holds the base branch, so `git switch <base>` there exits 128
+            # with *'<base>' is already used by worktree*. `keel capture-land` builds
+            # the commit with plumbing against `origin/<base>` and never checks it
+            # out, which is why it is topology-independent.
+            "land_command": "keel capture-land" if learning_sink_in_worktree(config) else None,
         },
         "learning_quality": learning_quality_contract_as_dict(config),
         "learning_retrieval": learning_retrieval_contract_as_dict(config),
@@ -2178,6 +2190,365 @@ def retrieve_relevant_learnings(
 
     results.sort(key=lambda r: (-r["declared"], -r["score"], r["file"]))
     return results[:max_results]
+
+
+#: Statuses :func:`learning_land_plan` and ``keel capture-land`` speak. ``landed``
+#: and ``already-landed`` are both success — the second is what a retry of a run
+#: that already pushed reports, which is what makes the command idempotent.
+LEARNING_LAND_STATUSES = (
+    "landed",
+    "already-landed",
+    "not-required",
+    "no-artifact",
+    "would-land",
+    "contended",
+    "failed",
+)
+
+#: How many times the landing rebuilds its commit when a concurrent ship pushed
+#: first. Each attempt re-reads ``origin/<base>``, so the rebuild is against the
+#: branch as it is *now* rather than the one the run started from; three is the
+#: same budget s6 gives CI fixes and bounds a live lock-step between two ships.
+LEARNING_LAND_ATTEMPTS = 3
+
+#: Marker on the landing commit, so the commit that carried a lesson onto the base
+#: branch can be found by the pull request it came from without parsing prose.
+LEARNING_LAND_SCHEMA_VERSION = "keel.capture-land.v1"
+
+#: The line the landing commit carries, and it is the **schema version**.
+#:
+#: This commit is the one thing keel pushes to a base branch outside a pull request,
+#: so a history reader — `git log`, `keel verify-merge`'s drift read, a person asking
+#: what this commit is — has to be able to tell it from a stray push. Naming it after
+#: the schema rather than inventing a second literal means the marker and the record
+#: cannot drift apart, and the name is greppable against the contract that defines it.
+LEARNING_LAND_MARKER = LEARNING_LAND_SCHEMA_VERSION
+
+
+def learning_land_message(
+    *, pr_number: int | None, path: str, issue_number: int | None = None
+) -> str:
+    """The landing commit's message — deterministic, so two runs agree byte for byte.
+
+    Consumer-neutral on purpose: it carries no vendor trailer. The commit is keel's,
+    made on behalf of whatever agent ran the ship, and a core command that stamped one
+    vendor's co-authorship onto every consumer's base branch would be asserting an
+    attribution it cannot know. The run ledger already records who implemented.
+    """
+    subject = (
+        f"chore(learning): record the lesson from PR #{pr_number}"
+        if pr_number is not None
+        else "chore(learning): record the lesson from this run"
+    )
+    fields = " ".join(
+        f"{name}={value if value is not None else '-'}"
+        for name, value in (("pr", pr_number), ("issue", issue_number), ("path", path))
+    )
+    return f"{subject}\n\n{LEARNING_LAND_MARKER}: {fields}\n"
+
+
+def learning_land_plan(
+    config: _HasPolicyPack | None,
+    *,
+    artifact: str | None,
+    pr_number: int | None = None,
+    issue_number: int | None = None,
+    remote: str = "origin",
+    base_branch: str | None = None,
+    attempts: int = LEARNING_LAND_ATTEMPTS,
+) -> dict[str, Any]:
+    """Plan the landing of one learning artifact onto ``origin/<base_branch>``.
+
+    Pure: it reads the config's *shape* and the artifact's path and answers what the
+    I/O layer should do, the way :func:`learning_sink_plan` answers what the writer
+    should write. Nothing here touches git or the filesystem, so the decision that
+    keel pushes to a base branch at all is unit-tested offline.
+
+    The plan deliberately describes **plumbing, not a checkout**. keel runs its own
+    s0–s12 inside a worktree while the primary checkout holds the base branch, so
+    every recipe built on ``git switch <base>`` exits 128 with *'<base>' is already
+    used by worktree* — the defect #1163 was opened for. Building the commit with
+    ``hash-object`` / ``ls-tree`` / ``mktree`` / ``commit-tree`` against
+    ``<remote>/<base>`` needs no checkout of the base branch at all, so it runs the
+    same from a worktree, from the primary checkout, and from a bare CI clone.
+
+    ``status`` is ``not-required`` when the sink is outside the repository (git never
+    sees it, so there is nothing to land), ``no-artifact`` when no path was recorded,
+    and ``planned`` when the caller should go ahead. ``errors`` is non-empty only for
+    a path this command must refuse to write to the base branch.
+    """
+    resolved_base = base_branch or getattr(config, "base_branch", None) or ""
+    if not learning_sink_in_worktree(config):
+        return {
+            "schema_version": LEARNING_LAND_SCHEMA_VERSION,
+            "status": "not-required",
+            "reason": (
+                "the learning sink is outside the checkout, so git never sees it and "
+                "nothing has to reach the base branch"
+            ),
+            "path": None,
+            "remote": remote,
+            "base_branch": resolved_base,
+            "ref": None,
+            "remote_ref": None,
+            "message": None,
+            "attempts": attempts,
+            "errors": [],
+        }
+    normalized = _land_path(artifact)
+    sink_dir = _land_sink_root(config, pr_number=pr_number, base_branch=resolved_base)
+    errors: list[str] = []
+    if artifact is None or not str(artifact).strip():
+        status = "no-artifact"
+        reason = "no capture artifact was recorded for this run, so there is nothing to land"
+    elif normalized is None:
+        status = "failed"
+        reason = "the capture artifact is not a path inside the repository"
+        # Refused rather than normalised. The command's whole job is to push one file
+        # to a shared base branch, so an artifact that climbs out of the checkout —
+        # `../x`, `/etc/x`, `C:\x` — is the one input that must never be resolved
+        # helpfully. `learning_sink_in_worktree` says the *sink* is in-repo; this says
+        # the recorded path is too, and they are answered from different values.
+        errors.append(f"capture artifact {artifact!r} is absolute or escapes the repository root")
+    elif sink_dir is None:
+        status = "failed"
+        reason = (
+            "the learning sink path does not name a directory this command can resolve, "
+            "so there is nothing to confine the landing to"
+        )
+        # A sink of `.`, or one whose directory still holds `{date}`/`{slug}`/
+        # `{fingerprint}` after `{owner}`/`{repo}`/`{base_branch}`/`{pr}` are filled in.
+        # Both describe a boundary that would accept any path in the repository, which is
+        # the boundary this check exists to replace.
+        errors.append("the learning sink path cannot be resolved to a directory")
+    elif not path_under_sink(normalized, sink_dir):
+        status = "failed"
+        reason = f"the capture artifact is not inside the learning sink ({sink_dir})"
+        # **Inside the repository is not the containment this command needs.** Every
+        # path test above answers "could git address this?", and the answer is yes for
+        # `config/private.env` and for `src/keel/cli.py` alike — so a ledger record
+        # naming one of those fast-forwarded the shared base branch with it, one file
+        # at a time, and the exactly-one-file check downstream agreed because it was
+        # exactly one file. The sink is the only directory this command has any
+        # business writing to, and it is the one value that says which.
+        errors.append(
+            f"capture artifact {artifact!r} is not under the configured learning sink {sink_dir!r}"
+        )
+    elif not resolved_base:
+        status = "failed"
+        reason = "the project declares no base branch to land the lesson on"
+        errors.append("base_branch is not configured")
+    else:
+        status = "planned"
+        reason = f"land {normalized} on {remote}/{resolved_base}"
+    return {
+        "schema_version": LEARNING_LAND_SCHEMA_VERSION,
+        "status": status,
+        "reason": reason,
+        "path": normalized,
+        # Published so the I/O layer can resolve the *real* artifact against the sink
+        # rather than against the checkout: a link inside the sink pointing at an
+        # untracked `.env` beside the code is in the repository, and a checkout-wide
+        # containment test says yes to it.
+        "sink": sink_dir,
+        "remote": remote,
+        "base_branch": resolved_base,
+        "ref": f"refs/heads/{resolved_base}" if resolved_base else None,
+        "remote_ref": f"{remote}/{resolved_base}" if resolved_base else None,
+        "message": (
+            learning_land_message(pr_number=pr_number, path=normalized, issue_number=issue_number)
+            if status == "planned"
+            else None
+        ),
+        "attempts": attempts,
+        "errors": errors,
+    }
+
+
+def _land_sink_root(
+    config: _HasPolicyPack | None, *, pr_number: int | None, base_branch: str
+) -> str | None:
+    """The directory the landing is allowed to write inside, as a repo-relative path.
+
+    The sink's ``path`` is a **template**, and `learning_sink_plan` writes the expanded
+    form — so comparing a recorded artifact against the literal `.keel/{repo}/learning`
+    refuses every lesson a project with placeholders ever writes. It is expanded here
+    with the same values, through the same `_relative_stays_relative` that keeps a
+    relative template relative when a leading placeholder expands to nothing.
+
+    Only the **directory-shaped** placeholders are resolvable here, and this command has
+    all four of them. One that still holds ``{date}``, ``{slug}`` or ``{fingerprint}``
+    afterwards names a place nobody can point at, and the answer is ``None`` — the caller
+    refuses rather than guessing. Two earlier shapes were tried and are recorded because
+    both looked reasonable: confining to the known *prefix* accepts anything under
+    ``.keel/``, and matching an unresolved component as a *wildcard* is not a boundary at
+    all — a sink of ``{date}`` then makes the first component match anything, so
+    ``config/private.env`` is "inside" it.
+    """
+    # `or {}` rather than a guard: the one caller reaches this only after
+    # `learning_sink_in_worktree` said there *is* a sink, and an empty block takes the
+    # documented default anyway — a branch no input can take is a claim the tests
+    # cannot check.
+    sink = learning_sink_policy(config) or {}
+    values = {
+        "owner": str(getattr(config, "owner", "") or ""),
+        "repo": str(getattr(config, "repo", "") or ""),
+        "base_branch": base_branch,
+        "pr": str(pr_number) if pr_number is not None else "",
+    }
+    expanded = _relative_stays_relative(str(sink.get("path") or DEFAULT_LEARNING_SINK_PATH), values)
+    # **Every placeholder resolved, or no sink root at all.** `{owner}`, `{repo}`,
+    # `{base_branch}` and `{pr}` are the directory-shaped ones and this command has all
+    # four. `{date}`, `{slug}` and `{fingerprint}` vary per run and belong in `filename`;
+    # left in a directory they name a place nobody can point at, and the landing says so
+    # rather than guessing — a wildcard component is not a boundary, it is a hole.
+    return None if "{" in expanded else _land_path(expanded)
+
+
+def path_under_sink(path: str, directory: str) -> bool:
+    """Is POSIX ``path`` inside ``directory``? Compared component by component.
+
+    Not a prefix test: a plain ``startswith`` says `.keel/learning-notes/x.md` is inside
+    `.keel/learning`, which is a different directory whose name merely begins the same way.
+
+    Every component of ``directory`` is a literal. A wildcard component was tried and is
+    not a boundary at all — a sink of `{date}` makes the first component match anything,
+    so `config/private.env` is "inside" it, and `{date}/learning` accepts
+    `config/learning/secrets.md`. The landing refuses a sink it cannot resolve instead,
+    so nothing here has to guess.
+    """
+    wanted, have = directory.split("/"), path.split("/")
+    # Strictly deeper: the sink directory is not a file inside itself.
+    if len(have) <= len(wanted):
+        return False
+    return all(want == got for want, got in zip(wanted, have, strict=False))
+
+
+def _land_path(artifact: str | None) -> str | None:
+    """``artifact`` as a repo-relative POSIX path, or ``None`` when it is not one.
+
+    Anchored on *any* platform for the same reason
+    :func:`learning_sink_in_worktree` is: a keel config and a keel ledger are the
+    same text wherever they are read, and a path this host calls relative is the
+    one the next host would push to its base branch.
+    """
+    if artifact is None:
+        return None
+    raw = str(artifact).strip()
+    if not raw or raw.startswith("~"):
+        return None
+    normalized = posixpath.normpath(raw.replace("\\", "/"))
+    # **Both forms are tested, and the rewrite is why.** `is_root_anchored` asks each
+    # flavour of path whether it is absolute, and `PureWindowsPath("\\etc\\hostname")`
+    # says no — a rooted path with no drive letter is *drive-relative*, not absolute.
+    # The backslash rewrite then turned that same string into `/etc/hostname`, which
+    # `os.path.join(root, …)` resolves by discarding root entirely: `git hash-object -w`
+    # stored a file from outside the checkout in the object database, and the tree
+    # composition split it into an entry with an empty name. Asking the question after
+    # the rewrite as well as before is what closes it.
+    if workspace.is_root_anchored(raw) or workspace.is_root_anchored(normalized):
+        return None
+    if normalized in (".", "") or normalized.split("/")[0] == "..":
+        return None
+    return normalized
+
+
+#: git's own words for "the ref moved under you" — the only rejection worth retrying.
+#: Printed by the client when its remote-tracking ref is behind, and by the server in
+#: the reason it returns; both reach us through the same combined output.
+PUSH_CONTENTION_MARKERS = ("fetch first", "non-fast-forward", "non-fast forward")
+
+
+def push_rejection_is_contention(output: str | None) -> bool:
+    """Did this push fail because the ref **moved**, or because it is **refused**?
+
+    The retry exists for one case: another ship landed its lesson between this run's
+    read of ``<remote>/<base>`` and its push. Rebuilding on the branch as it now is
+    will then succeed, which is why that case retries.
+
+    Every other rejection will refuse again, and a protected base branch is the
+    ordinary one — ``! [remote rejected] … (protected branch hook declined)``, or a
+    ``pre-receive`` hook's own sentence. Treating it as contention burned three pushes
+    on something that cannot succeed and then reported that the branch *"moved under
+    every one of 3 attempt(s)"* — naming a cause that did not happen and hiding the
+    server's actual reason, which is the one thing the operator needs.
+
+    Judged from git's text because the exit code is 1 either way. An unrecognised
+    failure is **not** contention: this pushes to the shared base branch, so an
+    unexplained refusal stops after one attempt rather than being retried on a guess.
+    """
+    text = (output or "").lower()
+    return any(marker in text for marker in PUSH_CONTENTION_MARKERS)
+
+
+#: One ``git ls-tree`` / ``git mktree`` line: ``<mode> SP <type> SP <sha> TAB <name>``.
+_TREE_ENTRY_RE = re.compile(r"\A(\d{6}) (blob|tree|commit) ([0-9a-f]{40,64})\t(.+)\Z")
+
+#: git's own mode for a regular, non-executable file and for a subdirectory.
+TREE_MODE_BLOB = "100644"
+TREE_MODE_TREE = "040000"
+
+
+@dataclass(frozen=True)
+class TreeEntry:
+    """One entry of a git tree, as ``ls-tree`` prints it and ``mktree`` reads it."""
+
+    mode: str
+    kind: str
+    sha: str
+    name: str
+
+    def render(self) -> str:
+        return f"{self.mode} {self.kind} {self.sha}\t{self.name}"
+
+
+def parse_tree_listing(listing: str | None) -> list[TreeEntry]:
+    """Parse ``git ls-tree -z`` output; unreadable records are dropped, not guessed at.
+
+    A missing directory is an empty listing rather than an error: landing a lesson
+    into a sink directory that does not exist on the base branch yet is the ordinary
+    first run, not a failure.
+
+    Records are NUL-separated (see :func:`keel.git.ls_tree`), and a newline is split
+    on as well so a listing that reached this from a LF-terminated source still
+    parses — the reader is permissive, the *writer* is the side that has to be exact.
+    """
+    entries: list[TreeEntry] = []
+    for line in re.split(r"[\0\n]", listing or ""):
+        match = _TREE_ENTRY_RE.match(line.rstrip("\n"))
+        if match is not None:
+            entries.append(
+                TreeEntry(match.group(1), match.group(2), match.group(3), match.group(4))
+            )
+    return entries
+
+
+def _tree_sort_key(entry: TreeEntry) -> str:
+    # git orders tree entries as if every directory name ended in "/", which is why
+    # "learning" and "learning.md" sort the way they do. `mktree` normalises the order
+    # itself; composing it correctly here keeps the pure result byte-stable so a test
+    # can assert the exact input the plumbing is handed.
+    return entry.name + "/" if entry.kind == "tree" else entry.name
+
+
+def upsert_tree_entry(listing: str | None, entry: TreeEntry) -> str:
+    """``listing`` with ``entry`` added or replacing the one of the same name.
+
+    Pure, and the whole reason the landing can be asserted offline: this is where a
+    lesson is grafted onto the base branch's tree, so "the commit differs from its
+    parent by exactly this one path" is a property of a string function rather than
+    of a live push nobody can re-run.
+
+    **NUL-terminated**, because the result is written to a subprocess's stdin and a
+    text-mode pipe rewrites ``\n`` as CRLF on Windows. ``git mktree`` accepts the
+    corrupted listing without complaint and writes a tree whose entry is named
+    ``<name>\r`` — a different SHA, exit 0, no error (measured). There is no newline
+    in this output to translate.
+    """
+    kept = [existing for existing in parse_tree_listing(listing) if existing.name != entry.name]
+    kept.append(entry)
+    kept.sort(key=_tree_sort_key)
+    return "".join(f"{item.render()}\x00" for item in kept)
 
 
 def _content_fingerprint(content: str) -> str:

@@ -1925,6 +1925,257 @@ def _cmd_ledger(args: argparse.Namespace) -> int:
     return 0
 
 
+def _land_learning_tree(root: str, path: str, base_sha: str, blob: str) -> str | None:
+    """Graft ``blob`` at ``path`` onto ``base_sha``'s tree; return the new root tree.
+
+    Walks the path's directories from the leaf upward, rewriting one tree object per
+    level, so the result shares every object it did not have to change. No checkout
+    and no index: the base branch is read as objects, which is the whole point — keel
+    runs s0-s12 inside a worktree while the primary checkout holds the base branch,
+    and any recipe that checks the base branch out there exits 128 (#1163).
+    """
+    parts = path.split("/")
+    entry = capture.TreeEntry(capture.TREE_MODE_BLOB, "blob", blob, parts[-1])
+    for depth in range(len(parts) - 1, 0, -1):
+        directory = "/".join(parts[:depth])
+        # `None` here is the ordinary first lesson: that directory does not exist on
+        # the base branch yet, so the level is composed from nothing rather than failing.
+        listing = git.ls_tree(f"{base_sha}:{directory}", cwd=root)
+        tree = git.mktree(capture.upsert_tree_entry(listing, entry), cwd=root)
+        if tree is None:
+            return None
+        entry = capture.TreeEntry(capture.TREE_MODE_TREE, "tree", tree, parts[depth - 1])
+    listing = git.ls_tree(base_sha, cwd=root)
+    return git.mktree(capture.upsert_tree_entry(listing, entry), cwd=root)
+
+
+def _contained_real_path(path: Path, root: str, sink: str) -> Path | None:
+    """``path``'s **real** location when it is inside the sink's, else ``None``.
+
+    Both ends are resolved, which does two jobs at once.
+
+    It follows symlinks on the way in: `git hash-object` follows them too, and the one
+    live safety check downstream counts *paths* in the finished commit, never where
+    their bytes came from — so a link named `.keel/learning/x.md` passed every test this
+    command made and published whatever it pointed at to the shared base branch under an
+    innocent name.
+
+    And it returns an **absolute** path for git to hash. A relative one is resolved
+    against the process directory here and against ``cwd=root`` again inside git, so
+    ``--root wt`` from the directory above applied the root twice and hashed nothing.
+
+    Containment is against the **sink**, not the checkout. Inside the repository is the
+    wrong boundary here for the same reason it was wrong for the recorded path: an
+    untracked `.env` beside the code is in the repository, and a link to it from inside
+    the sink satisfied a checkout-wide test. When the sink's own real path cannot be
+    resolved — it is a template component away from existing — nothing can be judged
+    against it, and the landing refuses rather than falling back to the wider boundary.
+    """
+    # No `sink is None` guard: a plan that reached the landing has a sink, because
+    # `learning_land_plan` refuses one it could not resolve — a branch no input can take
+    # is a claim about the data the tests cannot check.
+    try:
+        real, base = path.resolve(), Path(root).resolve()
+    except OSError:  # pragma: no cover - an unstattable path fails closed as uncontained
+        return None
+    if not real.is_relative_to(base):
+        return None
+    # **The same rule the plan applied, on the resolved path.** Resolving the sink to a
+    # directory instead looked equivalent and was not: `.keel/{date}/learning` is a
+    # template, so it names no directory on disk, and every project with a placeholder in
+    # its sink was `planned` by the pure layer and then refused here on every run.
+    # `path_under_sink` compares literal components, and the plan has already refused a
+    # sink it could not resolve — so the two layers are one answer rather than two that
+    # agree only sometimes.
+    relative = real.relative_to(base).as_posix()
+    return real if capture.path_under_sink(relative, sink) else None
+
+
+def _land_learning_attempt(args, plan: dict) -> dict:
+    """One build-and-push attempt. Returns ``{"status", "detail", "commit", "base"}``.
+
+    ``status`` is ``landed``, ``already-landed``, ``contended`` (another ship pushed
+    first - the caller retries) or ``failed``.
+    """
+    root, path, remote = args.root, plan["path"], plan["remote"]
+    # **Checked, because the ref resolves either way.** s11 runs after s10 moved
+    # `<remote>/<base>`, and a failed fetch leaves the remote-tracking ref at the
+    # pre-merge tip — so the commit is built as a *sibling* of the merge, the push is a
+    # non-fast-forward, and that is genuine contention by every test we have. It is
+    # retried, the fetch fails the same way, and the budget is spent on a race with
+    # nobody. A fetch that could not run is the answer, not the symptom it produces.
+    fetched = git.fetch(remote, plan["base_branch"], cwd=root)
+    if not fetched.ok:
+        return _land_result(
+            "failed",
+            f"cannot fetch {remote}/{plan['base_branch']}: {fetched.output.strip()}",
+            None,
+            None,
+        )
+    base_sha = git.rev_parse(plan["remote_ref"], cwd=root)
+    if base_sha is None:
+        return _land_result("failed", f"cannot resolve {plan['remote_ref']}", None, None)
+    # `_recorded_artifact`, not `os.path.join(root, path)`: the join resolved against
+    # the *process* directory for `isfile` and then again against `root` inside git,
+    # so a relative root that is not `.` was applied twice. The repo fixed this exact
+    # bug once already, sixty lines away, and the comment there says so.
+    resolved = _recorded_artifact(path, root)
+    if resolved is None:
+        return _land_result(
+            "failed", f"no such capture artifact: {_resolve_under_root(path, root)}", None, base_sha
+        )
+    # **Where the content came from, not only where the path points.** The safety check
+    # below counts *paths* in the finished commit, so a path inside the sink whose file
+    # is a symlink out of the checkout passed it while publishing someone else's file to
+    # the base branch — `git hash-object` follows the link. Resolving both ends and
+    # comparing them is the containment the docstrings already claim.
+    real = _contained_real_path(resolved, root, plan.get("sink"))
+    if real is None:
+        return _land_result(
+            "failed",
+            f"refusing to hash {path}: it resolves outside the learning sink ({resolved})",
+            None,
+            base_sha,
+        )
+    blob = git.hash_object(str(real), cwd=root)
+    if blob is None:
+        return _land_result("failed", f"cannot hash {real}", None, base_sha)
+    # **Asked before building, so a re-run is a no-op rather than an empty commit.**
+    # The s11 recipe is allowed to run twice (a resumed run, a retried session), and a
+    # landing that pushed a parentless-looking no-change commit each time would add a
+    # commit to the base branch for every retry.
+    if git.rev_parse(f"{base_sha}:{path}", cwd=root) == blob:
+        return _land_result(
+            "already-landed", f"{path} is already on {plan['remote_ref']}", None, base_sha
+        )
+    tree = _land_learning_tree(root, path, base_sha, blob)
+    if tree is None:
+        return _land_result("failed", f"cannot build a tree carrying {path}", None, base_sha)
+    commit = git.commit_tree(tree, parent=base_sha, message=plan["message"], cwd=root)
+    if commit is None:
+        return _land_result("failed", "cannot create the landing commit", None, base_sha)
+    # **The one live safety check.** Everything above composes trees from the base
+    # branch's own objects, so a composition bug is the only way this commit could
+    # carry something else - and the branch it would carry it to is the shared base.
+    # An unreadable diff fails closed: this must never push what it could not check.
+    touched = git.diff_names(base_sha, commit, cwd=root)
+    if touched != [path]:
+        return _land_result(
+            "failed",
+            f"refusing to push: the landing commit changes {touched}, not [{path!r}]",
+            commit,
+            base_sha,
+        )
+    pushed = git.push_commit(remote, commit, plan["ref"], cwd=root)
+    if pushed.ok:
+        return _land_result("landed", f"{path} landed on {plan['remote_ref']}", commit, base_sha)
+    detail = pushed.output.strip()
+    if capture.push_rejection_is_contention(detail):
+        return _land_result("contended", detail, commit, base_sha)
+    return _land_result("failed", detail, commit, base_sha)
+
+
+#: Landing outcomes that must not fail an s11 whose merge already happened.
+_LAND_OK_STATUSES = (
+    "landed",
+    "already-landed",
+    "not-required",
+    "no-artifact",
+    "would-land",
+)
+
+
+def _land_result(status: str, detail: str, commit: str | None, base: str | None) -> dict:
+    return {"status": status, "detail": detail, "commit": commit, "base": base}
+
+
+def _cmd_capture_land(args: argparse.Namespace) -> int:
+    """Land one run's learning document on ``origin/<base_branch>`` (#1163).
+
+    keel writes the learning at s11 and, before this command, stopped there: with the
+    default relative sink the file sat untracked in a worktree that s10's pre-clean
+    then deleted, so keel captured a lesson on every merge and threw it away.
+
+    This is **not** a merge path and does not touch one. It pushes a single commit
+    carrying a single file to the base branch, which is the mechanism #1163 picked;
+    `keel merge` at s10 remains the only way a pull request reaches that branch.
+    """
+    try:
+        config = cfg.load_config(args.path)
+    except FileNotFoundError:
+        print(f"no such config: {args.path}", file=sys.stderr)
+        return 1
+    except cfg.ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    artifact = args.artifact
+    ledger_path = ledger.resolve_path(args.root, config)
+    if artifact is None and args.pr is not None:
+        try:
+            records = ledger.read_records(ledger_path)
+        except ledger.LedgerError as exc:
+            print(f"invalid ledger {ledger_path}: {exc}", file=sys.stderr)
+            return 1
+        record = ledger.latest_ship_run_for_pr(records, args.pr)
+        capture_block = record.get("capture") if isinstance(record, dict) else None
+        if isinstance(capture_block, dict):
+            artifact = capture_block.get("artifact")
+
+    plan = capture.learning_land_plan(
+        config,
+        artifact=artifact,
+        pr_number=args.pr,
+        issue_number=args.issue,
+        remote=args.remote,
+        attempts=args.attempts,
+    )
+    attempts: list[dict] = []
+    outcome = {"status": plan["status"], "detail": plan["reason"], "commit": None, "base": None}
+    if plan["status"] == "planned":
+        if args.dry_run:
+            outcome = _land_result("would-land", plan["reason"], None, None)
+        else:
+            for _ in range(plan["attempts"]):
+                outcome = _land_learning_attempt(args, plan)
+                attempts.append(outcome)
+                if outcome["status"] != "contended":
+                    break
+            else:
+                # The last attempt's own detail is kept. Substituting a generic sentence
+                # here is what let three refusals be reported as a branch that "moved",
+                # printing a cause that had not happened over the server's actual reason.
+                last = attempts[-1]
+                outcome = _land_result(
+                    "failed",
+                    f"{plan['remote_ref']} moved under every one of "
+                    f"{plan['attempts']} attempt(s); the lesson was not landed. "
+                    f"Last push said: {last['detail']}",
+                    last["commit"],
+                    last["base"],
+                )
+
+    payload = {
+        "schema_version": capture.LEARNING_LAND_SCHEMA_VERSION,
+        "plan": plan,
+        "status": outcome["status"],
+        "detail": outcome["detail"],
+        "commit": outcome["commit"],
+        "base": outcome["base"],
+        "attempts": attempts,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"keel capture-land — {outcome['status']}  {outcome['detail']}")
+        if outcome["commit"] and outcome["status"] == "landed":
+            print(f"  commit  : {outcome['commit']}")
+    # `not-required` and `no-artifact` are answers, not failures: a project whose sink
+    # lives outside the checkout, and a run that captured nothing, both did the right
+    # thing and must not fail an s11 that has already merged.
+    return 0 if outcome["status"] in _LAND_OK_STATUSES else 1
+
+
 def _cmd_capture_verify(args: argparse.Namespace) -> int:
     try:
         config = cfg.load_config(args.path)
@@ -7275,6 +7526,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_capture.add_argument("--json", action="store_true", help="emit structured JSON")
     p_capture.set_defaults(func=_cmd_capture_verify)
+
+    p_land = sub.add_parser(
+        "capture-land",
+        help="land this run's learning document on the base branch (no checkout, no merge)",
+    )
+    p_land.add_argument("path", help="path to project.yaml")
+    p_land.add_argument("--root", default=".", help="repo root the sink path resolves against")
+    p_land.add_argument(
+        "--pr",
+        type=_positive_int,
+        default=None,
+        help="pull request the lesson came from; also how the artifact is read from the ledger",
+    )
+    p_land.add_argument(
+        "--issue",
+        type=_positive_int,
+        default=None,
+        help="issue the lesson came from; recorded in the commit's marker line",
+    )
+    p_land.add_argument(
+        "--artifact",
+        default=None,
+        help="repo-relative path to land (default: capture.artifact of the PR's ship_run record)",
+    )
+    p_land.add_argument("--remote", default="origin", help="remote holding the base branch")
+    p_land.add_argument(
+        "--attempts",
+        type=_positive_int,
+        default=capture.LEARNING_LAND_ATTEMPTS,
+        help="rebuild-and-retry budget when a concurrent ship pushes first",
+    )
+    p_land.add_argument(
+        "--dry-run", action="store_true", help="report what would be landed, push nothing"
+    )
+    p_land.add_argument("--json", action="store_true", help="emit structured JSON")
+    p_land.set_defaults(func=_cmd_capture_land)
 
     p_consent = sub.add_parser(
         "consent-verify",

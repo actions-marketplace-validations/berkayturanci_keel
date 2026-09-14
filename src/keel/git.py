@@ -158,6 +158,113 @@ def diff(base: str, head: str, *, cwd: str | None = None, _run=None) -> str | No
     return result.stdout if result.ok else None
 
 
+def hash_object(path: str, *, cwd: str | None = None, _run=None) -> str | None:
+    """Write ``path``'s content into the object database; return its blob SHA.
+
+    ``-w`` is what makes the landing possible without a checkout: the blob exists in
+    the repository before any tree references it, so the commit can be assembled with
+    plumbing and pushed, and a failed push leaves nothing but an unreferenced object
+    that ``git gc`` collects.
+    """
+    result = run_argv(["git", "hash-object", "-w", "--", path], cwd=cwd, **_kw(_run))
+    output = result.stdout.strip()
+    return output if result.ok and _SHA_RE.match(output) else None
+
+
+def ls_tree(treeish: str, *, cwd: str | None = None, _run=None) -> str | None:
+    """List one tree's own entries (not recursive); ``None`` when it cannot be read.
+
+    ``None`` and ``""`` are different answers and both are ordinary here: a sink
+    directory that does not exist on the base branch yet cannot be read (``None``),
+    and an existing but empty one reads as no entries. The caller treats the first as
+    "start a new directory" rather than as an error, which is what makes the very
+    first lesson land as cleanly as the hundredth.
+
+    ``-z`` for the same reason :func:`mktree` takes it: entries are NUL-terminated,
+    so a name is returned raw instead of C-quoted, and the round trip back through
+    ``mktree`` cannot re-encode one.
+    """
+    result = run_argv(["git", "ls-tree", "-z", treeish], cwd=cwd, **_kw(_run))
+    return result.stdout if result.ok else None
+
+
+def mktree(listing: str, *, cwd: str | None = None, _run=None) -> str | None:
+    """Write a tree object from NUL-terminated ``ls-tree``-shaped ``listing``.
+
+    The listing arrives on **stdin**, never in an argv: it carries object names and
+    file names, and an argv is world-readable in ``ps`` for the life of the process.
+
+    **``-z``, because a text-mode pipe rewrites newlines on Windows.** Python opens a
+    subprocess's stdin with ``newline=None`` under ``text=True``, which translates
+    every ``\n`` to ``os.linesep`` — so a LF-terminated listing reaches git as CRLF
+    there, and `mktree` does not complain: it writes a tree whose entry is named
+    ``<name>\r``, exits 0, and hands back a different SHA (measured). NUL-terminated
+    input has no newline to translate, so the same bytes arrive on every platform.
+    """
+    result = run_argv(["git", "mktree", "-z"], cwd=cwd, stdin_text=listing, **_kw(_run))
+    output = result.stdout.strip()
+    return output if result.ok and _SHA_RE.match(output) else None
+
+
+def commit_tree(
+    tree: str, *, parent: str, message: str, cwd: str | None = None, _run=None
+) -> str | None:
+    """Commit ``tree`` with a single ``parent``; return the new commit SHA.
+
+    The message goes in the **argv**, not on stdin, for the newline reason in
+    :func:`mktree`: a text-mode pipe turns every ``\n`` into CRLF on Windows, and a
+    commit message is content — it would land on the base branch carrying stray
+    carriage returns and stop being byte-identical across platforms. It is safe
+    there in a way a tree listing is not: this message is a fixed subject plus the
+    artifact path, which is about to be published on the base branch anyway.
+    """
+    result = run_argv(
+        ["git", "commit-tree", tree, "-p", parent, "-m", message],
+        cwd=cwd,
+        **_kw(_run),
+    )
+    output = result.stdout.strip()
+    return output if result.ok and _SHA_RE.match(output) else None
+
+
+def diff_names(a: str, b: str, *, cwd: str | None = None, _run=None) -> list[str] | None:
+    """Paths differing between two tree-ish objects (two-dot); ``None`` on error.
+
+    Two-dot on purpose, unlike :func:`changed_files`: the landing compares a commit
+    against the parent it was *just built on*, so "what did this commit add" is the
+    literal difference between the two trees and not a merge-base question. ``None``
+    stays distinct from ``[]`` so a caller that must fail closed when it cannot
+    observe — the landing's own "this commit changes exactly one file" check — can
+    tell an unreadable diff from an empty one.
+    """
+    # `-z` with `core.quotePath=false`, for the same reason `ls_tree`/`mktree` use it.
+    # Under the default `quotePath=true` git renders a non-ASCII name as a C-quoted
+    # escape — `".keel/learning/caf\\303\\251.md"` — which can never equal the raw path
+    # the landing planned, so the one live safety check refused every such artifact
+    # permanently and blamed the commit for changing a file nobody asked for.
+    result = run_argv(
+        ["git", "-c", "core.quotePath=false", "diff", "--name-only", "-z", a, b],
+        cwd=cwd,
+        **_kw(_run),
+    )
+    if not result.ok:
+        return None
+    return [name for name in result.stdout.split("\0") if name.strip()]
+
+
+def push_commit(
+    remote: str, commit: str, ref: str, *, cwd: str | None = None, _run=None
+) -> CommandResult:
+    """Fast-forward ``ref`` on ``remote`` to ``commit``.
+
+    Deliberately **not** forced. A rejected push is the concurrency signal the
+    landing is built around: another ship pushed its own lesson first, so this one
+    re-reads the branch and rebuilds its commit on top. Forcing here would discard
+    that ship's lesson — and, on a base branch, whatever else arrived with it.
+    """
+    return run_argv(["git", "push", remote, f"{commit}:{ref}"], cwd=cwd, **_kw(_run))
+
+
 def _kw(_run):
     """Pass ``_run`` through only when provided (so the default subprocess is used otherwise)."""
     return {"_run": _run} if _run is not None else {}

@@ -134,12 +134,17 @@ policy_pack:
       mode: create-learning
       sink:
         # The default sink writes into `.keel/learning/`, and keel runs its own
-        # ships inside a worktree that s10 then removes — so the file is written
-        # and thrown away until #1163 lands it on the base branch. It is on
-        # deliberately: the writer, the redaction, the dedupe and the fingerprint
-        # are exercised on every keel merge, and #1163 is the step that keeps the
-        # result. It does **not** yet make keel a project that captures its own
-        # runs across sessions; do not read it as that.
+        # ships inside a worktree that s10 removes before s11 runs — which is why
+        # s11 attempts the landing with `keel capture-land --root .` (#1163): the
+        # sink and the ledger are under the primary checkout, not the worktree.
+        # On *this* repository that landing is refused: `main` requires pull
+        # requests with `enforce_admins: true`, so a direct push has nowhere to
+        # go and s11 reports `failed` into the closure. The writer, the
+        # redaction, the dedupe and the fingerprint are still exercised on every
+        # keel merge; what is not exercised here is the push. `.keel/learning/`
+        # stays tracked rather than runtime-ignored so a lesson that *is* landed —
+        # by a consumer whose base branch takes the commit, or by hand here — is
+        # one git keeps.
         kind: markdown-dir
   labels:
     status: ["status:backlog", "status:in-progress", "status:needs-review", "status:done"]

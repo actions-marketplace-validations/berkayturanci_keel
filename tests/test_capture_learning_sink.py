@@ -29,6 +29,7 @@ import io
 import json
 import os
 import posixpath
+import re
 import shutil
 import tempfile
 import unittest
@@ -50,6 +51,49 @@ def run(argv):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = cli.main(argv)
     return code, out.getvalue(), err.getvalue()
+
+
+def _records(listing: str) -> list[str]:
+    """The NUL-terminated records of a tree listing, without the trailing empty one."""
+    return [record for record in listing.split("\x00") if record]
+
+
+#: Opens a runnable block: three *or more* backticks, a shell-ish tag, anything after.
+#:
+#: Every part of that is a shape an exact-string opener let through, and the
+#: assertion this replaced — a plain ``assertNotIn("```bash", …)`` over the whole
+#: section — had caught all three. ` ```bash title=x ` carries an attribute,
+#: ` ````bash ` uses four backticks to nest a fence inside itself, and ` ```console `
+#: is the tag a transcript uses; a recipe was pasted into the last of those, the
+#: surfaces regenerated the normal way, and this guard passed.
+_FENCE_OPEN = re.compile(r"\A`{3,}\s*(?:bash|sh|shell|console|zsh)\b")
+_FENCE_CLOSE = re.compile(r"\A`{3,}\s*\Z")
+
+
+def _shell_fences(markdown: str) -> list[str]:
+    """Every runnable fenced block's body in ``markdown``.
+
+    The s11 guard cares about what an operator could copy and run, which is the
+    fenced blocks alone — prose naming a command it is warning against must stay
+    legal, and grepping the whole section cannot tell the two apart.
+
+    An **unterminated** block yields its body too. A fence that never closes still
+    renders as a code block to the end of the section, and reading it as "no fence
+    here" is how a guard against pasted recipes comes to inspect nothing at all.
+    """
+    fences, inside, current = [], False, []
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not inside and _FENCE_OPEN.match(stripped):
+            inside, current = True, []
+        elif inside and _FENCE_CLOSE.match(stripped):
+            fences.append("\n".join(current))
+            inside = False
+        elif inside:
+            current.append(line)
+    if inside:
+        fences.append("\n".join(current))
+    return fences
 
 
 def write_config(directory: Path, extra_policy_pack_lines: list[str] | None = None) -> str:
@@ -292,25 +336,59 @@ class TheContractSaysWhoWritesTheFile(unittest.TestCase):
         checkout holds `base_branch`, so `git switch "$BASE_BRANCH"` there exits
         128 — *already used by worktree*, measured. A recipe built on it looks
         like durability and delivers none, on exactly the topology keel uses for
-        itself. The surfaces say what is true instead: keel writes the file, does
-        not commit it, and an in-repo sink is not durable yet.
+        itself.
+
+        Until #1163 this held by forbidding a runnable recipe outright, because
+        none could run. Now one can: `keel capture-land` builds its commit with
+        plumbing and never checks the base branch out. So the property is no
+        longer "no shell fence" but the thing that fence was standing in for —
+        s11 hands out **that** command, still warns why the obvious one is
+        wrong, and hands out no `git switch` / `git commit` / `git push` of its
+        own for the operator to run against the base branch.
         """
         root = Path(__file__).resolve().parents[1]
         for surface in (
             "src/keel/adapters/commands/ship.md",
             "commands/ship.md",
             ".claude/commands/keel/ship.md",
+            # The skills surface carries the same s11 fence and was not walked, so a
+            # regenerate that skipped it would have left a stale recipe this guard passed.
+            ".agents/skills/keel-ship/SKILL.md",
         ):
             with self.subTest(surface=surface):
                 body = (root / surface).read_text(encoding="utf-8")
                 s11 = body[body.index("### s11 capture") :]
                 self.assertIn("commit_required", body)
+                # The warning stays: the next person to reach for `git switch`
+                # should find out here why it cannot work, not from exit 128.
                 self.assertIn("already used by worktree", s11)
-                # The property is that s11 hands out no **runnable** recipe. The
-                # prose names the command it warns about, so the needle is the
-                # shell fence, not the string inside the warning.
                 capture_section = s11[: s11.index("### s12")]
-                self.assertNotIn("```" + "bash", capture_section)
+                self.assertIn("keel capture-land", capture_section)
+                # No hand-rolled git against the base branch. The needles are the
+                # commands themselves, inside a shell fence — the prose above is
+                # allowed to *name* `git switch` because it is warning about it.
+                fences = _shell_fences(capture_section)
+                # A guard that inspected zero fences would pass on a section whose
+                # opener it failed to recognise — the failure mode being fixed here.
+                self.assertTrue(fences, f"{surface}: s11 hands out no runnable block")
+                # **The landing's input is in the block with it.** `capture-land` reads
+                # the artifact off the `ship_run` record the append writes, so a fence
+                # carrying only the landing lands nothing when run as written: no
+                # record, `no-artifact`, exit 0 — the green s11 this section names as
+                # the regression it exists to prevent. Asserted on one fence rather
+                # than on the section, because prose elsewhere is not a recipe.
+                runnable = [f for f in fences if "keel capture-land" in f]
+                self.assertTrue(runnable, f"{surface}: no fence runs capture-land")
+                for fence in runnable:
+                    self.assertIn("--append-ledger", fence)
+                    self.assertLess(
+                        fence.index("--append-ledger"),
+                        fence.index("keel capture-land"),
+                        f"{surface}: the ledger append must come before the landing",
+                    )
+                for fence in fences:
+                    for forbidden in ("git switch", "git commit", "git push", "git add"):
+                        self.assertNotIn(forbidden, fence)
 
     def test_a_dormant_sink_under_a_disabled_capture_promises_nothing(self):
         """The contract must name the writer that will actually write.
@@ -2743,6 +2821,364 @@ class TheWriterLinksAtTheHead(unittest.TestCase):
         self.assertNotIn("topsecret", text)
         self.assertNotIn("hunter2", text)
         self.assertIn("REDACTED", text.split(capture.LEARNING_FILES_HEADING, 1)[1])
+
+
+class TestLearningLandPlan(unittest.TestCase):
+    """The pure plan behind `keel capture-land` (#1163).
+
+    keel wrote a learning on every merge and threw it away: with the default
+    relative sink the file sat untracked inside a worktree that s10's pre-clean
+    then deleted. These assert the decision to push to a base branch at all —
+    offline, because it is the one decision that must never be taken by accident.
+    """
+
+    def _config(self, tmp, lines=None):
+        return cfg.load_config(write_config(Path(tmp), lines))
+
+    _SINK = [
+        "  capture:",
+        "    enabled: true",
+        "    mode: extension",
+        "    learning:",
+        "      enabled: true",
+        "      mode: create-learning",
+        "      sink: {}",
+    ]
+
+    def test_in_repo_sink_is_planned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = capture.learning_land_plan(
+                self._config(tmp, self._SINK),
+                artifact=".keel/learning/a.md",
+                pr_number=7,
+            )
+        self.assertEqual(plan["status"], "planned")
+        self.assertEqual(plan["path"], ".keel/learning/a.md")
+        self.assertEqual(plan["ref"], "refs/heads/main")
+        self.assertEqual(plan["remote_ref"], "origin/main")
+        self.assertIn("PR #7", plan["message"])
+        self.assertEqual(plan["errors"], [])
+
+    def test_sink_outside_the_checkout_needs_no_landing(self):
+        # An absolute sink is a folder git never sees, so there is nothing to land
+        # and the command must not fail an s11 whose merge already happened.
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = list(self._SINK)
+            lines[-1] = "      sink: { path: /srv/knowledge }"
+            plan = capture.learning_land_plan(
+                self._config(tmp, lines), artifact="/srv/knowledge/a.md"
+            )
+        self.assertEqual(plan["status"], "not-required")
+        self.assertIsNone(plan["path"])
+        self.assertIsNone(plan["message"])
+
+    def test_no_artifact_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(tmp, self._SINK)
+            for empty in (None, "", "   "):
+                plan = capture.learning_land_plan(config, artifact=empty)
+                self.assertEqual(plan["status"], "no-artifact", empty)
+
+    def test_an_escaping_artifact_is_refused_not_normalised(self):
+        # The command pushes to a shared base branch, so this is the one input that
+        # must never be resolved helpfully.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(tmp, self._SINK)
+            # `\\etc\\hostname` and `~/x.md` are the two that got through. The first is
+            # *drive-relative*, so no flavour of `PurePath` calls it absolute — and the
+            # backslash rewrite then turned it into `/etc/hostname`, which
+            # `os.path.join(root, …)` resolves by discarding root: `git hash-object -w`
+            # stored a file from outside the checkout, and the tree split produced an
+            # entry with an empty name that `mktree` accepted into a corrupt object.
+            for bad in (
+                "../outside.md",
+                "/etc/passwd",
+                "C:\\x.md",
+                "\\\\srv\\x.md",
+                "\\etc\\hostname",
+                "~/x.md",
+                "~",
+                ".",
+            ):
+                plan = capture.learning_land_plan(config, artifact=bad)
+                self.assertEqual(plan["status"], "failed", bad)
+                self.assertTrue(plan["errors"], bad)
+
+    def test_a_sink_path_template_is_expanded_before_containment_is_judged(self):
+        """`path` is a template, and the writer writes the **expanded** form (#1163).
+
+        Compared against the literal `.keel/{repo}/learning`, every lesson such a project
+        ever writes is refused as "not under the configured learning sink" and the command
+        exits 1 — the containment test turned into one that can never pass.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(
+                tmp,
+                [
+                    "  capture:",
+                    "    enabled: true",
+                    "    mode: extension",
+                    "    learning:",
+                    "      enabled: true",
+                    "      mode: create-learning",
+                    "      sink:",
+                    "        kind: markdown-dir",
+                    "        path: '.keel/{repo}/learning'",
+                ],
+            )
+            self.assertEqual(
+                capture.learning_land_plan(config, artifact=".keel/tmp/learning/a.md", pr_number=7)[
+                    "status"
+                ],
+                "planned",
+            )
+            self.assertEqual(
+                capture.learning_land_plan(config, artifact="config/private.env", pr_number=7)[
+                    "status"
+                ],
+                "failed",
+            )
+            # The case that distinguishes "expanded" from "gave up at the placeholder":
+            # `.keel/other/learning/` is inside `.keel/` but is not this project's sink,
+            # so leaving `{repo}` unresolved would wave it through.
+            self.assertEqual(
+                capture.learning_land_plan(
+                    config, artifact=".keel/other/learning/a.md", pr_number=7
+                )["status"],
+                "failed",
+            )
+
+    def test_a_directory_placeholder_this_command_cannot_resolve_is_refused(self):
+        """A wildcard component is not a boundary, it is a hole.
+
+        `{owner}`, `{repo}`, `{base_branch}` and `{pr}` are the directory-shaped
+        placeholders and the landing has all four. `{date}`, `{slug}` and `{fingerprint}`
+        vary per run and belong in `filename`; left in a directory they name a place
+        nobody can point at. Matching them as a wildcard was tried: a sink of `{date}`
+        then makes the *first* component match anything, so `config/private.env` is
+        "inside" it, and `{date}/learning` accepts `config/learning/secrets.md`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(
+                tmp,
+                [
+                    "  capture:",
+                    "    enabled: true",
+                    "    mode: extension",
+                    "    learning:",
+                    "      enabled: true",
+                    "      mode: create-learning",
+                    "      sink:",
+                    "        kind: markdown-dir",
+                    "        path: '.keel/{date}/learning'",
+                ],
+            )
+            for artifact in (".keel/2026-09-15/learning/a.md", "config/private.env"):
+                plan = capture.learning_land_plan(config, artifact=artifact, pr_number=7)
+                self.assertEqual(plan["status"], "failed", artifact)
+                self.assertTrue(plan["errors"], artifact)
+                self.assertIn("cannot be resolved", " ".join(plan["errors"]))
+
+    def test_a_sink_of_just_a_placeholder_confines_nothing_and_is_refused(self):
+        # `{date}` alone makes every first component match, so the sink names the whole
+        # repository. Refusing is the only honest answer, and it names the fix.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(
+                tmp,
+                [
+                    "  capture:",
+                    "    enabled: true",
+                    "    mode: extension",
+                    "    learning:",
+                    "      enabled: true",
+                    "      mode: create-learning",
+                    "      sink:",
+                    "        kind: markdown-dir",
+                    "        path: '{date}'",
+                ],
+            )
+            for artifact in ("config/private.env", "src/keel/cli.py", "2026-09-15/a.md"):
+                self.assertEqual(
+                    capture.learning_land_plan(config, artifact=artifact)["status"],
+                    "failed",
+                    artifact,
+                )
+
+    def test_an_artifact_outside_the_sink_is_refused(self):
+        """Inside the repository is not the containment this command needs.
+
+        Every other path test asks whether git could address the path, and the answer is
+        yes for `config/private.env` as much as for a lesson — so a ledger record naming
+        one fast-forwarded the shared base branch with it, and the exactly-one-file check
+        downstream agreed, because it was exactly one file. The sink is the only directory
+        this command has business writing to.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(tmp, self._SINK)
+            for outside in ("config/private.env", "src/keel/cli.py", "README.md"):
+                plan = capture.learning_land_plan(config, artifact=outside)
+                self.assertEqual(plan["status"], "failed", outside)
+                self.assertTrue(plan["errors"], outside)
+
+    def test_a_sibling_directory_that_starts_the_same_is_not_the_sink(self):
+        # Compared by component: a prefix test calls `.keel/learning-notes/x.md` inside
+        # `.keel/learning`, and it is a different directory that merely reads alike.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(tmp, self._SINK)
+            self.assertEqual(
+                capture.learning_land_plan(config, artifact=".keel/learning-notes/x.md")["status"],
+                "failed",
+            )
+            # A nested path genuinely under the sink stays legal.
+            self.assertEqual(
+                capture.learning_land_plan(config, artifact=".keel/learning/2026/x.md")["status"],
+                "planned",
+            )
+
+    def test_no_base_branch_is_refused(self):
+        class _NoBase:
+            policy_pack = {
+                "capture": {
+                    "enabled": True,
+                    "mode": "extension",
+                    "learning": {"enabled": True, "mode": "create-learning", "sink": {}},
+                }
+            }
+            base_branch = ""
+
+        plan = capture.learning_land_plan(_NoBase(), artifact=".keel/learning/a.md")
+        self.assertEqual(plan["status"], "failed")
+        self.assertIn("base_branch is not configured", plan["errors"])
+
+    def test_remote_and_attempts_are_carried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = capture.learning_land_plan(
+                self._config(tmp, self._SINK),
+                artifact=".keel/learning/a.md",
+                remote="upstream",
+                attempts=5,
+            )
+        self.assertEqual(plan["remote"], "upstream")
+        self.assertEqual(plan["remote_ref"], "upstream/main")
+        self.assertEqual(plan["attempts"], 5)
+
+    def test_message_without_a_pr_number(self):
+        message = capture.learning_land_message(pr_number=None, path=".keel/learning/a.md")
+        self.assertIn("from this run", message)
+        self.assertIn("pr=-", message)
+
+    def test_message_carries_no_vendor_trailer(self):
+        # Core-owned and consumer-neutral: this commit lands on every consumer's base
+        # branch, and keel cannot know whose co-authorship to stamp on it.
+        message = capture.learning_land_message(pr_number=7, path=".keel/learning/a.md")
+        self.assertNotIn("Co-Authored-By", message)
+        # The marker *is* the schema version, so a history reader can tell this commit
+        # from a stray push and grep straight to the contract that defines it (#1163).
+        self.assertIn("keel.capture-land.v1: pr=7 issue=- path=.keel/learning/a.md", message)
+
+    def test_contract_names_the_land_command_only_when_it_is_needed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            in_repo = capture.contract_as_dict(self._config(tmp, self._SINK))
+            lines = list(self._SINK)
+            lines[-1] = "      sink: { path: /srv/knowledge }"
+            outside = capture.contract_as_dict(self._config(tmp, lines))
+        self.assertTrue(in_repo["durable_artifacts"]["commit_required"])
+        self.assertEqual(in_repo["durable_artifacts"]["land_command"], "keel capture-land")
+        self.assertFalse(outside["durable_artifacts"]["commit_required"])
+        self.assertIsNone(outside["durable_artifacts"]["land_command"])
+
+
+class TestTreeComposition(unittest.TestCase):
+    """Grafting one blob onto the base branch's tree, as a pure string function.
+
+    This is where "the landing commit differs from its parent by exactly one path"
+    becomes a property a test can assert, rather than a property of a live push.
+    """
+
+    def test_adds_into_an_existing_listing_in_git_order(self):
+        listing = f"100644 blob {'a' * 40}\tb.md\x00040000 tree {'c' * 40}\tsub\x00"
+        out = capture.upsert_tree_entry(
+            listing, capture.TreeEntry(capture.TREE_MODE_BLOB, "blob", "d" * 40, "a.md")
+        )
+        self.assertEqual(
+            _records(out),
+            [
+                f"100644 blob {'d' * 40}\ta.md",
+                f"100644 blob {'a' * 40}\tb.md",
+                f"040000 tree {'c' * 40}\tsub",
+            ],
+        )
+
+    def test_replaces_the_entry_of_the_same_name(self):
+        listing = f"100644 blob {'a' * 40}\ta.md\x00"
+        out = capture.upsert_tree_entry(
+            listing, capture.TreeEntry(capture.TREE_MODE_BLOB, "blob", "b" * 40, "a.md")
+        )
+        self.assertEqual(out, f"100644 blob {'b' * 40}\ta.md\x00")
+
+    def test_a_missing_directory_composes_from_nothing(self):
+        # The first lesson ever landed, where `.keel/learning` is not on the base branch.
+        out = capture.upsert_tree_entry(
+            None, capture.TreeEntry(capture.TREE_MODE_BLOB, "blob", "a" * 40, "a.md")
+        )
+        self.assertEqual(out, f"100644 blob {'a' * 40}\ta.md\x00")
+
+    def test_git_sorts_a_tree_as_if_its_name_ended_in_a_slash(self):
+        # git compares "learning/" against "learning.md", and "." (0x2e) sorts before
+        # "/" (0x2f) - so the blob comes first. Composing it any other way hands
+        # `mktree` an order it has to fix, and two runs stop agreeing byte for byte.
+        listing = f"040000 tree {'a' * 40}\tlearning\x00100644 blob {'b' * 40}\tlearning.md\x00"
+        out = capture.upsert_tree_entry(
+            listing, capture.TreeEntry(capture.TREE_MODE_BLOB, "blob", "c" * 40, "a.md")
+        )
+        self.assertEqual(
+            [record.split("\t")[1] for record in _records(out)],
+            ["a.md", "learning.md", "learning"],
+        )
+
+    def test_unparseable_lines_are_dropped_not_guessed_at(self):
+        self.assertEqual(capture.parse_tree_listing("garbage\x00\x00"), [])
+        self.assertEqual(capture.parse_tree_listing(None), [])
+
+    def test_parses_every_entry_kind(self):
+        listing = (
+            f"100644 blob {'a' * 40}\ta.md\x00"
+            f"040000 tree {'b' * 40}\tsub\x00"
+            f"160000 commit {'c' * 40}\tmodule\x00"
+        )
+        self.assertEqual(
+            [(e.kind, e.name) for e in capture.parse_tree_listing(listing)],
+            [("blob", "a.md"), ("tree", "sub"), ("commit", "module")],
+        )
+
+    def test_the_listing_carries_no_newline_to_translate(self):
+        """The Windows defect this format exists for, pinned as a property.
+
+        Python opens a subprocess's stdin with ``newline=None`` under ``text=True``,
+        so every ``\n`` becomes CRLF there. `git mktree` accepts a CRLF listing
+        without complaint, writes a tree whose entry is named ``<name>\r`` and exits
+        0 with a different SHA — measured, and the reason seven tests went red on
+        every Windows leg while the landing's own safety check correctly refused to
+        push. NUL-terminated output has nothing to translate.
+        """
+        out = capture.upsert_tree_entry(
+            f"040000 tree {'a' * 40}\tsub\x00",
+            capture.TreeEntry(capture.TREE_MODE_BLOB, "blob", "b" * 40, "a.md"),
+        )
+        self.assertNotIn("\n", out)
+        self.assertNotIn("\r", out)
+        self.assertTrue(out.endswith("\x00"))
+
+    def test_a_listing_that_arrives_lf_terminated_still_parses(self):
+        # The reader is permissive on purpose; the writer is the exact side.
+        self.assertEqual(
+            [e.name for e in capture.parse_tree_listing(f"100644 blob {'a' * 40}\ta.md\n")],
+            ["a.md"],
+        )
+
+    def test_render_round_trips(self):
+        entry = capture.TreeEntry(capture.TREE_MODE_TREE, "tree", "a" * 40, "sub")
+        self.assertEqual(capture.parse_tree_listing(entry.render()), [entry])
 
 
 if __name__ == "__main__":  # pragma: no cover
