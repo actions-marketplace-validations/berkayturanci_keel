@@ -1091,7 +1091,13 @@ def _cmd_merge(args: argparse.Namespace) -> int:
             except ledger.LedgerError as exc:
                 return _finish_merge(args, payload, f"invalid run ledger: {exc}", code=1)
             matched, record = ledger.gates_pass_for_head(
-                gates_records, args.pr, head_sha if isinstance(head_sha, str) else ""
+                gates_records,
+                args.pr,
+                head_sha if isinstance(head_sha, str) else "",
+                # The same set the evidence gate just proved, not a second walk: two reads
+                # of one history could disagree, and the merge would then be judged by the
+                # more permissive of them.
+                covered_heads=tuple(evidence_payload.get("covered_heads") or ()),
             )
             gates_run_id = record.get("run_id") if record else None
             payload["gates_sha"] = {
@@ -1213,18 +1219,33 @@ def _shipped_jury_availability(
     authority a posted jury verdict has — no more. An untrusted author's comment may not
     relax the contract in either shape.
     """
-    head_sha = artifacts["head_sha"]
-    return juryavail.pin(
-        ledger_record,
-        head_sha=head_sha,
-        closure_panel_decision=evidence.shipped_panel_decision(
-            artifacts["pr_comments"], head_sha=head_sha
-        ),
-        panel_verdict_posted=juryavail.is_pinnable_head(head_sha)
-        and evidence.panel_verdict_posted(
-            artifacts["pr_comments"], artifacts["pr_reviews"], head_sha=head_sha
-        ),
-    )
+    # **The current head first, then each head it covers** (#1203). The panel decision is
+    # a pin, and a pin removes requirements — so it keeps `juryavail`'s strict one-head
+    # rule, asked once per head rather than widened. Every source it ranks (the ledger
+    # record, the closure comment, a posted jury verdict) was written against the head
+    # before the lesson landed; asked only about the landing's head, all three missed, the
+    # pin came back `None`, and the caller *probed this machine* for the panel instead —
+    # re-deriving the review contract from the landing host's availability, which is the
+    # rewrite #1066 and #1068 exist to stop. The landing changes one file inside the sink,
+    # never who reviewed the code, so a pin for a covered head is the ship's own statement.
+    for head in (artifacts["head_sha"], *artifacts.get("covered_heads", ())):
+        decision = juryavail.pin(
+            ledger_record,
+            head_sha=head,
+            closure_panel_decision=evidence.shipped_panel_decision(
+                artifacts["pr_comments"], head_sha=head
+            ),
+            panel_verdict_posted=juryavail.is_pinnable_head(head)
+            and evidence.panel_verdict_posted(
+                artifacts["pr_comments"],
+                artifacts["pr_reviews"],
+                head_sha=head,
+                covered_heads=(),
+            ),
+        )
+        if decision is not None:
+            return decision
+    return None
 
 
 def _review_assignment(
@@ -1649,13 +1670,12 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     # The built-in capture extension (#1154). `policy_pack.capture.learning.sink`
     # names a directory of Markdown; keel renders the document and writes it, and
     # the path becomes `capture.artifact` — which is already the field that makes
-    # an `applied` capture provable rather than asserted. A project with no sink
-    # keeps today's behaviour exactly, including an operator-supplied
-    # `--capture-artifact`.
+    # an `applied` capture provable rather than asserted. An operator-supplied
+    # `--capture-artifact` is recorded as given, sink or no sink (see below).
     # Resolved once, so the document the sink writes and the record the ledger
     # appends fingerprint the same lesson.
     capture_facts = _capture_issue_facts(args)
-    capture_changed = _capture_changed_files(args, changed_read)
+    capture_changed = _capture_changed_files(args, config, changed_read)
     # **Ask the clash first.** The append no-ops when this (PR, head) already
     # carries a marker, and the write ran before that was known — so a retry whose
     # fingerprint had moved (a `gh` outage on the first attempt, a label fetched on
@@ -1670,9 +1690,15 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         if args.append_ledger and args.live
         else None
     )
+    # **A named artifact is recorded, not written again** (#1203). With an in-repo sink
+    # the lesson is written and landed on the pull request at s10 by `keel capture-land
+    # --write`, and s11 records it by passing that path. Writing here as well rendered a
+    # second copy into the primary checkout after the merge — untracked, so the next
+    # `git pull` bringing the landed one refuses to overwrite it, or, a day later, under
+    # a second filename that no landing would ever carry.
     capture_write = (
         None
-        if capture_clash is not None
+        if capture_clash is not None or args.capture_artifact
         else _write_learning_sink(
             args, config, capture_changed, existing_ledger_records, outcomes, capture_facts
         )
@@ -2004,11 +2030,15 @@ def _land_learning_attempt(args, plan: dict) -> dict:
     # non-fast-forward, and that is genuine contention by every test we have. It is
     # retried, the fetch fails the same way, and the budget is spent on a race with
     # nobody. A fetch that could not run is the answer, not the symptom it produces.
-    fetched = git.fetch(remote, plan["base_branch"], cwd=root)
+    # The branch the commit goes **to**, which is the pull request's own under #1203 —
+    # fetching the base instead would build the lesson on a remote-tracking ref that
+    # names the wrong branch entirely, or a stale copy of the right one.
+    target = plan.get("onto") or plan["base_branch"]
+    fetched = git.fetch(remote, target, cwd=root)
     if not fetched.ok:
         return _land_result(
             "failed",
-            f"cannot fetch {remote}/{plan['base_branch']}: {fetched.output.strip()}",
+            f"cannot fetch {remote}/{target}: {fetched.output.strip()}",
             None,
             None,
         )
@@ -2021,6 +2051,19 @@ def _land_learning_attempt(args, plan: dict) -> dict:
     # bug once already, sixty lines away, and the comment there says so.
     resolved = _recorded_artifact(path, root)
     if resolved is None:
+        # **Gone locally because a landing already took it.** A successful landing removes
+        # the now-redundant working-tree copy, so a resumed or retried s11 finds no file —
+        # and reporting `failed` there would break the re-run guarantee the command makes.
+        # The path already on the target branch is the answer: the lesson is where it
+        # belongs. Only a path that is neither here nor there is a missing artifact.
+        if git.rev_parse(f"{base_sha}:{path}", cwd=root) is not None:
+            return _land_result(
+                "already-landed",
+                f"{path} is already on {plan['remote_ref']}; the local copy was removed "
+                "by the landing that put it there",
+                None,
+                base_sha,
+            )
         return _land_result(
             "failed", f"no such capture artifact: {_resolve_under_root(path, root)}", None, base_sha
         )
@@ -2075,7 +2118,60 @@ def _land_learning_attempt(args, plan: dict) -> dict:
     return _land_result("failed", detail, commit, base_sha)
 
 
-#: Landing outcomes that must not fail an s11 whose merge already happened.
+def _drop_landed_copy(root: str, path: str, landed: str | None) -> str:
+    """Remove the working-tree copy of a lesson now committed, when it is the same bytes.
+
+    **git will not pull over an untracked file, even one byte-identical to the file
+    arriving.** Measured: the writer puts the lesson in the checkout untracked, the landing
+    puts the same path on the branch, and the next `git pull` there aborts with *untracked
+    working tree files would be overwritten by merge* — until someone deletes a file keel
+    wrote. The landing is what made that copy redundant, so the landing removes it.
+
+    Only when it is provably redundant: the blob in the working tree must equal the blob
+    at that path in ``landed``. A lesson someone edited after it was written is kept, and
+    so is anything that cannot be read. Returns ``removed``, ``kept`` or ``absent``.
+
+    **Never a tracked file.** After the merge a `git pull` puts the lesson in the index, and
+    a re-run that finds it already landed would otherwise delete a file the checkout tracks
+    — same bytes, so every check above passes. ``:<path>`` asks the index literally, with no
+    pathspec globbing; measured on a tracked ``x*.md`` beside an untracked ``xy.md``.
+    """
+    local = _recorded_artifact(path, root)
+    if local is None:
+        return "absent"
+    committed = git.rev_parse(f"{landed}:{path}", cwd=root) if landed else None
+    current = git.hash_object(str(local.resolve()), cwd=root)
+    if committed is None or current != committed:
+        return "kept"
+    return _unlink_untracked(local, path, root)
+
+
+def _discard_unlanded_lesson(root: str, path: str) -> str:
+    """Remove the lesson ``--write`` wrote when it did not land: ``removed``, ``kept``, ``absent``.
+
+    A lesson that is not on the pull request is not durable, and left untracked in the
+    primary checkout it is the orphan #1203 exists to end — no record will name it, and a
+    later landing at the same path meets it in `git pull`. Re-running s10 writes it again.
+    """
+    local = _recorded_artifact(path, root)
+    if local is None:
+        return "absent"
+    return _unlink_untracked(local, path, root)
+
+
+def _unlink_untracked(local: Path, path: str, root: str) -> str:
+    """Delete ``local`` unless the checkout tracks ``path``; ``removed`` or ``kept``."""
+    if git.rev_parse(f":{path}", cwd=root) is not None:
+        return "kept"
+    try:
+        local.unlink()
+    except OSError:  # pragma: no cover - a file that vanished or is read-only stays as-is
+        return "kept"
+    return "removed"
+
+
+#: Landing outcomes that are not failures: the lesson is on the branch, or there was nothing
+#: to put there. `failed` is the one that is — and s10 still merges past it (fail-soft).
 _LAND_OK_STATUSES = (
     "landed",
     "already-landed",
@@ -2089,16 +2185,191 @@ def _land_result(status: str, detail: str, commit: str | None, base: str | None)
     return {"status": status, "detail": detail, "commit": commit, "base": base}
 
 
+def _lesson_write(status: str, path: str | None, detail: str, commit: str | None = None) -> dict:
+    return {"status": status, "path": path, "detail": detail, "commit": commit}
+
+
+def _land_write_refusal(args: argparse.Namespace) -> str | None:
+    """Why ``capture-land --write`` cannot run as invoked, or ``None``."""
+    if args.pr is None:
+        return "--write needs --pr: the lesson is written from that pull request"
+    if args.artifact is not None:
+        return "--write and --artifact are exclusive: --write lands the lesson it writes"
+    if args.dry_run:
+        return "--write and --dry-run are exclusive: a dry run writes no lesson to land"
+    return None
+
+
+def _write_lesson_to_land(args: argparse.Namespace, config: cfg.ProjectConfig, records) -> dict:
+    """Write the lesson ``capture-land --write`` lands, or say why there is none (#1203).
+
+    s10 used to write it with ``keel ship --live --append-ledger``, and that is a ship-run
+    recorder: it appends a ledger row stamped with the pull request's head, capture marker
+    included, and a later row for the same (PR, head) is dropped — so a merge that then
+    failed could not be recorded as anything but the ``applied`` that row already claimed.
+    This writes the document and nothing else. The capture is recorded at s11, after the
+    merge, by the append that names this path.
+
+    The facts are the ones that append will carry, read the same way: the issue through
+    :func:`_capture_issue_facts`, the files through :func:`_capture_changed_files`, and the
+    writer handed a ``ship`` namespace parsed from the flags s11 passes. The gate words are
+    the gates-pass recorded for the head — s10 runs no gates, and a lesson that reported
+    none would be wrong about the one fact the merge rests on.
+
+    **One lesson per pull request.** A retried s10 — the merge window closed, and the run
+    resumes tomorrow — must not write a second document under tomorrow's date, so a lesson
+    a landing already put on this pull request, and that the pull request still carries, is
+    reported ``already-landed`` and nothing is written.
+
+    Returns ``{"status", "path", "detail", "commit"}``: ``written`` (a new document at
+    ``path``, to land), ``already-landed`` (``commit`` put ``path`` on the pull request),
+    ``no-artifact`` (the policy writes no document, or this one duplicates a lesson already
+    durable — the s11 append then records that one, as it always has), or ``failed``.
+    """
+    pr = args.pr
+    try:
+        owner_repo = _owner_repo(config)
+        pull = _gh_json(["repos", owner_repo, "pulls", str(pr)], cwd=args.root)
+    except ValueError as exc:
+        return _lesson_write("failed", None, f"cannot read pull request #{pr}: {exc}")
+    head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+    head_sha = head.get("sha") if isinstance(head.get("sha"), str) else None
+    if not head_sha:
+        return _lesson_write("failed", None, f"pull request #{pr} reports no head commit")
+    files = github.pr_files(pr, cwd=args.root)
+    if files is None:
+        return _lesson_write("failed", None, f"cannot read the files pull request #{pr} changed")
+    try:
+        landed = _landed_lesson(config, owner_repo, pr, files, cwd=args.root)
+    except ValueError as exc:
+        return _lesson_write("failed", None, f"cannot read pull request #{pr}'s commits: {exc}")
+    if landed is not None:
+        return _lesson_write(
+            "already-landed",
+            landed["path"],
+            f"{landed['path']} already rides pull request #{pr} (landed by {landed['sha']}); "
+            "no second lesson is written",
+            landed["sha"],
+        )
+    passed, record = ledger.gates_pass_for_head(records, pr, head_sha)
+    if not passed:
+        return _lesson_write(
+            "failed",
+            None,
+            f"no gates-pass is recorded for {head_sha} under {args.root}; the lesson reports "
+            "the gates that passed on the head it merges with, so they must have run",
+        )
+    flags = [
+        "ship",
+        args.path,
+        f"--root={args.root}",
+        "--live",
+        "--append-ledger",
+        "--capture-status=applied",
+        f"--pull-request={pr}",
+        f"--head-sha={head_sha}",
+    ]
+    if args.issue is not None:
+        flags.append(f"--issue={args.issue}")
+    ship_args = build_parser().parse_args(flags)
+    result = _write_learning_sink(
+        ship_args,
+        config,
+        _capture_changed_files(ship_args, config, files),
+        records,
+        _recorded_gate_outcomes(record),
+        _capture_issue_facts(ship_args),
+    )
+    if result is None:
+        return _lesson_write("no-artifact", None, "the capture policy writes no document here")
+    if not result["ok"]:
+        return _lesson_write("failed", None, f"cannot write the lesson: {result['error']}")
+    if result["reused"]:
+        return _lesson_write(
+            "no-artifact",
+            None,
+            f"this lesson duplicates {result['path']}, which is already durable; "
+            "the s11 append records that one",
+        )
+    return _lesson_write("written", result["path"], f"wrote {result['path']}")
+
+
+def _recorded_gate_outcomes(record: dict) -> list[GateOutcome]:
+    """A gates-pass record's gates, as the outcomes the learning writer words them from.
+
+    Only what :func:`_gate_word` reads is restored. The record keeps a finding *count*, not
+    the findings, and no lesson sentence needs them. Called only on a record
+    :func:`keel.ledger.record_gates_passed` accepted, which is what makes ``gates`` a
+    non-empty list of mappings here.
+    """
+    return [
+        GateOutcome(
+            gate=str(item.get("gate")),
+            ok=item.get("ok") is True,
+            skipped=item.get("skipped") is True,
+            not_run=item.get("not_run") is True,
+        )
+        for item in record["gates"]
+    ]
+
+
+def _landed_lesson(
+    config: cfg.ProjectConfig,
+    owner_repo: str,
+    pr_number: int,
+    pr_files: list[str],
+    *,
+    cwd: str,
+) -> dict[str, str] | None:
+    """The lesson a landing already put on this pull request, newest first; ``None`` if none.
+
+    A commit counts when :func:`keel.capture.capture_only_descent` accepts it against its
+    own parent — the marker, one parent, one added or modified path inside the sink: the
+    test the head-pin exemption applies, so a stray commit that merely *says* it is a
+    landing is not one. And its path must still be among the files the pull request
+    changes; a lesson a later commit deleted is not riding it any more.
+
+    The commits are read from the pull request, not walked back from its head, on purpose:
+    a fix pushed after the landing leaves the lesson below the tip, and it is still this
+    pull request's lesson. Only commits carrying the marker are fetched, and at most
+    ``_COVERED_HEADS_LIMIT`` of them.
+    """
+    sink = capture.land_sink_root(config, pr_number=pr_number, base_branch=config.base_branch or "")
+    carried = set(pr_files)
+    commits = _gh_json_list(["repos", owner_repo, "pulls", str(pr_number), "commits"], cwd=cwd)
+    marked = [
+        item["sha"]
+        for item in reversed(commits)
+        if isinstance(item.get("sha"), str)
+        and isinstance(item.get("commit"), dict)
+        and capture.carries_landing_marker(item["commit"].get("message"))
+    ]
+    for sha in marked[:_COVERED_HEADS_LIMIT]:
+        facts = _commit_facts(owner_repo, sha, cwd=cwd)
+        parents = facts.get("parents") if facts else None
+        if not isinstance(parents, list) or len(parents) != 1:
+            continue
+        if not capture.capture_only_descent(parents[0], sha, [facts], sink=sink):
+            continue
+        if facts["files"][0] in carried:
+            return {"sha": sha, "path": facts["files"][0]}
+    return None
+
+
 def _cmd_capture_land(args: argparse.Namespace) -> int:
-    """Land one run's learning document on ``origin/<base_branch>`` (#1163).
+    """Land one run's learning document on a branch (#1163, #1203).
 
-    keel writes the learning at s11 and, before this command, stopped there: with the
-    default relative sink the file sat untracked in a worktree that s10's pre-clean
-    then deleted, so keel captured a lesson on every merge and threw it away.
+    With ``--write --onto`` — which is how `/keel:ship` runs it, at s10 before the evidence
+    gate — it writes the lesson itself (:func:`_write_lesson_to_land`) and lands it on the
+    pull request's own branch, so the lesson merges with the work it describes and
+    base-branch protection never sees the push. Without ``--write`` the artifact is
+    ``--artifact``, or the one the pull request's latest ``ship_run`` record names; without
+    ``--onto`` the branch is ``<remote>/<base_branch>``, which a base that requires pull
+    requests refuses.
 
-    This is **not** a merge path and does not touch one. It pushes a single commit
-    carrying a single file to the base branch, which is the mechanism #1163 picked;
-    `keel merge` at s10 remains the only way a pull request reaches that branch.
+    This is **not** a merge path and does not touch one. It pushes a single commit carrying
+    a single file; `keel merge` at s10 remains the only way a pull request reaches the base.
+    Nor does it write the run ledger: the capture is recorded at s11, after the merge.
     """
     try:
         config = cfg.load_config(args.path)
@@ -2109,18 +2380,38 @@ def _cmd_capture_land(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    refusal = _land_write_refusal(args) if args.write else None
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 1
+
     artifact = args.artifact
+    written: dict | None = None
     ledger_path = ledger.resolve_path(args.root, config)
-    if artifact is None and args.pr is not None:
+    if args.write or (artifact is None and args.pr is not None):
         try:
             records = ledger.read_records(ledger_path)
         except ledger.LedgerError as exc:
             print(f"invalid ledger {ledger_path}: {exc}", file=sys.stderr)
             return 1
-        record = ledger.latest_ship_run_for_pr(records, args.pr)
-        capture_block = record.get("capture") if isinstance(record, dict) else None
-        if isinstance(capture_block, dict):
-            artifact = capture_block.get("artifact")
+        if args.write:
+            # Asked of the plan before anything is read or written: a sink outside the
+            # checkout (`not-required` — s11 writes that one, as before) or a remote or
+            # branch git cannot take (`failed`) must not cost a lesson on disk.
+            precheck = capture.learning_land_plan(
+                config, artifact=None, remote=args.remote, onto=args.onto
+            )
+            written = (
+                _write_lesson_to_land(args, config, records)
+                if precheck["status"] == "no-artifact"
+                else _lesson_write(precheck["status"], None, precheck["reason"])
+            )
+            artifact = written["path"]
+        else:
+            record = ledger.latest_ship_run_for_pr(records, args.pr)
+            capture_block = record.get("capture") if isinstance(record, dict) else None
+            if isinstance(capture_block, dict):
+                artifact = capture_block.get("artifact")
 
     plan = capture.learning_land_plan(
         config,
@@ -2128,11 +2419,20 @@ def _cmd_capture_land(args: argparse.Namespace) -> int:
         pr_number=args.pr,
         issue_number=args.issue,
         remote=args.remote,
+        onto=args.onto,
         attempts=args.attempts,
     )
     attempts: list[dict] = []
     outcome = {"status": plan["status"], "detail": plan["reason"], "commit": None, "base": None}
-    if plan["status"] == "planned":
+    if (
+        written is not None
+        and written["status"] != "written"
+        and plan["status"] in ("planned", "no-artifact")
+    ):
+        # The write already settled it: a lesson on the pull request, nothing to write, or
+        # a failure to read or write. A plan that refuses outright keeps its own answer.
+        outcome = _land_result(written["status"], written["detail"], written["commit"], None)
+    elif plan["status"] == "planned":
         if args.dry_run:
             outcome = _land_result("would-land", plan["reason"], None, None)
         else:
@@ -2155,6 +2455,15 @@ def _cmd_capture_land(args: argparse.Namespace) -> int:
                     last["base"],
                 )
 
+    local_copy = None
+    if outcome["status"] == "landed":
+        local_copy = _drop_landed_copy(args.root, plan["path"], outcome["commit"])
+    elif outcome["status"] == "already-landed":
+        local_copy = _drop_landed_copy(
+            args.root, plan["path"], outcome["commit"] or outcome["base"]
+        )
+    elif written is not None and written["status"] == "written":
+        local_copy = _discard_unlanded_lesson(args.root, written["path"])
     payload = {
         "schema_version": capture.LEARNING_LAND_SCHEMA_VERSION,
         "plan": plan,
@@ -2163,6 +2472,8 @@ def _cmd_capture_land(args: argparse.Namespace) -> int:
         "commit": outcome["commit"],
         "base": outcome["base"],
         "attempts": attempts,
+        "local_copy": local_copy,
+        "write": written,
     }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -3752,6 +4063,7 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
                 artifacts["pr_comments"],
                 artifacts["pr_reviews"],
                 head_sha=artifacts["head_sha"],
+                covered_heads=artifacts.get("covered_heads", ()),
             )
         ),
         # The panel size the posted jury verdict declared. On a tier whose panel *is*
@@ -3762,6 +4074,7 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
             artifacts["pr_comments"],
             artifacts["pr_reviews"],
             head_sha=artifacts["head_sha"],
+            covered_heads=artifacts.get("covered_heads", ()),
         ),
     )
     gate_label = args.gate_label or config.knobs.evidence_gate_label
@@ -3784,6 +4097,7 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
         pr_title=artifacts.get("pr_title", ""),
         pr_labels=artifacts["pr_labels"],
         head_sha=artifacts["head_sha"],
+        covered_heads=artifacts.get("covered_heads", ()),
         ledger_record=ledger_record,
         dry_run=args.dry_run,
         enforced=enforced,
@@ -5003,6 +5317,7 @@ def _verify_merge_evidence(
             artifacts["pr_comments"],
             artifacts["pr_reviews"],
             head_sha=artifacts["head_sha"],
+            covered_heads=artifacts.get("covered_heads", ()),
         ),
     )
     gate_label = args.gate_label or config.knobs.evidence_gate_label
@@ -5025,6 +5340,7 @@ def _verify_merge_evidence(
         pr_title=artifacts.get("pr_title", ""),
         pr_labels=artifacts["pr_labels"],
         head_sha=artifacts["head_sha"],
+        covered_heads=artifacts.get("covered_heads", ()),
         enforced=enforced,
         phase=phase,
     )
@@ -5035,6 +5351,7 @@ def _verify_merge_evidence(
         "enforced": enforced,
         "verification": report,
         "head_sha": artifacts["head_sha"],
+        "covered_heads": list(artifacts.get("covered_heads", ())),
         "head_ref": artifacts.get("head_ref"),
         "changed_files": changed_files,
         "docs_only": docs_only,
@@ -5068,6 +5385,95 @@ def _issue_context_provided(args: argparse.Namespace) -> bool:
     )
 
 
+#: How many capture commits the head-pin walk will step back through before it stops.
+#: A ship adds one; a resumed or re-captured one might add a second. Past this bound the
+#: walk stops and covers what it has proven so far, rather than reading a long history.
+_COVERED_HEADS_LIMIT = 10
+
+
+def _commit_facts(owner_repo: str, sha: str, *, cwd: str) -> dict[str, object] | None:
+    """``{sha, parents, message, files}`` for one commit, or ``None`` when unreadable.
+
+    Read from the API rather than the checkout, so it answers the same on a CI runner
+    as in a worktree. A commit it cannot read is not a capture commit: the walk that
+    consumes this removes a requirement, so an unreadable step stops it.
+    """
+    try:
+        payload = _gh_json(["repos", owner_repo, "commits", sha], cwd=cwd)
+    except ValueError:
+        return None
+    commit = payload.get("commit")
+    parents = payload.get("parents")
+    files = payload.get("files")
+    entries = [f for f in files if isinstance(f, dict)] if isinstance(files, list) else None
+    return {
+        "sha": payload.get("sha"),
+        "parents": [
+            p.get("sha") for p in parents if isinstance(p, dict) and isinstance(p.get("sha"), str)
+        ]
+        if isinstance(parents, list)
+        else None,
+        "message": commit.get("message") if isinstance(commit, dict) else None,
+        # **Every path the commit touches, not only where each file ended up.** The API
+        # reports a rename as *one* entry — `status: renamed`, `filename` the new path,
+        # `previous_filename` the old — so a commit carrying the landing marker that
+        # renamed `src/keel/cli.py` into the sink read as exactly one path inside it,
+        # passed the exemption, and kept the review pins over a tree that had just lost a
+        # reviewed file. Counting the old path too makes that two paths, which it is.
+        "files": [
+            path
+            for entry in entries
+            for path in (entry.get("previous_filename"), entry.get("filename"))
+            if isinstance(path, str)
+        ]
+        if entries is not None
+        else None,
+        "statuses": [entry.get("status") for entry in entries] if entries is not None else None,
+    }
+
+
+def _covered_heads(
+    config: cfg.ProjectConfig,
+    owner_repo: str,
+    pr_number: int | None,
+    head_sha: str | None,
+    *,
+    cwd: str,
+) -> tuple[str, ...]:
+    """Heads that ``head_sha`` answers for because only capture commits separate them.
+
+    Walks back from the current head: while the tip is a capture commit on top of its one
+    parent — `capture.capture_only_descent` says so, the same predicate the gates read —
+    the parent is covered and the walk steps to it. The first commit that is anything
+    else ends it. A ship adds one capture commit, so this is ordinarily two reads.
+
+    Walking back rather than testing each head a verdict was pinned to is what keeps it
+    cheap: a pull request that went through eight review rounds has eight such heads,
+    most of them ancestors by *code* commits, and each would cost a compare and a read
+    per commit only to be refused.
+
+    Empty unless this project lands learnings into the repository at all. The exemption
+    exists for that mechanism; a project with no in-repo sink has no capture commits to
+    exempt, and granting it anyway would turn a marker and a path into a way past a pin.
+    """
+    if not head_sha or not capture.learning_sink_in_worktree(config):
+        return ()
+    sink = capture.land_sink_root(config, pr_number=pr_number, base_branch=config.base_branch or "")
+    covered: list[str] = []
+    current = head_sha
+    for _ in range(_COVERED_HEADS_LIMIT):
+        facts = _commit_facts(owner_repo, current, cwd=cwd)
+        parents = facts.get("parents") if facts else None
+        if not isinstance(parents, list) or len(parents) != 1:
+            break
+        parent = parents[0]
+        if not capture.capture_only_descent(parent, current, [facts], sink=sink):
+            break
+        covered.append(parent)
+        current = parent
+    return tuple(covered)
+
+
 def _load_evidence_artifacts(
     args: argparse.Namespace,
     config: cfg.ProjectConfig,
@@ -5082,6 +5488,7 @@ def _load_evidence_artifacts(
     # the path, which is the behaviour that existed before #794.
     patches: dict[str, str] = {}
     head_sha = args.head_sha
+    covered_heads: tuple[str, ...] = ()
     head_ref = getattr(args, "head_ref", None)
     issue_number = args.issue
     injected_labels = list(args.pr_label or ())
@@ -5104,6 +5511,7 @@ def _load_evidence_artifacts(
             "pr_reviews": [],
             "issue": issue_number,
             "head_sha": head_sha,
+            "covered_heads": (),
             "head_ref": head_ref,
             "changed_files": changed_files,
             "patches": {},
@@ -5134,6 +5542,7 @@ def _load_evidence_artifacts(
             issue_comments = _gh_json_list(
                 ["repos", owner_repo, "issues", str(issue_number), "comments"], cwd=args.root
             )
+        covered_heads = _covered_heads(config, owner_repo, args.pr, head_sha, cwd=args.root)
     elif issue_number is None:
         issue_number = _linked_issue_from_body(pr_body)
     return {
@@ -5144,6 +5553,10 @@ def _load_evidence_artifacts(
         "pr_reviews": pr_reviews,
         "issue": issue_number,
         "head_sha": head_sha,
+        # Offline fixtures never walk: a supplied `--head-sha` and supplied comments are a
+        # closed world, and reaching out to GitHub from one would make the result depend
+        # on a network the caller chose not to use.
+        "covered_heads": covered_heads,
         "head_ref": head_ref,
         "changed_files": changed_files,
         "patches": patches,
@@ -7558,7 +7971,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_land = sub.add_parser(
         "capture-land",
-        help="land this run's learning document on the base branch (no checkout, no merge)",
+        help="land this run's learning document on a branch — the pull request's own with "
+        "--onto, else the base branch (no checkout, no merge)",
     )
     p_land.add_argument("path", help="path to project.yaml")
     p_land.add_argument("--root", default=".", help="repo root the sink path resolves against")
@@ -7580,6 +7994,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="repo-relative path to land (default: capture.artifact of the PR's ship_run record)",
     )
     p_land.add_argument("--remote", default="origin", help="remote holding the base branch")
+    p_land.add_argument(
+        "--onto",
+        default=None,
+        help="land on this branch instead of the base branch — the pull request's own, so "
+        "the lesson merges with the work it describes",
+    )
+    p_land.add_argument(
+        "--write",
+        action="store_true",
+        help="write the lesson first — from the pull request, its issue and the gates-pass "
+        "recorded for its head — then land it; a lesson already on the pull request is reused",
+    )
     p_land.add_argument(
         "--attempts",
         type=_positive_int,
@@ -9818,7 +10244,7 @@ def _retrieve_learnings(args, config, changed_files) -> dict:
     )
 
 
-def _capture_changed_files(args, changed_files) -> list[str]:
+def _capture_changed_files(args, config, changed_files) -> list[str]:
     """The files this capture is about.
 
     **The local diff is empty on the path that matters.** s11 runs after s10 has
@@ -9831,15 +10257,22 @@ def _capture_changed_files(args, changed_files) -> list[str]:
     `--pull-request` names the PR whose files those were, so they are read from the
     host when the local diff has none. Fail-soft, like the issue facts beside it:
     offline, the empty list stands and the lesson is scored on its title alone.
+
+    Either list is then read without the sink's own documents
+    (:func:`keel.capture.lesson_changed_files`): once a lesson has landed on the pull
+    request, the host lists it among that pull request's files, and the document written
+    before the landing and the record appended after the merge must hash the same list.
     """
     local = list(changed_files or ())
     # `args.ledger_pr or args.pr`, the same pair the sink resolves its `{pr}` from:
     # `--pull-request` lands on `ledger_pr`, and reading only `args.pr` asked the
     # host about nothing on the very command this exists for.
     pr = getattr(args, "ledger_pr", None) or getattr(args, "pr", None)
-    if local or pr is None:
-        return local
-    return github.pr_files(pr, cwd=args.root) or []
+    if not local and pr is not None:
+        local = github.pr_files(pr, cwd=args.root) or []
+    return capture.lesson_changed_files(
+        config, local, pr_number=pr, base_branch=config.base_branch or ""
+    )
 
 
 def _capture_issue_facts(args) -> tuple[str, str, tuple[str, ...]]:

@@ -1,6 +1,7 @@
 """Tests for deterministic ship evidence verification."""
 
 import unittest
+from pathlib import Path
 
 from keel import agents, artifacts, closure, evidence, ship
 
@@ -299,6 +300,131 @@ class TestEvidenceVerify(unittest.TestCase):
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["counts"]["review_verdict"], 2)
         self.assertEqual(report["counts"]["jury_verdict"], 1)
+
+    def test_a_verdict_for_a_head_the_branch_moved_one_lesson_past_still_counts(self):
+        """#1203: the learning is the pull request's last commit, after review.
+
+        Both verdicts were pinned to `reviewed`; the branch then gained a capture commit
+        and its head is `with-lesson`. Proven by `capture.capture_only_descent`, the
+        reviewed head is *covered*, so the verdicts answer for the head that merges.
+        """
+        comments = [
+            _comment(closure.COMMENT_MARKER),
+            _comment(
+                "keel.review-verdict.v1\nreviewer: alpha\nhead: reviewed\nLGTM"
+                "\n\nsrc/keel/evidence.py: ok."
+            ),
+            _comment(
+                "keel.review-verdict.v1\nreviewer: beta\nhead: reviewed\nLGTM"
+                "\n\nsrc/keel/evidence.py: ok."
+            ),
+        ]
+        covered = evidence.verify(
+            _review_contract(reviewers=2),
+            pr_comments=comments,
+            issue_comments=[_comment(closure.COMMENT_MARKER)],
+            head_sha="with-lesson",
+            covered_heads=("reviewed",),
+        )
+        self.assertEqual(covered["status"], "pass")
+        self.assertEqual(covered["counts"]["review_verdict"], 2)
+        # Without the proof, the same verdicts are stale — which is the gate as it was.
+        uncovered = evidence.verify(
+            _review_contract(reviewers=2),
+            pr_comments=comments,
+            issue_comments=[_comment(closure.COMMENT_MARKER)],
+            head_sha="with-lesson",
+        )
+        self.assertEqual(uncovered["counts"]["review_verdict"], 0)
+
+    def test_a_covered_head_is_not_a_blank_one(self):
+        # Covering widens a match; it must never turn a known head into "do not filter".
+        # A verdict for some *other* head stays out.
+        report = evidence.verify(
+            _review_contract(reviewers=1),
+            pr_comments=[
+                _comment(
+                    "keel.review-verdict.v1\nreviewer: alpha\nhead: unrelated\nLGTM"
+                    "\n\nsrc/keel/evidence.py: ok."
+                )
+            ],
+            head_sha="with-lesson",
+            covered_heads=("reviewed",),
+        )
+        self.assertEqual(report["counts"]["review_verdict"], 0)
+
+    def test_every_path_to_the_head_matcher_carries_the_covered_heads(self):
+        """The exemption flows through twelve functions that only pass the head along.
+
+        A new path that forwards `head_sha` and forgets `covered_heads` would silently
+        fall back to the strict pin on that path alone — a gate that passes on one reader
+        and refuses on another for the same pull request. Checked from the source rather
+        than by exercising each path, because a missing forward is exactly the kind of
+        omission a behavioural test does not know to look for.
+        """
+        import ast
+
+        tree = ast.parse(Path(evidence.__file__).read_text(encoding="utf-8"))
+        functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        takes = {
+            name
+            for name, fn in functions.items()
+            if any(a.arg == "covered_heads" for a in fn.args.args + fn.args.kwonlyargs)
+        }
+        self.assertIn("_matches_head", takes)
+        missing = []
+        # Every function in the module, not only the ones that already declare the set: a
+        # reader that forwards `head_sha` into the chain *without* declaring `covered_heads`
+        # is the blind spot — `count_review_verdicts` sat in it, invisible to a check that
+        # only walked functions it already knew about.
+        for name, fn in functions.items():
+            for call in (c for c in ast.walk(fn) if isinstance(c, ast.Call)):
+                callee = getattr(call.func, "id", None)
+                if callee not in takes:
+                    continue
+                forwarded = {k.arg for k in call.keywords} | {
+                    getattr(a, "id", None) for a in call.args
+                }
+                if "head_sha" in forwarded and "covered_heads" not in forwarded:
+                    missing.append(f"{name} -> {callee} (line {call.lineno})")
+        self.assertEqual(missing, [])
+
+    def test_every_caller_outside_the_module_forwards_the_covered_heads_too(self):
+        """The same invariant, at the boundary the first one could not see.
+
+        The internal check held while four callers in `cli.py` — the jury vendor count,
+        the jury panel size twice, and the posted-verdict pin — forwarded `head_sha` and
+        dropped `covered_heads`. Each fell back to the strict pin on its own path, so after
+        a landing the panel was re-derived by probing the machine instead of read from the
+        ship. A gate that is exempt in one reader and strict in the next is not one rule.
+
+        An explicit `covered_heads=()` passes: that is a caller saying, in the source, that
+        it iterates the heads itself.
+        """
+        import ast
+
+        from keel import cli
+
+        tree = ast.parse(Path(evidence.__file__).read_text(encoding="utf-8"))
+        takes = {
+            n.name
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef)
+            and any(a.arg == "covered_heads" for a in n.args.args + n.args.kwonlyargs)
+        }
+        missing = []
+        for call in ast.walk(ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))):
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+                continue
+            owner = call.func.value
+            if not (isinstance(owner, ast.Name) and owner.id == "evidence"):
+                continue
+            if call.func.attr not in takes:
+                continue
+            keywords = {k.arg for k in call.keywords}
+            if "head_sha" in keywords and "covered_heads" not in keywords:
+                missing.append(f"evidence.{call.func.attr} (cli.py line {call.lineno})")
+        self.assertEqual(missing, [])
 
     def test_review_verdicts_without_matching_head_are_ignored_when_head_known(self):
         report = evidence.verify(

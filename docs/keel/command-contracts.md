@@ -172,7 +172,8 @@ one fail-closed path:
    workflow is expected to trigger); on any other PR it blocks;
 4. run `evidence-verify` for the current PR artifacts;
 5. require a SHA-stamped gates-pass: the **latest** `ship_run` ledger record for the PR
-   whose `git.head_sha` equals the PR's current head must have passed its gates — so
+   whose `git.head_sha` equals the PR's current head — or a head it covers, one it descends
+   from by `keel capture-land` commits alone (#1203) — must have passed its gates — so
    neither a stale green run from an older head nor a green run superseded by a later red
    one on the *same* head can authorize the merge. A gate flagged `not_run` (the
    command-only runner does not dispatch agentic gates) never counts as passed when the
@@ -289,19 +290,29 @@ The block records:
   candidates are suppressed by a stable fingerprint over normalized title, labels, and
   changed files. The decision is stored in the structured run ledger and mirrored in the
   closure comment's Capture line.
-- s11 landing command: `keel capture-land <project.yaml> --root . [--pr N] [--issue N]`
-  — pushes one commit carrying exactly the learning artifact to `<remote>/<base_branch>`,
-  built with plumbing and no checkout of the base branch (s2, `overnight` and `swarm` all
-  run inside a worktree while the primary checkout holds it). It is **not** a merge and
-  touches none: `keel merge` at s10 remains the only path a pull request takes to that
-  branch. `--root .`, never the worktree — s10's pre-clean has already removed that and the
-  ledger append writes under the primary checkout. The artifact must sit inside the
+- landing command, run at **s10 before the evidence gate**:
+  `keel capture-land <project.yaml> --root . --pr N --issue N --onto <branch> --write` — writes
+  the lesson from the pull request, its issue and the gates-pass recorded for its head, and
+  pushes one commit carrying exactly that artifact **onto the pull request's own branch**, so
+  the squash carries the lesson into `base_branch` with the work (#1203). It appends nothing to
+  the run ledger: s11 records the capture after the merge with
+  `keel ship --append-ledger --capture-artifact <path>`, which records a named artifact and
+  writes none. A lesson a landing already put on the pull request is reused, never written a
+  second time. Built with plumbing and
+  no checkout (s2, `overnight` and `swarm` all run inside a worktree while the primary checkout
+  holds the base). It is **not** a merge and touches none: `keel merge` remains the only path a
+  pull request takes to the base branch. The head it produces is accepted for the review
+  verdicts and gates-pass pinned to the head before it **only** when every commit in between
+  has one parent, the `keel.capture-land.v1` marker, and exactly one path inside the sink. The artifact must sit inside the
   configured sink, not merely inside the repository. Statuses `landed`, `already-landed`,
-  `not-required`, `no-artifact` and `would-land` exit 0 (capture is fail-soft after a merge
-  that already happened); only `failed` exits 1. The commit's marker line is
+  `not-required`, `no-artifact` and `would-land` exit 0; only `failed` exits 1, and the
+  ship treats it as fail-soft — the landing runs before the merge, and a lesson that did not
+  land is recorded in the closure rather than allowed to hold the work back. The commit's marker line is
   `keel.capture-land.v1: pr=<N> issue=<N> path=<path>`, so a history reader can tell a
-  capture commit from a stray push. A base branch that requires pull requests refuses the
-  push; that is reported as `failed` with the server's reason and is not retried.
+  capture commit from a stray push. Because the push goes to the pull request's branch,
+  base-branch protection never applies to it. Without `--onto` the push goes to the base
+  branch, where a branch that requires pull requests refuses it — reported as `failed` with
+  the server's reason and not retried.
 - session-end verifier command: `keel capture-verify`
 - post-merge recovery command: `keel capture-reconcile`
 - reconcile plan guarantees: idempotent actions only, never reopen implementation, never

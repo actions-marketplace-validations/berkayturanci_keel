@@ -342,9 +342,9 @@ class TheContractSaysWhoWritesTheFile(unittest.TestCase):
         none could run. Now one can: `keel capture-land` builds its commit with
         plumbing and never checks the base branch out. So the property is no
         longer "no shell fence" but the thing that fence was standing in for —
-        s11 hands out **that** command, still warns why the obvious one is
-        wrong, and hands out no `git switch` / `git commit` / `git push` of its
-        own for the operator to run against the base branch.
+        s10 hands out **that** command (#1203), s11 still warns why the obvious one
+        is wrong, and neither hands out a `git switch` / `git commit` / `git push`
+        of its own for the operator to run.
         """
         root = Path(__file__).resolve().parents[1]
         for surface in (
@@ -357,38 +357,61 @@ class TheContractSaysWhoWritesTheFile(unittest.TestCase):
         ):
             with self.subTest(surface=surface):
                 body = (root / surface).read_text(encoding="utf-8")
-                s11 = body[body.index("### s11 capture") :]
+                s10 = body[body.index("### s10 merge") : body.index("### s11 capture")]
+                s11 = body[body.index("### s11 capture") : body.index("### s12")]
                 self.assertIn("commit_required", body)
-                # The warning stays: the next person to reach for `git switch`
-                # should find out here why it cannot work, not from exit 128.
+                # The warning stays: the next person to reach for `git switch` should
+                # find out here why it cannot work, not from exit 128.
                 self.assertIn("already used by worktree", s11)
-                capture_section = s11[: s11.index("### s12")]
-                self.assertIn("keel capture-land", capture_section)
-                # No hand-rolled git against the base branch. The needles are the
-                # commands themselves, inside a shell fence — the prose above is
-                # allowed to *name* `git switch` because it is warning about it.
-                fences = _shell_fences(capture_section)
-                # A guard that inspected zero fences would pass on a section whose
-                # opener it failed to recognise — the failure mode being fixed here.
-                self.assertTrue(fences, f"{surface}: s11 hands out no runnable block")
-                # **The landing's input is in the block with it.** `capture-land` reads
-                # the artifact off the `ship_run` record the append writes, so a fence
-                # carrying only the landing lands nothing when run as written: no
-                # record, `no-artifact`, exit 0 — the green s11 this section names as
-                # the regression it exists to prevent. Asserted on one fence rather
-                # than on the section, because prose elsewhere is not a recipe.
-                runnable = [f for f in fences if "keel capture-land" in f]
-                self.assertTrue(runnable, f"{surface}: no fence runs capture-land")
-                for fence in runnable:
-                    self.assertIn("--append-ledger", fence)
-                    self.assertLess(
-                        fence.index("--append-ledger"),
-                        fence.index("keel capture-land"),
-                        f"{surface}: the ledger append must come before the landing",
-                    )
+                # **The landing is s10's, and it precedes the evidence gate** (#1203): the
+                # lesson rides the pull request, so it has to be on the branch before the
+                # merge is authorised against the head it produces.
+                self.assertIn("keel capture-land", s10)
+                self.assertLess(
+                    s10.index("keel capture-land"),
+                    s10.index("Evidence gate"),
+                    f"{surface}: the lesson must land before the evidence gate",
+                )
+                # No hand-rolled git in either step. The needles are the commands
+                # themselves, inside a shell fence — prose may *name* `git switch`
+                # because it is warning about it.
+                fences = _shell_fences(s10) + _shell_fences(s11)
+                # A guard that inspected zero fences would pass on a section whose opener
+                # it failed to recognise.
+                self.assertTrue(fences, f"{surface}: capture hands out no runnable block")
                 for fence in fences:
                     for forbidden in ("git switch", "git commit", "git push", "git add"):
                         self.assertNotIn(forbidden, fence)
+                # **The landing writes its own input, and it targets the pull request.**
+                # Without `--write` the landing reads the artifact off a ledger record, and
+                # the only writer of one was `keel ship --append-ledger` — which records an
+                # `applied` capture for a merge that has not happened, and which no later row
+                # for that head can take back (measured: the second append writes nothing).
+                # Without `--onto` it pushes at the base branch, which a protected base
+                # refuses — measured on this repository.
+                s10_fences = _shell_fences(s10)
+                runnable = [f for f in s10_fences if "keel capture-land" in f]
+                self.assertTrue(runnable, f"{surface}: no s10 fence runs capture-land")
+                for fence in runnable:
+                    self.assertIn("--write", fence, f"{surface}: the landing must write")
+                    self.assertIn("--onto", fence, f"{surface}: the landing must target the PR")
+                    # From the primary checkout: the gates-pass the lesson reports lives there,
+                    # and the worktree is removed by the pre-clean that follows.
+                    self.assertNotIn('--root "$WORKTREE"', fence)
+                for fence in s10_fences:
+                    self.assertNotIn(
+                        "--append-ledger", fence, f"{surface}: s10 must record no capture"
+                    )
+                # **The record is s11's, and it names the lesson rather than writing another.**
+                recorders = [
+                    f for f in _shell_fences(s11) if "keel ship" in f and "--append-ledger" in f
+                ]
+                self.assertTrue(recorders, f"{surface}: s11 hands out no capture record")
+                for fence in recorders:
+                    self.assertIn("--capture-artifact", fence)
+                # The instruction the old writer needed is gone with it: there is no `applied`
+                # row before the merge for a failed merge to take back.
+                self.assertNotIn("skipped:merge-failed", s10)
 
     def test_a_dormant_sink_under_a_disabled_capture_promises_nothing(self):
         """The contract must name the writer that will actually write.
@@ -1811,6 +1834,32 @@ class ShipWritesTheFileAndRecordsItAsTheArtifact(unittest.TestCase):
             self.assertEqual(block["learning"]["decision"], "duplicate")
             self.assertEqual(block["artifact"], first)
 
+    def test_the_record_after_the_landing_fingerprints_the_lesson_written_before_it(self):
+        """#1203: s10 writes the lesson, the landing adds it to the PR, s11 records it.
+
+        By s11 the host lists the landed lesson among the pull request's files, so the record
+        hashed one path more than the document it names — and the append, not told the
+        lesson already existed, wrote a second copy into the checkout. Named with
+        `--capture-artifact`, it writes nothing and records the path it was given.
+        """
+        with tempfile.TemporaryDirectory() as before, tempfile.TemporaryDirectory() as after:
+            config = write_config(Path(before), self.SINK_LINES)
+            with _github_pr_files(["src/keel/capture.py"]):
+                self.assertEqual(self.ship_with(before, config, pr=1203)[0], 0)
+            (written,) = sorted((Path(before) / "learnings").glob("*.md"))
+            lesson = f"learnings/{written.name}"
+            document = _front_matter_fields(written.read_text(encoding="utf-8"))
+
+            config = write_config(Path(after), self.SINK_LINES)
+            with _github_pr_files(["src/keel/capture.py", lesson]):
+                code, _, err = self.ship_with(after, config, "--capture-artifact", lesson, pr=1203)
+            self.assertEqual(code, 0, err)
+            self.assertFalse((Path(after) / "learnings").exists())
+            block = self.ledger_capture(after)
+            self.assertEqual(block["artifact"], lesson)
+            self.assertEqual(block["status"], "applied")
+            self.assertEqual(block["learning"]["fingerprint"], document["fingerprint"])
+
     def test_no_host_leaves_the_files_as_the_diff_reported_them(self):
         """Fail-soft: offline the lesson is scored on its title alone, not lost."""
         with tempfile.TemporaryDirectory() as root:
@@ -3004,6 +3053,95 @@ class TestLearningLandPlan(unittest.TestCase):
                     artifact,
                 )
 
+    def test_an_option_shaped_remote_or_target_is_refused(self):
+        """Both reach `git fetch` as positional arguments, where a leading `-` is an option.
+
+        `--onto '--upload-pack=/usr/bin/true'` is not a branch — it names a program for git
+        to run. No remote or branch name can begin with `-`, so refusing it refuses nothing
+        legitimate, and it is refused in the plan: the one place every landing passes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(tmp, self._SINK)
+            for kwargs in (
+                {"onto": "--upload-pack=/usr/bin/true"},
+                {"onto": "-x"},
+                {"remote": "--upload-pack=/usr/bin/true"},
+                # A colon makes the branch a two-sided refspec: handed to `git fetch` it
+                # moves the local `main` to another branch's tip. Refusing only `-` missed it.
+                {"onto": "foo:refs/heads/main"},
+                {"remote": "origin:refs/heads/main"},
+            ):
+                with self.subTest(**kwargs):
+                    plan = capture.learning_land_plan(
+                        config, artifact=".keel/learning/a.md", pr_number=7, **kwargs
+                    )
+                    self.assertEqual(plan["status"], "failed")
+                    self.assertTrue(plan["errors"])
+            # An ordinary branch name is untouched by the rule.
+            self.assertEqual(
+                capture.learning_land_plan(
+                    config, artifact=".keel/learning/a.md", pr_number=7, onto="feature/x-1"
+                )["status"],
+                "planned",
+            )
+
+    def test_the_branch_name_rule_is_gits_own(self):
+        """Held to `git check-ref-format --branch` itself, case by case.
+
+        Not to a reading of the man page: git is the authority on what it will parse as a
+        branch, and a rule that drifted from it in either direction is a refusal of a real
+        branch or a pass for a refspec.
+        """
+        import shutil
+        import subprocess
+
+        if shutil.which("git") is None:  # pragma: no cover - every CI leg has git
+            self.skipTest("git is not installed")
+        for name in (
+            "main",
+            "feature/x-1",
+            "fix/issue-1203-learning",
+            "foo:refs/heads/main",
+            "-x",
+            "a..b",
+            "a b",
+            "a~1",
+            "a^",
+            "x.lock",
+            "a/.b",
+            "/a",
+            "a/",
+            "a//b",
+            "a.",
+            "a@{b",
+            "a\\b",
+            "HEAD",
+            "FETCH_HEAD",
+            "a/HEAD",
+            "a?",
+            "a*",
+            "a[",
+            "a\x01",
+        ):
+            with self.subTest(name=name):
+                accepted = (
+                    subprocess.run(
+                        ["git", "check-ref-format", "--branch", name], capture_output=True
+                    ).returncode
+                    == 0
+                )
+                self.assertEqual(capture.is_branch_name(name), accepted)
+        # The one deliberate departure: git expands `@` to the current branch.
+        self.assertFalse(capture.is_branch_name("@"))
+        self.assertFalse(capture.is_branch_name(""))
+        self.assertFalse(capture.is_branch_name(None))
+
+    def test_a_remote_is_a_name_not_a_url_or_a_refspec(self):
+        for good in ("origin", "upstream", "my-fork", "fork_2.backup"):
+            self.assertTrue(capture.is_remote_name(good), good)
+        for bad in ("", "-x", "origin:x", "https://github.com/o/r", "a b", None):
+            self.assertFalse(capture.is_remote_name(bad), bad)
+
     def test_an_artifact_outside_the_sink_is_refused(self):
         """Inside the repository is not the containment this command needs.
 
@@ -3086,6 +3224,194 @@ class TestLearningLandPlan(unittest.TestCase):
         self.assertEqual(in_repo["durable_artifacts"]["land_command"], "keel capture-land")
         self.assertFalse(outside["durable_artifacts"]["commit_required"])
         self.assertIsNone(outside["durable_artifacts"]["land_command"])
+
+
+class TheLessonRidesThePullRequest(unittest.TestCase):
+    """`capture.capture_only_descent` — the proof the head-pin exemption rests on (#1203).
+
+    The learning is the pull request's last commit, after review and before the merge,
+    which moves the head every verdict and the gates-pass are pinned to. A pin for
+    `base` still answers for `head` only when nothing between them could change what was
+    reviewed. Every refusal below is a way that could happen, and each fails closed,
+    because this answer *removes* a requirement.
+    """
+
+    SINK = ".keel/learning"
+    MARKER = "chore(learning): x\n\nkeel.capture-land.v1: pr=1 issue=- path=.keel/learning/a.md\n"
+
+    def _commit(
+        self,
+        sha="H2",
+        parents=("H1",),
+        message=None,
+        files=(".keel/learning/a.md",),
+        statuses=("added",),
+    ):
+        return {
+            "sha": sha,
+            "parents": list(parents),
+            "message": self.MARKER if message is None else message,
+            "files": list(files),
+            "statuses": list(statuses),
+        }
+
+    def _descends(self, commits, base="H1", head="H2", sink=SINK):
+        return capture.capture_only_descent(base, head, commits, sink=sink)
+
+    def test_one_capture_commit_is_a_capture_only_descent(self):
+        self.assertTrue(self._descends([self._commit()]))
+
+    def test_several_capture_commits_in_a_chain_are_too(self):
+        second = self._commit(sha="H3", parents=("H2",), files=(".keel/learning/b.md",))
+        self.assertTrue(self._descends([self._commit(), second], head="H3"))
+
+    def test_a_commit_that_does_not_say_it_is_a_landing_is_not_exempt(self):
+        # The exemption is for commits that declare themselves a landing, not for any
+        # edit that happens to touch the sink.
+        self.assertFalse(self._descends([self._commit(message="docs: tidy a lesson")]))
+
+    def test_a_file_outside_the_sink_is_not_exempt(self):
+        self.assertFalse(self._descends([self._commit(files=("src/keel/cli.py",))]))
+
+    def test_two_files_are_not_exempt_even_both_inside_the_sink(self):
+        files = (".keel/learning/a.md", ".keel/learning/b.md")
+        self.assertFalse(self._descends([self._commit(files=files)]))
+
+    def test_a_merge_commit_is_not_exempt(self):
+        # Two parents can carry anything the second parent brought in.
+        self.assertFalse(self._descends([self._commit(parents=("H1", "OTHER"))]))
+
+    def test_a_broken_chain_is_not_a_descent(self):
+        self.assertFalse(self._descends([self._commit()], base="H0"))
+        self.assertFalse(self._descends([self._commit()], head="H9"))
+
+    def test_no_commits_and_the_same_head_are_not_an_exemption(self):
+        self.assertFalse(self._descends([]))
+        self.assertFalse(self._descends([self._commit()], base="H2", head="H2"))
+
+    def test_an_unresolvable_sink_exempts_nothing(self):
+        # With no boundary to hold a commit to, "inside the sink" would mean anywhere.
+        self.assertFalse(self._descends([self._commit()], sink=None))
+
+    def test_a_lesson_rewritten_at_the_same_path_is_a_landing(self):
+        # A re-capture that changes the lesson at its own path is the other legitimate shape.
+        self.assertTrue(self._descends([self._commit(statuses=("modified",))]))
+
+    def test_a_rename_into_the_sink_is_not_a_landing(self):
+        """The API reports a rename as one entry, so it has to be refused on two counts.
+
+        `status: renamed`, `filename` inside the sink, `previous_filename` outside it. Read
+        as one path, a marker-carrying commit that moved `src/keel/cli.py` into the sink
+        passed as a landing and kept the review pins over a tree that had just lost a
+        reviewed file. The reader counts the source path, and the status is refused too.
+        """
+        both_paths = self._commit(
+            files=("src/keel/cli.py", ".keel/learning/a.md"), statuses=("renamed",)
+        )
+        self.assertFalse(self._descends([both_paths]))
+        # Even if a reader dropped the source path, the status alone refuses it.
+        self.assertFalse(self._descends([self._commit(statuses=("renamed",))]))
+
+    def test_a_copy_or_a_removal_is_not_a_landing(self):
+        for status in ("copied", "removed", "changed", "unchanged"):
+            with self.subTest(status=status):
+                self.assertFalse(self._descends([self._commit(statuses=(status,))]))
+
+    def test_a_reader_that_cannot_say_what_the_commit_did_is_refused(self):
+        # Absent statuses have not shown the commit only *added* a lesson.
+        without = self._commit()
+        del without["statuses"]
+        self.assertFalse(self._descends([without]))
+        self.assertFalse(self._descends([self._commit(statuses=())]))
+        self.assertFalse(self._descends([self._commit(statuses=("added", "added"))]))
+
+    def test_malformed_facts_fail_closed(self):
+        for broken in (
+            "not a dict",
+            {**self._commit(), "parents": "H1"},
+            {**self._commit(), "message": None},
+            {**self._commit(), "files": ".keel/learning/a.md"},
+            {**self._commit(), "files": [None]},
+            {**self._commit(), "sha": ""},
+        ):
+            with self.subTest(broken=broken):
+                self.assertFalse(self._descends([broken]))
+
+
+class TheLessonIsNotAmongItsOwnFiles(unittest.TestCase):
+    """`capture.lesson_changed_files` and `capture.carries_landing_marker` (#1203).
+
+    Once the landing has put the lesson on the pull request, the host lists it among that
+    pull request's files. The document is written before the landing and the s11 record
+    after the merge, and both read that list — so without the subtraction they fingerprint
+    different lessons.
+    """
+
+    MARKER = "keel.capture-land.v1: pr=7 issue=- path=.keel/learning/a.md"
+
+    def _config(self, sink, *, enabled=True):
+        return cfg.ProjectConfig(
+            extends="keel",
+            core_version="^0.1",
+            knobs={},
+            owner="o",
+            repo="r",
+            base_branch="main",
+            policy_pack={
+                "capture": {
+                    "enabled": enabled,
+                    "mode": "extension",
+                    "learning": {"enabled": True, "mode": "create-learning", "sink": sink},
+                }
+            },
+        )
+
+    def _files(self, sink, files, *, pr=7, enabled=True):
+        return capture.lesson_changed_files(
+            self._config(sink, enabled=enabled), files, pr_number=pr, base_branch="main"
+        )
+
+    def test_the_sink_is_subtracted_and_nothing_beside_it(self):
+        files = [
+            "src/x.py",
+            ".keel/learning/2026-09-16-pr7-x.md",
+            ".keel/learning/nested/y.md",
+            # Neighbours that only *look* inside: a longer sibling, and the directory itself.
+            ".keel/learning-notes/z.md",
+            ".keel/learning",
+        ]
+        self.assertEqual(
+            self._files({}, files), ["src/x.py", ".keel/learning-notes/z.md", ".keel/learning"]
+        )
+
+    def test_a_pr_sink_subtracts_only_this_pull_requests_directory(self):
+        files = ["docs/7/lesson.md", "docs/8/lesson.md", "docs/guide.md"]
+        self.assertEqual(
+            self._files({"path": "docs/{pr}"}, files), ["docs/8/lesson.md", "docs/guide.md"]
+        )
+
+    def test_where_there_is_no_boundary_nothing_is_subtracted(self):
+        files = ["docs/guide.md", ".keel/learning/a.md", "learnings/2026/a.md"]
+        for label, sink, pr, enabled in (
+            # `docs/{pr}` with no pull request resolves to `docs` — the run's own work.
+            ("no pull request", {"path": "docs/{pr}"}, None, True),
+            ("a sink outside the checkout", {"path": "/srv/knowledge"}, 7, True),
+            ("a sink no landing can resolve", {"path": "learnings/{date}"}, 7, True),
+            ("capture disabled", {}, 7, False),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self._files(sink, files, pr=pr, enabled=enabled), files)
+
+    def test_the_marker_is_a_line_of_its_own(self):
+        for label, message, expected in (
+            ("the line", f"chore(learning): x\n\n{self.MARKER}\n", True),
+            ("indented", f"chore(learning): x\n\n    {self.MARKER}\n", True),
+            ("inside another line", f"see {self.MARKER}\n", False),
+            ("absent", "fix: x\n", False),
+            ("not text", None, False),
+        ):
+            with self.subTest(label):
+                self.assertIs(capture.carries_landing_marker(message), expected)
 
 
 class TestTreeComposition(unittest.TestCase):

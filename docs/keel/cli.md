@@ -178,7 +178,9 @@ requires a SHA-stamped gates-pass for the PR's current head, and only then calls
 
 The gates-SHA check reads the run ledger and requires a `ship_run` record whose
 `pull_request.number` matches the PR, whose `git.head_sha` equals the PR's current head
-(from the live merge snapshot), and whose gates passed (verdict not blocked and every
+(from the live merge snapshot) — or a head that head **covers**: one it descends from by
+`keel capture-land` commits alone (see [`--onto`](#--onto-the-lesson-rides-the-pull-request)),
+the same set `evidence-verify` accepts review verdicts for — and whose gates passed (verdict not blocked and every
 recorded gate `ok` or `skipped`, none errored). A stale green run from an older head no
 longer authorizes a merge of a newer head; if no record matches, the merge refuses with
 `no gates-pass recorded for the current head <sha>`. The decision is reported in the
@@ -602,9 +604,10 @@ On a live append, a missing `--host-agent` emits a run-context warning by defaul
 fields would degrade. `--transport` is auto-filled from the resolved GitHub transport when
 omitted, so adapters should not echo a stale transport value.
 
-## `keel capture-land <project.yaml> [--root <dir>] [--pr <N>] [--issue <N>] [--artifact <path>] [--remote <name>] [--attempts <N>] [--dry-run] [--json]`
+## `keel capture-land <project.yaml> [--root <dir>] [--pr <N>] [--issue <N>] [--artifact <path>] [--remote <name>] [--onto <branch>] [--write] [--attempts <N>] [--dry-run] [--json]`
 
-Land this run's learning document on `origin/<base_branch>` (#1163).
+Land this run's learning document on a branch — the pull request's own under `/keel:ship`
+(#1203), or `origin/<base_branch>` without `--onto` (#1163).
 
 `policy_pack.capture.learning.sink` writes one Markdown learning per applied capture, and
 with a **relative** sink path — `.keel/learning/`, the default keel dogfoods — the file
@@ -614,16 +617,84 @@ CI runner clones fresh, and s10's pre-clean deletes the worktree outright. The c
 contract's `durable_artifacts.commit_required` said the file *had* to be committed;
 `durable_artifacts.land_command` now names what commits it.
 
-**This is not a merge path.** It pushes one commit carrying one file to the base branch.
-`keel merge` at s10 remains the only way a pull request reaches that branch, and the
-landing touches no pull request, no merge claim, and no merge window.
+**This is not a merge path.** It pushes one commit carrying one file. `keel merge` at s10
+remains the only way a pull request reaches the base branch, and the landing touches no
+merge claim and no merge window.
 
 ```bash
-keel capture-land .keel/project.yaml --root . --pr 456 --issue 123 --json
+keel capture-land .keel/project.yaml --root . --pr 456 --issue 123 --onto "$BRANCH" --write --json
 ```
 
-With no `--artifact`, the path is read from the `capture.artifact` field of the newest
-`ship_run` ledger record for `--pr`, so s11 passes the pull request and nothing else.
+### `--onto`: the lesson rides the pull request
+
+`/keel:ship` lands the lesson **onto the pull request's own branch**, at s10 and before the
+evidence gate, so the squash carries it into the base branch with the work it describes. It
+cannot be forgotten — there is no second pull request to merge — and it never pushes to the
+base branch, so branch protection never sees it.
+
+The commit moves the head that every review verdict and the gates-pass are pinned to, so
+`keel evidence-verify` and `keel merge` accept a pin for head **H** on head **H′** exactly
+when every commit between them:
+
+- has **one parent** — a merge commit could carry anything;
+- carries the **`keel.capture-land.v1:` marker line** — the exemption is for commits that say
+  they are a landing, not for any edit that touches the sink;
+- differs from its parent by **exactly one path, inside the configured sink**;
+- and that path was **added or modified** — never renamed, copied or removed.
+
+The last rule is not decoration. GitHub's API reports a rename as *one* entry naming where the
+file went, so a marker-carrying commit that moved `src/keel/cli.py` into the sink would read as
+one path inside it; the reader counts the path it came from too, and the status is refused.
+
+**Every reader of a head honours it, the panel pin included.** The review verdicts, the
+gates-pass, the jury vendor count and panel size, and the pin that decides the review contract
+all answer for a covered head. The pin keeps its strict one-head rule — it removes requirements
+— and is simply asked once for the current head and once for each head it covers; asked only
+about the landing's head it missed all three of its sources and let the contract be re-derived
+by probing the landing machine.
+
+Any other commit invalidates the pins exactly as it always did. The walk runs back from the
+current head, reads each commit from the API so it answers the same on a CI runner as in a
+worktree, and stops at the first commit that is not a landing — ordinarily two reads. It only
+applies to a project whose sink is inside the repository with capture enabled.
+
+Without `--onto` the commit goes to the base branch, which is what #1163 shipped and what a
+protected base refuses.
+
+### `--write`: the lesson is written here, and recorded at s11
+
+`/keel:ship` passes `--write`, and the command writes the lesson before it lands it. The
+document is rendered from the pull request's files, its issue, and the **gates-pass s8
+recorded for the pull request's head** — s10 runs no gates, so their words come from that
+record, and with no gates-pass for the head nothing is written (`failed`). **Nothing is
+appended to the run ledger.** The capture is recorded at s11, after the merge, by
+`keel ship --live --append-ledger --capture-status applied --capture-artifact <plan.path>` —
+which records a named artifact rather than rendering a second copy of it.
+
+The first shape wrote the lesson with `keel ship --append-ledger` at s10 instead, and that is a
+ship-run recorder: it appended an `applied` capture for a merge that had not happened. The
+ledger keeps one capture marker per pull request and head, so when the merge then failed, the
+row that would have said so was dropped — the second append exits 0 and writes nothing,
+measured — and the capture health summary reported the open pull request as a clean capture.
+
+**One lesson per pull request.** The sink's filename carries the date, so a retried s10 — the
+merge window closed, and the run resumes the next morning — would render a second document
+and land it beside the first. `--write` first reads the pull request's commits for a lesson a
+landing already put there: a commit carrying the marker that `capture.capture_only_descent`
+accepts against its own parent, whose path the pull request still changes. Found, it is
+reported `already-landed` and nothing is written or pushed — which is also how s11 recovers
+the path when s10's output is gone. Only commits carrying the marker are read, at most ten.
+
+The lesson's changed files leave out the sink's own documents
+(`capture.lesson_changed_files`): once a lesson has landed, the host lists it among the pull
+request's files, and the record appended after the merge must fingerprint the same lesson as
+the document written before it. A lesson that did not land is removed rather than left
+untracked in the checkout (`local_copy: removed`). `--write` refuses `--artifact` (it lands
+what it writes) and `--dry-run` (a dry run writes nothing to land), and needs `--pr`; a sink
+outside the checkout reports `not-required` without reading anything — s11 writes that one.
+
+With neither `--write` nor `--artifact`, the path is read from the `capture.artifact` field of
+the newest `ship_run` ledger record for `--pr`.
 
 ### Why plumbing, and not a checkout
 
@@ -643,11 +714,11 @@ from a fresh CI clone.
 
 ### Concurrency
 
-Two ships finishing s11 at once both land their lesson. The push is a plain
-fast-forward, never forced: a rejected push means another ship pushed first, so the
-command re-reads the base branch, rebuilds its commit on top of what it now carries, and
-pushes again — up to `--attempts` (default 3) times. Forcing would discard the other
-ship's lesson, and on a base branch whatever arrived with it.
+A push is a plain fast-forward, never forced. If the target branch moved between this
+command's read and its push — another push to the pull request's branch, or, without `--onto`,
+another ship landing on the base — the push is rejected, the command re-reads the branch as
+it now is, rebuilds its commit on top, and pushes again, up to `--attempts` (default 3) times.
+Forcing would discard whatever the other push brought.
 
 **Only a ref that moved is retried.** git exits 1 for every rejection, so the two are told
 apart by what it says: `fetch first` and `non-fast-forward` mean the branch moved and
@@ -660,11 +731,31 @@ pushes to a shared branch, so it stops and reports rather than guessing.
 
 ### Branch protection
 
-A base branch that requires pull requests refuses this push, and so does one with required
-status checks — the commit is built with `commit-tree` and has never been through CI. The
-command reports `failed` with the server's reason and does not retry. This repository's own
-`main` is in exactly that position, so keel writes its lessons and does not land them; see
-[`configuration.md`](configuration.md) for what a project in that position can do instead.
+Without `--onto`, a base branch that requires pull requests refuses this push, and so does one
+with required status checks — the commit is built with `commit-tree` and has never been through
+CI. Measured against this repository's `main` on 2026-09-16:
+
+```
+remote: error: GH006: Protected branch update failed for refs/heads/main.
+remote: - Changes must be made through a pull request.
+remote: - 13 of 13 required status checks are expected.
+ ! [remote rejected]  … -> main (protected branch hook declined)
+```
+
+The command reports `failed` with the server's reason and does not retry. That refusal is why
+`/keel:ship` lands onto the pull request instead.
+
+### The untracked copy
+
+git will not pull over an untracked file, **even one byte-identical to the file arriving** —
+measured — so a lesson left in the working tree after landing would stop the next `git pull`
+there with *untracked working tree files would be overwritten by merge*. After `landed` or
+`already-landed` the command removes that copy, but only when its bytes equal the committed
+blob; one edited after it was written is kept, and so is one the checkout **tracks** — after
+`git pull` the landed lesson is in the index, every same-bytes check passes on it, and a
+re-run that found it `already-landed` would otherwise have deleted a tracked file. `local_copy` in the JSON says which:
+`removed`, `kept` or `absent`. A re-run that finds the copy already gone, and the path already
+on the target branch, reports `already-landed` rather than a missing artifact.
 
 ### Safety
 
@@ -703,10 +794,10 @@ beside the code is in the repository, and a checkout-wide test says yes to a lin
 sink configured as the repository root (`path: '.'`) therefore names no directory to confine
 anything to, and the landing refuses rather than falling back to the wider boundary.
 
-### Identifying the commit on the base branch
+### Identifying the landing commit
 
-This is the one commit keel pushes to a base branch outside a pull request, so it says so
-in a line a machine can read:
+This is a commit keel builds and pushes itself rather than one an implementer wrote, so it
+says so in a line a machine can read — which is also what the head-pin exemption reads:
 
 ```
 chore(learning): record the lesson from PR #456
@@ -723,17 +814,18 @@ core command cannot know whose co-authorship to stamp on one.
 
 | `status` | exit | meaning |
 | --- | --- | --- |
-| `landed` | 0 | the lesson is on `<remote>/<base_branch>` |
-| `already-landed` | 0 | that exact content is already there; nothing was pushed |
+| `landed` | 0 | the lesson is on the target branch — the pull request's own with `--onto`, else `<remote>/<base_branch>` |
+| `already-landed` | 0 | that exact content is already there — with `--write`, a landing already put this pull request's lesson on it; nothing was written or pushed |
 | `not-required` | 0 | the sink is outside the checkout, so git never sees it |
-| `no-artifact` | 0 | this run captured nothing to land |
+| `no-artifact` | 0 | this run captured nothing to land — with `--write`, the policy writes no document, or this one duplicates a lesson already durable |
 | `would-land` | 0 | `--dry-run` |
 | `contended` | — | a single attempt's outcome, never the command's: the branch moved, so the next attempt rebuilds |
-| `failed` | 1 | the lesson was not landed; `detail` carries the last push's own reason |
+| `failed` | 1 | the lesson was not landed; `detail` carries the reason — the last push's own, or with `--write` the read or write that failed — and no lesson `--write` wrote is left behind |
 
-The five non-`failed` statuses exit 0 on purpose: s11 runs after the merge already
-happened, and a capture that had nothing to do must not fail it. Capture is fail-soft, so
-a `failed` landing is reported and does not roll anything back.
+The five non-`failed` statuses exit 0 on purpose: a capture that had nothing to do must
+not fail the ship. `/keel:ship` runs the landing at s10, **before** the merge, and treats
+`failed` as fail-soft too — a lesson that did not land is recorded in the closure and does
+not hold back the work it describes, so the merge goes ahead and nothing is rolled back.
 
 ## `keel capture-verify <project.yaml> [--merged-pr <N>] [--from-transport] [--json]`
 

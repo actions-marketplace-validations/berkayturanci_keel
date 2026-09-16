@@ -2255,9 +2255,13 @@ def learning_land_plan(
     issue_number: int | None = None,
     remote: str = "origin",
     base_branch: str | None = None,
+    onto: str | None = None,
     attempts: int = LEARNING_LAND_ATTEMPTS,
 ) -> dict[str, Any]:
-    """Plan the landing of one learning artifact onto ``origin/<base_branch>``.
+    """Plan the landing of one learning artifact onto a branch.
+
+    ``onto`` names it — the pull request's own under `/keel:ship` (#1203) — and without it
+    the target is ``origin/<base_branch>`` (#1163).
 
     Pure: it reads the config's *shape* and the artifact's path and answers what the
     I/O layer should do, the way :func:`learning_sink_plan` answers what the writer
@@ -2278,6 +2282,11 @@ def learning_land_plan(
     a path this command must refuse to write to the base branch.
     """
     resolved_base = base_branch or getattr(config, "base_branch", None) or ""
+    # **The branch the commit goes to, kept apart from the base branch.** #1203 lands the
+    # lesson on the pull request's own branch, as its last commit, so it merges with the
+    # work it describes. The sink template still expands against the *base* branch —
+    # that is the value the writer used — so the two cannot share one variable.
+    target = onto or resolved_base
     if not learning_sink_in_worktree(config):
         return {
             "schema_version": LEARNING_LAND_SCHEMA_VERSION,
@@ -2289,6 +2298,7 @@ def learning_land_plan(
             "path": None,
             "remote": remote,
             "base_branch": resolved_base,
+            "onto": None,
             "ref": None,
             "remote_ref": None,
             "message": None,
@@ -2298,7 +2308,17 @@ def learning_land_plan(
     normalized = _land_path(artifact)
     sink_dir = _land_sink_root(config, pr_number=pr_number, base_branch=resolved_base)
     errors: list[str] = []
-    if artifact is None or not str(artifact).strip():
+    if not is_remote_name(remote) or (target and not is_branch_name(target)):
+        status = "failed"
+        reason = "the remote or the target branch is not a name git can take as one"
+        # **Refused before any git call sees it, by git's own rules.** Both reach
+        # `git fetch <remote> <ref>` as positional arguments. A leading `-` is read there as
+        # an option — `--upload-pack=<program>` runs a program — and a `:` makes the branch
+        # a two-sided refspec: `foo:refs/heads/main` moves the local `main` to `foo`'s tip.
+        # Refusing only the `-` shipped first and was not enough. Answered here, in the one
+        # place every landing is planned, rather than trusted to each wrapper downstream.
+        errors.append(f"remote {remote!r} or target {target!r} is not a valid name")
+    elif artifact is None or not str(artifact).strip():
         status = "no-artifact"
         reason = "no capture artifact was recorded for this run, so there is nothing to land"
     elif normalized is None:
@@ -2340,7 +2360,7 @@ def learning_land_plan(
         errors.append("base_branch is not configured")
     else:
         status = "planned"
-        reason = f"land {normalized} on {remote}/{resolved_base}"
+        reason = f"land {normalized} on {remote}/{target}"
     return {
         "schema_version": LEARNING_LAND_SCHEMA_VERSION,
         "status": status,
@@ -2353,8 +2373,9 @@ def learning_land_plan(
         "sink": sink_dir,
         "remote": remote,
         "base_branch": resolved_base,
-        "ref": f"refs/heads/{resolved_base}" if resolved_base else None,
-        "remote_ref": f"{remote}/{resolved_base}" if resolved_base else None,
+        "onto": target or None,
+        "ref": f"refs/heads/{target}" if target else None,
+        "remote_ref": f"{remote}/{target}" if target else None,
         "message": (
             learning_land_message(pr_number=pr_number, path=normalized, issue_number=issue_number)
             if status == "planned"
@@ -2422,6 +2443,174 @@ def path_under_sink(path: str, directory: str) -> bool:
     if len(have) <= len(wanted):
         return False
     return all(want == got for want, got in zip(wanted, have, strict=False))
+
+
+#: The line a landing commit's message carries, as the prefix a reader matches on.
+LEARNING_LAND_MARKER_LINE = f"{LEARNING_LAND_MARKER}:"
+
+
+def land_sink_root(
+    config: _HasPolicyPack | None, *, pr_number: int | None, base_branch: str
+) -> str | None:
+    """The public name for :func:`_land_sink_root`, for the readers outside this module.
+
+    The evidence gate and the merge gate ask the same containment question the landing
+    asks, and a second copy of the answer is how the three would come to disagree.
+    """
+    return _land_sink_root(config, pr_number=pr_number, base_branch=base_branch)
+
+
+def lesson_changed_files(
+    config: _HasPolicyPack | None,
+    changed_files: list[str] | tuple[str, ...],
+    *,
+    pr_number: int | None,
+    base_branch: str,
+) -> list[str]:
+    """The files a lesson is about: the pull request's, less the lessons in the sink (#1203).
+
+    The landing puts the lesson on the pull request itself, so once it has landed the host
+    lists the lesson among the files that pull request changed. The document is written
+    before the landing and the s11 record after the merge, and both read the host's list:
+    without this the record fingerprinted one more path than the document it names — the
+    mismatch the shared list exists to prevent — and a retried s10 rendered a lesson whose
+    **Files** section named the lesson.
+
+    Only an in-repo sink is subtracted, and only for a pull request. A sink outside the
+    checkout never appears in a pull request's files, and one whose path cannot be resolved
+    has no boundary to subtract by. Without a pull request there is no landing to subtract —
+    and a ``{pr}`` sink resolved with none reads as its parent (``docs/{pr}`` as ``docs``),
+    which would take the run's real work in ``docs/`` out of its own lesson.
+    """
+    paths = list(changed_files)
+    if pr_number is None or not learning_sink_in_worktree(config):
+        return paths
+    sink = _land_sink_root(config, pr_number=pr_number, base_branch=base_branch)
+    if sink is None:
+        return paths
+    return [path for path in paths if not path_under_sink(path, sink)]
+
+
+#: Characters `git check-ref-format` refuses anywhere in a ref name.
+_REF_FORBIDDEN = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+
+#: A remote *name* — what `--remote` documents — rather than a URL or a refspec.
+_REMOTE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def is_branch_name(name: object) -> bool:
+    """Would ``git check-ref-format --branch`` accept ``name`` as a literal branch? (#1203)
+
+    Pure, so the landing plan can refuse a bad target before any git call sees it. The
+    rules are git's own, and the test holds this function to git's verdict case by case
+    rather than to a reading of the man page:
+
+    - not empty, not beginning with ``-`` (git reads that as an option) or ``/``;
+    - no ``:`` — ``foo:refs/heads/main`` is a two-sided refspec, and handed to
+      ``git fetch`` it moves the local ``main`` to another branch's tip (measured);
+    - no control character, space, ``~``, ``^``, ``?``, ``*``, ``[`` or backslash;
+    - no ``..``, no ``@{``, no ``//``, not ending in ``/`` or ``.``;
+    - no path component beginning with ``.`` or ending in ``.lock``.
+
+    ``HEAD`` is refused, as git refuses it. ``@`` alone is refused although git accepts it:
+    ``--branch`` expands it to the current branch, which is not a name a caller can mean as a
+    literal target.
+    """
+    if not isinstance(name, str) or not name or name in ("@", "HEAD"):
+        return False
+    if name[0] in "-/" or name.endswith(("/", ".")):
+        return False
+    if _REF_FORBIDDEN.search(name) or ".." in name or "@{" in name or "//" in name:
+        return False
+    return not any(part.startswith(".") or part.endswith(".lock") for part in name.split("/"))
+
+
+def is_remote_name(name: object) -> bool:
+    """Is ``name`` a plain remote name — letters, digits, ``.``, ``_``, ``-``, no leading ``-``?"""
+    return isinstance(name, str) and bool(_REMOTE_NAME.match(name))
+
+
+#: What a landing commit may do to its one path: write a new lesson, or rewrite one at the
+#: same path. Never rename, copy or remove — those are other changes wearing the marker.
+LANDING_FILE_STATUSES = ("added", "modified")
+
+
+def carries_landing_marker(message: object) -> bool:
+    """Does a commit message carry the ``keel.capture-land.v1:`` marker line?
+
+    One predicate for both of its readers: the head-pin exemption below, and the search for
+    a lesson already riding a pull request (``keel capture-land --write``). Two copies of the
+    match would drift apart, and the search would then find landings the exemption refuses.
+    """
+    return isinstance(message, str) and any(
+        line.strip().startswith(LEARNING_LAND_MARKER_LINE) for line in message.splitlines()
+    )
+
+
+def capture_only_descent(
+    base: str,
+    head: str,
+    commits: list[dict[str, Any]],
+    *,
+    sink: str | None,
+) -> bool:
+    """Does ``head`` descend from ``base`` by **capture commits and nothing else**? (#1203)
+
+    The question the head-pin exemption rests on. Every review verdict and every
+    gates-pass is pinned to the head it was recorded against, and #1203 puts the
+    learning on the pull request's own branch as its last commit — after review, before
+    the merge — which moves that head. A verdict for ``base`` still answers for ``head``
+    exactly when nothing between them could change what was reviewed:
+
+    - every commit has **exactly one parent**, and they form an unbroken chain from
+      ``base`` to ``head`` — a merge commit could carry anything;
+    - every commit's message carries the ``keel.capture-land.v1:`` marker line — the
+      exemption is for commits that *say* they are a landing, not for any edit that
+      happens to touch the sink;
+    - every commit differs from its parent by **exactly one path**, and that path is
+      inside the configured sink — the same containment the landing enforces before it
+      pushes, asked again here of commits it did not necessarily build;
+    - and that one path was **added or modified** — not renamed, copied or removed.
+
+    ``commits`` is ordered oldest to newest, each a mapping with ``sha``, ``parents``
+    (a list of SHAs), ``message``, ``files`` (every path the commit touches, a rename's
+    source included) and ``statuses`` (one per changed entry). Anything malformed or
+    absent is ``False``: this answer removes a requirement, so it fails closed.
+
+    A sink that cannot be resolved is ``False`` too. There is then no boundary to hold a
+    commit to, and "inside the sink" would silently mean "anywhere".
+    """
+    if not base or not head or base == head or sink is None or not commits:
+        return False
+    previous = base
+    for commit in commits:
+        if not isinstance(commit, dict):
+            return False
+        parents = commit.get("parents")
+        if not isinstance(parents, list) or parents != [previous]:
+            return False
+        if not carries_landing_marker(commit.get("message")):
+            return False
+        files = commit.get("files")
+        if not isinstance(files, list) or len(files) != 1 or not isinstance(files[0], str):
+            return False
+        if not path_under_sink(files[0], sink):
+            return False
+        # **What happened to that path, not only which path it was.** A rename or a copy
+        # into the sink arrives as one entry naming a path inside it; `files` counts the
+        # path it came from too, and this refuses the status outright, so neither a moved
+        # reviewed file nor a deleted lesson reads as a landing. Absent is refused as well:
+        # a reader that cannot say what the commit did has not shown it only *added*.
+        statuses = commit.get("statuses")
+        if not isinstance(statuses, list) or len(statuses) != 1:
+            return False
+        if statuses[0] not in LANDING_FILE_STATUSES:
+            return False
+        sha = commit.get("sha")
+        if not isinstance(sha, str) or not sha:
+            return False
+        previous = sha
+    return previous == head
 
 
 def _land_path(artifact: str | None) -> str | None:
