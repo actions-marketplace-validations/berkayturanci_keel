@@ -996,8 +996,9 @@ call and one commit each:
 | `implementation` | the change that turns them green, without weakening a test | the change | must end **green** |
 
 At **s8** the run then carries one extra gate, `tdd-order`. It is `on_fail: block`, and it
-is a **pure function of the commit list and the path policy** — keel reads the branch
-through a single `git log` and decides in `keel.tdd`, with no other I/O. It passes when:
+is a **pure function of the commit list and the path policy** — keel looks up the base ref,
+reads the branch through a single `git log`, and decides in `keel.tdd`, with no other I/O.
+It passes when:
 
 1. the branch history is readable at all (an unreadable one blocks — it is not an empty branch);
 2. the first non-merge commit touches at least one path, and **only** test paths;
@@ -1017,11 +1018,21 @@ removed tests to restore (a rename-out is named by the path it *left*, the one t
 stopped being a test), the test globs it matched against, or the missing half of s4.
 
 The branch is read with `git log --topo-order --first-parent --reverse --name-status
-base..HEAD`. Ancestry order, not commit-date order: once a branch integrates its base at
+<base>..HEAD`. Ancestry order, not commit-date order: once a branch integrates its base at
 s10, a base commit dated *before* the tests commit would otherwise sort ahead of it and be
 judged as this implementer's first commit. `--first-parent` follows only this branch's own
 line, so the commits a base merge brought in are not on it at all; the merge commits
 themselves stay and are skipped rather than judged.
+
+`<base>` is the ref every other gate diffs against: `refs/remotes/origin/<base_branch>` when
+that ref exists, else `refs/heads/<base_branch>`. It used to be the bare local branch name,
+and keel cuts its worktrees from `origin/<base_branch>` while the primary checkout's local
+branch lags. The range then began *below* the branch point, so the base commit the branch was
+cut on top of was judged as the implementer's first commit, and a test-first branch was
+blocked for touching `src/` first. `--first-parent` cannot drop such a commit, because it is
+on the branch's own line. A bare name is also a short name, which a tag called `main`
+outranks: with that tag on an implementation-first commit, the gate passed a branch that was
+not written test-first (#1227, both measured).
 
 > **What the gate does not check.** It reads commit **order and paths**, and nothing else.
 > It never runs phase A's tests, so it cannot report that they were red, and it cannot tell
