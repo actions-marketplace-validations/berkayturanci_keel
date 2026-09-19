@@ -9,8 +9,50 @@ timezone: Europe/Istanbul
 merge_window: "07:00-01:30"
 
 knobs:
-  implementer_agents:
-    core: backend-developer
+  # keel's own team policy (#1014). This is the dogfood: the same block any project
+  # writes, resolved into the `assignment` that `keel plan`/`keel ship --json` render.
+  # It replaces the old `implementer_agents: {core: backend-developer}` — a value that
+  # was documented as a vendor string in docs/keel/models.md and as a Claude subagent
+  # name in ship.md s4, with nothing saying which. `subagent:` now says it.
+  team:
+    implement:
+      default: { provider: "subagent:backend-developer" }
+      by_role:
+        core: { provider: "subagent:backend-developer" }
+    # Every implementation gets one second opinion from a seat that did not write it.
+    gate:
+      provider: agy
+      distinct_from: implementer
+    review:
+      by_tier:
+        # Quoted keys: YAML reads a bare `1:` as an integer key, which a JSON schema
+        # cannot describe. keel says so rather than accepting it and meaning something
+        # else.
+        #
+        # These are the seats that actually review keel today. Tier-3 reaches past CI,
+        # so it gets all three: the host lead, the second vendor, and a second Opus
+        # reviewer — spelled `subagent:` because that is what it is, not a vendor keel
+        # dispatches to. `"3": jury` (the cross-vendor panel *as* the review) is the
+        # intended future and is documented in docs/keel/configuration.md#team.
+        #
+        # #1015 built the mechanism — s7 dispatches the panel and `keel review
+        # --from-jury` maps its ballots onto the review verdicts — but keel does not
+        # adopt it in the same change that ships it. On a panel tier no flag can take
+        # the panel back off (#1014 round 3), so the switch commits every tier-3 keel
+        # PR to a jury run; it is made deliberately, once `--from-jury` has been
+        # exercised on a real keel PR.
+        "1": [{ provider: claude }]
+        "2": [{ provider: claude }, { provider: agy }]
+        "3":
+          - { provider: claude }
+          - { provider: agy }
+          - { provider: "subagent:opus-reviewer" }
+    jury:
+      # Advisory, not gating, until #1015 dispatches the jury from s7. keel does not
+      # get to make its own merge wait on a panel that does not run yet.
+      mode: advisory
+      min_vendors: 2
+    fix: { provider: implementer }
   build_gate_cmd: "make test"
   lint_cmd: "make lint"
   # Tier-3 is for changes that can reach past CI — publish, deploy, write to the
@@ -45,14 +87,29 @@ knobs:
     - ".github/workflows/codeql.yml"
     - ".github/workflows/scorecard.yml"
     # Not workflows, but they reach further than most code here does: this is the
-    # formula `brew install` runs, and the hash-locked tooling that publishes to
-    # PyPI. Both were tier-2 while every CI edit was tier-3 (#787, #779).
-    - "Formula/keel.rb"
+    # template the formula `brew install` runs is rendered from, the patch that
+    # tells the tap where to read it, and the hash-locked tooling that publishes
+    # to PyPI. All were tier-2 while every CI edit was tier-3 (#787, #779).
+    #
+    # By extension, not by directory: `packaging/homebrew/**` would also sweep in
+    # README.md and TAP_REPOINTED, neither of which reaches a user's machine, and
+    # `DIFF_CLASSIFIED_GLOBS` covers only workflow YAML — so a README typo there
+    # would be permanently tier-3, three verdicts, with no way to downgrade it.
+    - "packaging/homebrew/*.template"
+    - "packaging/homebrew/*.patch"
     - ".github/requirements/**"
   ci_workflows:
     "CI": "**"
   docs_gate_paths: ["docs/**", "*.md", "README.md"]
   sot_doc: AGENTS.md
+  # Explicitly off, overriding the tier-derived default (#1014), until a third
+  # *vendor* seat is stable. Today's tier-3 panel is claude + agy + a second Opus
+  # subagent, and `evidence.distinct_vendor_check` requires every required verdict to
+  # carry a pairwise-distinct vendor — anthropic + google + anthropic fails that. The
+  # protection it buys at tier-2 is already there by construction: the two tier-2
+  # seats above are two different vendors. Revisit when the third seat is its own
+  # vendor rather than a second Opus.
+  evidence_require_distinct_vendors: false
 
 gates: [build, lint]
 
@@ -62,6 +119,30 @@ extensions_dir: .keel/extensions
 policy_pack:
   name: keel-python
   presets: ["bandit"]
+  # keel dogfoods its own capture extension (#1154). The default sink, so an
+  # applied capture writes one Markdown learning into `.keel/learning/` and
+  # `capture.artifact` names it — which is what stops keel being a project that
+  # ships a capture contract and captures nothing from its own runs.
+  capture:
+    enabled: true
+    mode: extension
+    learning:
+      # `enabled` is what `learning_decision` reads; without it the decision is
+      # `marker-only` however the mode reads, so a dogfood that omitted it would
+      # write files while recording that it had decided not to.
+      enabled: true
+      mode: create-learning
+      sink:
+        # The default sink writes into `.keel/learning/`, and keel runs its own
+        # ships inside a worktree, so s10 — before the evidence gate — lands the
+        # lesson with `keel capture-land --root . --onto "$BRANCH" --write` (#1203): one
+        # commit on the pull request's own branch, carried into `main` by the
+        # same squash as the work. `main` requires pull requests with
+        # `enforce_admins: true` and refuses a direct push (measured 2026-09-16),
+        # which is exactly why the lesson rides the pull request instead. So keel
+        # does capture its own runs across sessions, and `.keel/learning/` stays
+        # tracked rather than runtime-ignored because that is where they arrive.
+        kind: markdown-dir
   labels:
     status: ["status:backlog", "status:in-progress", "status:needs-review", "status:done"]
     priority: ["priority:high", "priority:medium", "priority:low"]
@@ -80,6 +161,10 @@ policy_pack:
     unit:
       command: "make test"
       paths: ["src/**", "tests/**"]
+      # Where the tests themselves live, as distinct from the paths that make this group
+      # relevant. Read by the `implement_mode: tdd` `tdd-order` gate, which would be
+      # vacuous if `src/**` counted as a test path.
+      test_paths: ["tests/**"]
       required_capabilities: ["shell"]
     package-validate:
       command: "make validate"

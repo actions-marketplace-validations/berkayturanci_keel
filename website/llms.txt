@@ -5,7 +5,7 @@
 > branch → implement → CI → review → test → merge → close → capture. Projects set
 > their values in `project.yaml` and snap their own logic into named extension
 > slots. Stdlib-first Python CLI, single runtime dependency, 100% test coverage,
-> 16 `/keel` commands. Works across Claude Code, Codex, Antigravity, Gemini, and any OpenAI-compatible API or CLI.
+> 17 `/keel` commands. Works across Claude Code, Codex, Antigravity, Gemini, and any OpenAI-compatible API or CLI.
 
 ## Docs
 
@@ -23,4 +23,7 @@
 - Project-neutral core: all project specifics live in `project.yaml`, read via the `keel` CLI
 - Extension slots: named hooks where a project snaps in its own implementers/reviewers
 - Auditable evidence chain: commit-SHA-bound review provenance, model attribution, and audited deferrals
+- Test-first mode: `knobs.implement_mode: tdd` writes the failing tests first, and the blocking `tdd-order` gate verifies that order
+- Gate-verified iteration: `knobs.loop` repeats the implementation until the command gates pass, at most `max_iterations` times (a red run after that blocks the issue); under test-first mode it wraps the implementation phase only
+- Learning chain: with `learning.enabled`, `learning.mode: create-learning` and a sink, an applied capture writes a Markdown lesson — committed onto the pull request by `keel capture-land` when the sink is inside the repository, written after the merge when it is not — and later implement and review briefs read matching lessons back
 - Pure-core / thin-I/O split with a strict 100% coverage bar

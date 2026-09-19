@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,16 +26,156 @@ class TestWebsiteSwarmSimulator(unittest.TestCase):
         self.assertIn("fullstack", sim_js)
         self.assertIn("conflict", sim_js)
 
-        # Multi-model and multi-vendor references
-        self.assertIn("claude-3-7-sonnet", sim_js)
-        self.assertIn("gemini-2.5-flash", sim_js)
+        # Multi-model and multi-vendor references. Asserted by *vendor*, not by
+        # model id: pinning two ids here made a model-id refresh (#1019) fail a
+        # test whose subject is "the simulator shows more than one vendor", and
+        # a vendor's catalogue is not this repo's to keep current.
+        for vendor in ("Anthropic", "Google", "OpenAI", "DeepSeek"):
+            self.assertIn(f'vendor: "{vendor}"', sim_js)
         self.assertIn("codex", sim_js)
-        self.assertIn("deepseek-r1", sim_js)
 
         # Styles present
         self.assertIn(".swarm-sandbox", styles_css)
         self.assertIn(".sim-dag-layout", styles_css)
         self.assertIn(".sim-metrics-bar", styles_css)
+
+
+class _AccessibleName(HTMLParser):
+    """The text a screen reader announces for one element, by id.
+
+    `aria-hidden` subtrees are skipped, because that is what the browser does:
+    the `↻` glyph in the replay button is decorative and contributes nothing to
+    the accessible name. Nothing else here is a general implementation of the
+    accessible-name algorithm — it reads one button in one file.
+    """
+
+    def __init__(self, element_id: str):
+        super().__init__()
+        self.element_id = element_id
+        self.attrs: dict[str, str] = {}
+        self.text: list[str] = []
+        self._depth = 0
+        self._hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        got = dict(attrs)
+        if self._depth:
+            self._depth += 1
+            if got.get("aria-hidden") == "true" or self._hidden:
+                self._hidden += 1
+        elif got.get("id") == self.element_id:
+            self.attrs = got
+            self._depth = 1
+
+    def handle_endtag(self, tag):
+        if self._depth:
+            if self._hidden:
+                self._hidden -= 1
+            self._depth -= 1
+
+    def handle_data(self, data):
+        if self._depth and not self._hidden:
+            self.text.append(data)
+
+    @property
+    def visible(self) -> str:
+        return " ".join("".join(self.text).split())
+
+
+class TestReplayButtonAccessibleName(unittest.TestCase):
+    """WCAG 2.5.3 Label in Name: the accessible name must contain the visible text.
+
+    The replay button carries an `aria-label` that adds the context its visible
+    text leaves out — that what is replayed is the animation above it. An
+    `aria-label` *overrides* the visible text as the accessible name, so the two
+    can then diverge silently: change the button's words and a screen reader, and
+    any speech-input user saying "click replay the run", still gets the old label.
+
+    That divergence class is already in this repository's `.jules/palette.md`
+    (2026-08-18), where a handler restored an `aria-label` to a captured value and
+    left the button announcing "copied" while its visible text had recovered.
+    Nothing pinned the relationship then. This pins it.
+    """
+
+    def _button(self, element_id: str) -> _AccessibleName:
+        parser = _AccessibleName(element_id)
+        parser.feed((REPO_ROOT / "website" / "index.html").read_text(encoding="utf-8"))
+        self.assertTrue(parser.attrs, f"no element with id={element_id!r} in index.html")
+        return parser
+
+    def test_the_visible_text_survives_inside_the_accessible_name(self):
+        button = self._button("replay")
+        label = button.attrs.get("aria-label", "")
+
+        self.assertTrue(label, "the replay button has no aria-label")
+        self.assertIn(
+            button.visible.lower(),
+            label.lower(),
+            f"aria-label {label!r} does not contain the visible text "
+            f"{button.visible!r}, so speech input cannot activate this button",
+        )
+
+    def test_the_accessible_name_starts_with_the_visible_text(self):
+        """Stronger than 2.5.3 requires, and the shape it recommends.
+
+        A visible label at the *start* of the accessible name is what lets a
+        speech-input user say the words they can see and be understood.
+        """
+        button = self._button("replay")
+
+        self.assertTrue(button.attrs["aria-label"].lower().startswith(button.visible.lower()))
+
+    def test_the_decorative_glyph_is_not_part_of_the_name(self):
+        """If the `↻` ever loses `aria-hidden`, the assertions above stop holding."""
+        self.assertNotIn("\u21bb", self._button("replay").visible)
+
+
+class TestSimulatorSpeedButtons(unittest.TestCase):
+    """The speed control says *which* speed is selected, and says it the way the
+    pills twelve lines above it do.
+
+    The three buttons choose one of three — the same interaction the backlog-scenario
+    pills implement with ``role="radiogroup"`` / ``role="radio"`` / ``aria-checked``.
+    The speed box shipped with none of it: selection was carried by the ``active``
+    CSS class alone, so a screen-reader user could hear all three buttons and not
+    which one was in effect. Naming the buttons is the smaller half of that problem;
+    the state is the half that was missing.
+
+    **The name stays the visible text.** An `aria-label` *overrides* it, and the
+    obvious label — "Animation speed 1×" — does not contain "1x": `×` is U+00D7 and
+    the button says a letter `x`. That is a WCAG 2.5.3 (Label in Name) divergence,
+    the same class :class:`TestReplayButtonAccessibleName` exists to pin, and it
+    costs a speech-input user the ability to say "click 1x". `role="radio"` carries
+    the state without touching the name, so nothing has to diverge.
+
+    Not pinned here: arrow-key navigation, which a radiogroup conventionally offers
+    and neither this group nor the pills implement. Tab still reaches every button,
+    so this is the pills' shape exactly — a wider keyboard change belongs to both.
+    """
+
+    def _markup(self) -> str:
+        source = (REPO_ROOT / "website" / "swarm-simulator.js").read_text(encoding="utf-8")
+        start = source.index('<div class="sim-speed-box"')
+        return source[start : source.index("</div>", start)]
+
+    def test_the_group_is_a_named_radiogroup(self):
+        markup = self._markup()
+        self.assertIn('role="radiogroup"', markup)
+        self.assertIn('aria-label="Animation speed"', markup)
+
+    def test_each_button_announces_whether_it_is_the_selected_speed(self):
+        markup = self._markup()
+        self.assertEqual(markup.count('role="radio"'), 3)
+        # Bound to the same condition as the `active` class, not to a constant: an
+        # `aria-checked` that never changes is worse than none, because it asserts.
+        for speed in (1, 2, 4):
+            self.assertIn(f"aria-checked=\"' + (state.speed === {speed}) + '\"", markup)
+            self.assertIn(f"(state.speed === {speed} ? 'active' : '')", markup)
+
+    def test_the_buttons_carry_no_aria_label_to_diverge_from(self):
+        # See the class docstring: the accessible name is the visible text, and an
+        # `aria-label` here is how "1x" and "1×" come to disagree.
+        self.assertNotIn("aria-label", self._markup().split("<span>", 1)[1])
 
 
 class TestCopyButtonFlash(unittest.TestCase):
@@ -130,6 +271,69 @@ class TestSimulatorCopyButtonLabels(unittest.TestCase):
         handler = self._handler()
         self.assertIn('var COPY_ARIA = "Copy CLI command";', handler)
         self.assertIn('var COPY_TEXT = "Copy";', handler)
+
+
+class TestCopyAnnouncements(unittest.TestCase):
+    """The integration cards' and the simulator's copy buttons announce a copy (#1212).
+
+    `app.js` writes "Copied to clipboard" into `#sr-live-region`; these two buttons only
+    changed their own aria-label, which is not a live-region update. Both now announce, and
+    both clear the region before setting it on the next tick — the technique the integrations
+    filter already uses — because a live region announces a change, and a second copy in a
+    row would otherwise leave identical text in place and say nothing.
+    """
+
+    FILES = ("integrations.js", "swarm-simulator.js")
+
+    def _source(self, name: str) -> str:
+        return (REPO_ROOT / "website" / name).read_text(encoding="utf-8")
+
+    def _announcer(self, name: str) -> str:
+        source = self._source(name)
+        start = source.index("function announceCopied()")
+        return source[start : source.index("\n  }", start)]
+
+    def test_the_page_has_the_region_both_scripts_write_to(self):
+        page = (REPO_ROOT / "website" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="sr-live-region"', page)
+        for name in self.FILES:
+            with self.subTest(file=name):
+                self.assertIn(name, page)
+
+    def test_the_success_path_announces(self):
+        for name in self.FILES:
+            with self.subTest(file=name):
+                source = self._source(name)
+                flash = source.index('.setAttribute("aria-label", "Copied to clipboard");')
+                self.assertEqual(source.count("announceCopied();"), 1)
+                call = source.index("announceCopied();")
+                # Inside the clipboard's success callback, right after the label flips —
+                # not before the write resolves, which would announce a copy that failed.
+                self.assertLess(flash, call)
+                self.assertLess(call - flash, 120)
+
+    def test_the_region_is_cleared_before_the_message_is_set(self):
+        for name in self.FILES:
+            with self.subTest(file=name):
+                body = self._announcer(name)
+                self.assertIn('document.getElementById("sr-live-region")', body)
+                self.assertIn("if (!sr) return;", body)
+                cleared = body.index('sr.textContent = "";')
+                armed = body.index("setTimeout(")
+                self.assertLess(cleared, armed)
+                self.assertIn('sr.textContent = "Copied to clipboard"', body[armed:])
+
+    def test_a_pending_announcement_is_cancelled_first(self):
+        for name, timer in (
+            ("integrations.js", "srTimer"),
+            ("swarm-simulator.js", "copyAnnounceTimer"),
+        ):
+            with self.subTest(file=name):
+                body = self._announcer(name)
+                self.assertIn(f"clearTimeout({timer})", body)
+                self.assertLess(
+                    body.index(f"clearTimeout({timer})"), body.index(f"{timer} = setTimeout")
+                )
 
 
 if __name__ == "__main__":

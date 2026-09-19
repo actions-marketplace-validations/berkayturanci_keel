@@ -9,14 +9,40 @@
 #                  (.claude/commands/keel/ + the shared .agents/skills/keel-* skill set)
 #   make plugin    regenerate the committed Claude Code plugin command files (commands/*.md)
 #                  from src/keel/adapters/commands/ — the drift test locks these byte-for-byte
+#   make site-params
+#                  regenerate website/params.js (the site's argument hints + flag chips) from
+#                  the same adapter frontmatter — also locked byte-for-byte by a drift test
+#   make release-check
+#                  refuse a release that does not agree with itself: CHANGELOG top
+#                  released section == declared version, every release surface in
+#                  scripts/release_surfaces.py on that version, keel-visual markers
+#                  in step. Same guards publish.yml runs before it builds anything.
 #   make release-bump VERSION=x.y.z
 #                  bump the version everywhere a release must touch (pyproject, __init__,
 #                  Claude + Codex plugin manifests, pinned-install refs) and regenerate all
 #                  adapter surfaces
+#   make doctor-python
+#                  print the interpreter these targets resolved, and its version
 
-PY ?= python3
+# PY — the interpreter every target below runs on.
+#
+# `PY=/path/to/python make test`, or an exported PY (what CI's setup-python step
+# effectively provides), always wins: the resolver only runs when PY is unset.
+# Otherwise scripts/find_python.sh picks the first interpreter that is >= 3.11
+# *and* can import yaml, instead of assuming `python3` is one — on macOS that is
+# Xcode's 3.9, where `make test` fails with ~110 import errors that read like a
+# regression rather than a missing toolchain (#1022).
+ifeq ($(origin PY),undefined)
+PY := $(shell scripts/find_python.sh)
+ifeq ($(strip $(PY)),)
+# The resolver already printed the one-line install hint on stderr. Failing here
+# is deferred to the first target that actually expands PY, so `make clean` and
+# `make lint` still work on a machine with no usable interpreter.
+PY = $(error no usable Python — see the find_python message above, or set PY=/path/to/python)
+endif
+endif
 
-.PHONY: test lint coverage validate site adapters plugin release-bump clean
+.PHONY: test lint coverage validate site site-params adapters plugin release-check release-bump doctor-python clean
 
 test:
 	PYTHONPATH=src $(PY) -m unittest discover -s tests -v
@@ -43,12 +69,22 @@ adapters:
 plugin:
 	PYTHONPATH=src $(PY) -m keel install-adapter plugin --root . --force
 
+site-params:
+	PYTHONPATH=src $(PY) -m keel install-adapter site --root . --force
+
+release-check:
+	$(PY) scripts/release_check.py
+
 release-bump:
 	@test -n "$(VERSION)" || { echo "usage: make release-bump VERSION=x.y.z"; exit 1; }
-	$(PY) scripts/release_bump.py "$(VERSION)"
+	$(PY) scripts/release_bump.py "$(VERSION)" --strict
 	$(MAKE) plugin
 	$(MAKE) adapters
 	@echo "release-bump done. Add a CHANGELOG.md entry for $(VERSION), run the gates, then follow docs/keel/release.md to tag."
+
+doctor-python:
+	@echo "interpreter : $(PY)"
+	@$(PY) -c 'import sys, yaml; print("version     :", sys.version.split()[0]); print("pyyaml      :", yaml.__version__)'
 
 clean:
 	rm -rf .coverage htmlcov **/__pycache__ src/**/__pycache__

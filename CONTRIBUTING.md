@@ -16,7 +16,8 @@ By participating you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 - **Pure core + thin I/O.** Put deterministic logic in a pure, unit-tested function; keep
   subprocess/network/prompting in a thin wrapper with an injectable `_run` seam.
 - **Add-only backbone.** Extensions snap into named slots; they never remove, reorder, or
-  replace a backbone step. `on_fail: block` is valid only in the `pre-merge` slot.
+  replace a backbone step. `on_fail: block` is permitted only in documented blocking slots:
+  `guard`, `tester`, `test`, and `pre-merge`.
 - **Single runtime dependency.** PyYAML only on Linux/macOS. Dev-only tools (`ruff`,
   `coverage`, `build`) live in the `dev` extra. The one platform exception is `tzdata` on
   Windows (`sys_platform == 'win32'`), where the stdlib `zoneinfo` has no system IANA
@@ -38,7 +39,16 @@ By participating you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
    make coverage    # coverage gate (fail_under in pyproject)
    make validate    # validate every projects/*.yaml
    ```
+   These targets resolve their own interpreter (`scripts/find_python.sh`: the repo venv,
+   then the newest `python3.x` on PATH that is ≥ 3.11 and can import yaml) rather than
+   assuming `python3` is one — on macOS it is Xcode's 3.9, where the suite fails with a
+   hundred syntax errors that look like a regression. `PY=/path/to/python make test`
+   overrides the resolver; `make doctor-python` prints what it picked, and
+   `keel doctor` reports the same interpreter under its `python_toolchain` check.
 4. The pure core is held at **100% line + branch coverage**. New core logic needs tests.
+   `make test` also fails if any tracked file — `CHANGELOG.md` most often, since it conflicts
+   on nearly every PR — still carries an unresolved `<<<<<<<`/`=======`/`>>>>>>>` marker after
+   a merge or rebase.
 5. Update docs (`docs/keel/`, README) and `CHANGELOG.md` (`[Unreleased]`) when behaviour
    changes. If you change the `/keel:<command>` adapters, re-install with
    `keel install-adapter all --force`.
@@ -46,6 +56,33 @@ By participating you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
    reference (`Closes #N` / `Relates to #N`, or `no issue` for a pure chore). The
    [PR description lint](.github/workflows/pr-lint.yml) check enforces this — a PR template
    only pre-fills the body, it can't stop an empty PR.
+
+## Bot-owned branches are read-only
+
+A pull request branch opened by an automation is a **read-only input**. The registered
+prefixes are `jules`, `bolt`, `palette`, `sentinel`, `dependabot`, `copilot` and
+`renovate`, in any spelling (`bolt-x`, `palette/x`, `jules-1234-abcd`).
+
+**Do not rebase such a branch, amend it, or push fixes to it.** The bot pushes from its
+own checkout, so its next push replaces the branch with that stale copy and silently
+reverts anything that landed in between. Re-land the reviewed changes on a fresh `fix/`,
+`perf/` or `docs/` branch cut from `main` — cherry-pick the bot's commit unchanged so its
+authorship survives — and close the bot's pull request with a link to the replacement.
+
+This is not hypothetical. On [#1125](https://github.com/berkayturanci/keel/pull/1125) a
+review found four defects in a Palette change and the fixes were pushed onto the
+`jules-…` branch; while the last gate round was running the bot pushed *Acknowledge
+reviewer verdicts*, which reverted all of them — **222 deletions**, the entire 189-line
+test class among them, restoring a `var` above `"use strict"` that silently un-stricts a
+420-line IIFE. A few minutes' different timing and it would have merged under a green
+suite, because the tests that would have caught it were in the commit it deleted. The
+work was re-landed as [#1126](https://github.com/berkayturanci/keel/pull/1126). The
+sibling repository adopted the same rule after an equivalent incident cost it two
+already-merged pull requests.
+
+Branches a person drives from a working copy (`claude/…`, `codex/…`, `cursor/…`, `fix/…`)
+are deliberately outside the rule — it is about a branch something else holds the only
+copy of, not about who wrote the code.
 
 ## Dependency and tooling updates
 
@@ -68,3 +105,19 @@ User-visible changes update [CHANGELOG.md](CHANGELOG.md). A release is a version
 `pyproject.toml` + `src/keel/__init__.py`, a promoted CHANGELOG section, and a `vX.Y.Z`
 tag — the tag triggers [`publish.yml`](.github/workflows/publish.yml) (PyPI trusted
 publishing + a GitHub Release with SBOM, checksums, and build provenance).
+
+The version lives in more places than that pair, so use `make release-bump VERSION=x.y.z`
+rather than editing by hand, and check the result:
+
+```bash
+make release-check   # offline; refuses a release that does not agree with itself
+```
+
+It compares the declared version against the top released `## [x.y.z]` CHANGELOG section
+(the guard for a CHANGELOG never renamed from `## [Unreleased]`), against every surface
+listed in `scripts/release_surfaces.py` — plugin manifests, pinned-install references, the
+site fallbacks — and checks `keel-visual`'s two version markers agree with each other.
+`publish.yml` runs the same command before it builds anything, and verifies the
+published package afterwards: a clean-venv install from PyPI, the release
+smoke test, and a SHA256 cross-check against the GitHub Release. See
+[the release runbook](docs/keel/release.md).

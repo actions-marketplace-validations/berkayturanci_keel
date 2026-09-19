@@ -107,6 +107,43 @@ footer line
         theirs = "import os\n"
         self.assertIsNone(resolve_adjacent_conflict(ours, theirs))
 
+    def test_a_conflict_path_is_staged_as_a_path_not_an_option(self):
+        """A file named like a flag is still a file (#1097).
+
+        The path comes out of `git status` for a tree the cluster's agents
+        wrote, so its name is not the operator's to vouch for. Without git's
+        pathspec separator `git add -i` starts interactive mode and
+        `git add -A` stages the whole tree — neither is what healing one
+        conflict means.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hostile = root / "-i"
+            hostile.write_text(
+                "import os\n<<<<<<< HEAD\nimport sys\n=======\nimport json\n>>>>>>> feat/b\n",
+                encoding="utf-8",
+            )
+            seen: list[list[str]] = []
+
+            def runner(cmd: list[str], cwd: Path) -> CommandResult:
+                seen.append(cmd)
+                if "status" in cmd:
+                    return CommandResult(ok=True, code=0, output="UU -i")
+                if "--continue" in cmd:
+                    return CommandResult(ok=True, code=0, output="rebased")
+                if "rebase" in cmd and "--abort" not in cmd:
+                    return CommandResult(ok=False, code=1, output="conflict")
+                return CommandResult(ok=True, code=0, output="ok")
+
+            ok, reason = rebase_and_heal_cluster_branch(root, "branch-hostile", runner=runner)
+
+        self.assertTrue(ok)
+        self.assertEqual(reason, "self_healed_rebase")
+        add = next(cmd for cmd in seen if cmd[:2] == ["git", "add"])
+        self.assertEqual(add, ["git", "add", "--", "-i"])
+        # The separator has to come before the path, or git reads the name first.
+        self.assertLess(add.index("--"), add.index("-i"))
+
     def test_resolve_conflict_content(self):
         clean = "def foo():\n    return 42\n"
         self.assertEqual(resolve_conflict_content(clean), clean)
@@ -539,7 +576,9 @@ class TestSwarmLandingThinIO(unittest.TestCase):
 
             conflicted = Path(tmpdir) / "src"
             conflicted.mkdir(parents=True, exist_ok=True)
-            (conflicted / "shared.py").write_text("<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n")
+            (conflicted / "shared.py").write_text(
+                "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n", encoding="utf-8"
+            )
 
             res = land_wave_clusters(
                 plan,
@@ -870,7 +909,9 @@ class TestSwarmLandingThinIO(unittest.TestCase):
 
             d = Path(tmpdir) / "src"
             d.mkdir(parents=True, exist_ok=True)
-            (d / "shared.py").write_text("<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n")
+            (d / "shared.py").write_text(
+                "<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n", encoding="utf-8"
+            )
 
             res = land_wave_clusters(
                 plan,

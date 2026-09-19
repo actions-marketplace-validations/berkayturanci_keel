@@ -1,6 +1,6 @@
 /* ============================================================
    keel — Ecosystem & Integrations Catalog
-   Interactive catalog of 32 AI coding agents, LLM backends,
+   Interactive catalog of 30 AI coding agents, LLM backends,
    agent skills, and developer platforms supported out-of-the-box.
    Uses authentic brand logo assets and 100% real Keel CLI commands.
    Zero external dependencies — pure client-side vanilla JS.
@@ -8,6 +8,16 @@
 
 (function () {
   "use strict";
+
+  // Below the directive, never above it: a `var` before `"use strict"`
+  // ends the Directive Prologue and leaves the string an inert
+  // expression, silently un-stricting this whole IIFE.
+  var srTimer = null;
+  // Set the first time the reader touches a filter, so the initial render is
+  // silent and every change after it is announced — including clearing the box.
+  var srArmed = false;
+  // The query is whatever the reader typed, and the empty state puts it into markup.
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 
   var INTEGRATIONS = [
     // --- 1. AI Agents & Coding Assistants (12) ---
@@ -26,7 +36,8 @@
       category: "assistants",
       badge: "AI Code Editor",
       desc: "Integrated via knobs.delegate_profiles, background task sync, and AGENTS.md rules.",
-      cmd: "keel ship .keel/project.yaml --delegate cursor",
+      cmd: "keel implement .keel/project.yaml 101 --delegate cursor",
+      note: "Needs a <code>knobs.delegate_profiles.cursor</code> entry naming <code>cursor-agent</code> — keel ships no profile for it. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
       logo: "logos/cursor.svg"
     },
     {
@@ -71,7 +82,8 @@
       category: "assistants",
       badge: "Terminal Agent",
       desc: "Interactive terminal pair programmer mapped to Keel's s4 implement via generic CLI delegates.",
-      cmd: "keel ship .keel/project.yaml --delegate aider",
+      cmd: "keel implement .keel/project.yaml 101 --delegate aider",
+      note: "Needs a <code>knobs.delegate_profiles.aider</code> entry naming the <code>aider</code> binary — keel ships no profile for it. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
       logo: "logos/aider.svg"
     },
     {
@@ -80,7 +92,8 @@
       category: "assistants",
       badge: "Open Assistant",
       desc: "Open-source coding assistant integrated via standard POSIX CLI delegate profiles.",
-      cmd: "keel ship .keel/project.yaml --delegate opencode",
+      cmd: "keel implement .keel/project.yaml 101 --delegate opencode",
+      note: "Needs a <code>knobs.delegate_profiles.opencode</code> entry naming the <code>opencode</code> binary — keel ships no profile for it. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
       logo: "logos/opencode.svg"
     },
     {
@@ -89,7 +102,8 @@
       category: "assistants",
       badge: "AI Code Editor",
       desc: "Adaptive AI editor companion configured via delegate profiles and Keel deterministic gates.",
-      cmd: "keel ship .keel/project.yaml --delegate trae",
+      cmd: "keel implement .keel/project.yaml 101 --delegate trae",
+      note: "Needs a <code>knobs.delegate_profiles.trae</code> entry naming the <code>trae</code> binary — keel ships no profile for it. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
       logo: "logos/trae.jpg"
     },
     {
@@ -98,7 +112,7 @@
       category: "assistants",
       badge: "AI Assistant",
       desc: "Copilot workspace and coding actions verified against deterministic Keel pre-merge evidence gates.",
-      cmd: "keel evidence-verify .keel/project.yaml --phase pre-merge",
+      cmd: "keel evidence-verify .keel/project.yaml --pr 101 --phase pre-merge",
       logo: "logos/githubcopilot.svg"
     },
     {
@@ -107,7 +121,8 @@
       category: "assistants",
       badge: "AI Assistant",
       desc: "Moonshot Kimi coding assistant integration for large-context codebase analysis and implementation.",
-      cmd: "keel ship .keel/project.yaml --delegate kimi",
+      cmd: "keel implement .keel/project.yaml 101 --delegate kimi",
+      note: "Needs a <code>knobs.delegate_profiles.kimi</code> entry naming the Kimi CLI binary — keel ships no profile for it. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
       logo: "logos/kimi-cli.png"
     },
     {
@@ -116,18 +131,19 @@
       category: "assistants",
       badge: "Autonomous Agent",
       desc: "Lightweight autonomous agent runner dispatched across parallel Swarm isolated worktrees.",
-      cmd: "keel swarm-run .keel/project.yaml",
+      cmd: "keel swarm-run .keel/project.yaml --delegate hermes",
+      note: "Needs a <code>knobs.delegate_profiles.hermes</code> entry naming the agent's binary — keel ships no profile for it. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
       logo: "logos/hermes.png"
     },
 
-    // --- 2. Supported LLM Models & Backends (8) ---
+    // --- 2. Supported LLM Models & Backends (6) ---
     {
       id: "anthropic-claude",
       name: "Anthropic Claude",
       category: "backends",
       badge: "LLM Backend",
-      desc: "Claude 3.7 Sonnet, 3.5 Sonnet, Haiku, and Opus supported for implementer and reviewer roles.",
-      cmd: "keel ship .keel/project.yaml --implementer claude-3-7-sonnet",
+      desc: "Hosted Anthropic API for the implementer and reviewer roles. keel pins no model catalogue \u2014 keel doctor --providers reports what this machine can reach.",
+      cmd: "keel ship .keel/project.yaml --implementer anthropic-api:claude-opus-5",
       logo: "logos/anthropic.svg"
     },
     {
@@ -135,17 +151,17 @@
       name: "Google Gemini",
       category: "backends",
       badge: "LLM Backend",
-      desc: "Gemini 2.5 Flash and Pro with fast multi-token reasoning and low token cost tracking.",
-      cmd: "keel ship .keel/project.yaml --implementer gemini-2.5-flash",
+      desc: "Hosted Gemini API with per-run token cost tracking; the Antigravity CLI reports its own model list to keel doctor --providers.",
+      cmd: "keel ship .keel/project.yaml --implementer agy:gemini-3.8-flash-high",
       logo: "logos/googlegemini.svg"
     },
     {
       id: "openai",
-      name: "OpenAI GPT & o1",
+      name: "OpenAI",
       category: "backends",
       badge: "LLM Backend",
-      desc: "GPT-4o, o1, o3-mini, and GPT-4o-mini supported across single-issue ships and jury panels.",
-      cmd: "keel ship .keel/project.yaml --implementer gpt-4o",
+      desc: "Hosted OpenAI API across single-issue ships and jury panels; the model id is whichever the vendor currently serves.",
+      cmd: "keel ship .keel/project.yaml --implementer openai-api:<model-id>",
       logo: "logos/openai.svg"
     },
     {
@@ -163,26 +179,8 @@
       category: "backends",
       badge: "Local Backend",
       desc: "100% on-device, offline model execution with zero API cost and private repository isolation.",
-      cmd: "keel ship .keel/project.yaml --delegate ollama:deepseek-r1",
+      cmd: "keel delegate run --provider ollama:deepseek-r1 --role implement --prompt-file task.md",
       logo: "logos/ollama.svg"
-    },
-    {
-      id: "aws-bedrock",
-      name: "AWS Bedrock",
-      category: "backends",
-      badge: "Enterprise Cloud",
-      desc: "Enterprise VPC-isolated Claude and Llama endpoints via standard AWS credentials.",
-      cmd: "export ANTHROPIC_BEDROCK_AWS_REGION=us-east-1",
-      logo: "logos/aws.svg"
-    },
-    {
-      id: "azure-openai",
-      name: "Azure OpenAI",
-      category: "backends",
-      badge: "Enterprise Cloud",
-      desc: "SOC2 and HIPAA compliant OpenAI models hosted in private Microsoft Azure tenancies.",
-      cmd: "export AZURE_OPENAI_ENDPOINT=https://...",
-      logo: "logos/azure.svg"
     },
     {
       id: "openrouter",
@@ -190,7 +188,7 @@
       category: "backends",
       badge: "Unified Routing",
       desc: "Dynamic multi-model fallback and lowest-latency routing with token cost analytics.",
-      cmd: "keel cost-report .keel/project.yaml --json",
+      cmd: "keel cost-report --root . --json",
       logo: "logos/openrouter.svg"
     },
 
@@ -200,8 +198,8 @@
       name: "Addy Osmani Agent Skills",
       category: "skills",
       badge: "Skill Library",
-      desc: "Production-grade engineering workflows: TDD, spec-driven design, security audits & progressive disclosure.",
-      cmd: "knobs.skills: ['addyosmani:tdd-workflow']",
+      desc: "Third-party skill libraries live beside keel's own keel-&lt;command&gt; skills in .agents/skills/, which every non-Claude agent reads.",
+      cmd: "keel install-adapter skills --root .",
       logo: "logos/addyosmani.png"
     },
     {
@@ -256,8 +254,8 @@
       name: "Official GitHub Action",
       category: "platforms",
       badge: "CI/CD Automation",
-      desc: "Official 1-click composite action (berkayturanci/keel-action@v1) for autonomous issue shipping and swarm runs.",
-      cmd: "uses: berkayturanci/keel-action@v1",
+      desc: "Official composite action (berkayturanci/keel@v1.23.1) for gates, ship assessment, evidence verification and swarm planning.",
+      cmd: "uses: berkayturanci/keel@v1.23.1",
       logo: "logos/githubactions.svg"
     },
     {
@@ -293,7 +291,7 @@
       category: "platforms",
       badge: "Python Ecosystem",
       desc: "Standard Python distribution supporting isolated virtual environments and global CLI usage.",
-      cmd: "pipx install keel",
+      cmd: "pipx install keel-workflow",
       logo: "logos/pypi.svg"
     },
     {
@@ -318,7 +316,8 @@
         item.name.toLowerCase().indexOf(q) >= 0 ||
         item.desc.toLowerCase().indexOf(q) >= 0 ||
         item.badge.toLowerCase().indexOf(q) >= 0 ||
-        item.cmd.toLowerCase().indexOf(q) >= 0;
+        item.cmd.toLowerCase().indexOf(q) >= 0 ||
+        (item.note || "").toLowerCase().indexOf(q) >= 0;
       return matchesCat && matchesQuery;
     });
   }
@@ -333,8 +332,35 @@
       countEl.textContent = items.length + " of " + INTEGRATIONS.length + " integrations";
     }
 
+    // Gated on whether the reader has touched a filter, NOT on the query being
+    // non-empty. `renderGrid` also runs from `init()` on DOMContentLoaded while
+    // the landing view is the overview and this grid is hidden, and announcing
+    // "Showing 32 integrations" there interrupts a page nobody opened. But
+    // *clearing* the box is a result-set change worth announcing, and an
+    // emptiness test silences exactly that.
+    var sr = srArmed ? document.getElementById("sr-live-region") : null;
+    // Cancelled unconditionally: a keystroke that lands while an announcement
+    // is pending must not let the stale one fire after the results moved on.
+    if (srTimer) { clearTimeout(srTimer); srTimer = null; }
+    if (sr) {
+      // "Showing 1 integrations" is the sentence a screen-reader user actually
+      // hears, and searching "ollama" produces exactly one match.
+      var announcement = items.length === 0
+        ? 'No integrations found matching "' + searchQuery + '"'
+        : 'Showing ' + items.length +
+          (items.length === 1 ? ' integration' : ' integrations');
+      // Cleared first, and the message set on the next tick. A live region only
+      // announces a *change*: typing "cla" then "clau" can leave the same
+      // "Showing 3 integrations" text in place, and a screen reader says
+      // nothing while the result set actually moved. `app.js` and `docs.js`
+      // avoid this by clearing after their message; a filter fires on every
+      // keystroke, so it clears before instead.
+      sr.textContent = "";
+      srTimer = setTimeout(function () { sr.textContent = announcement; }, 0);
+    }
+
     if (items.length === 0) {
-      grid.innerHTML = '<div class="integ-empty">No integrations found matching "' + searchQuery + '".</div>';
+      grid.innerHTML = '<div class="integ-empty">No integrations found matching "' + esc(searchQuery) + '".</div>';
       return;
     }
 
@@ -356,12 +382,30 @@
         '    <code>' + item.cmd + '</code>',
         '    <button type="button" class="integ-copy-btn" data-copy="' + item.cmd.replace(/"/g, '&quot;') + '" title="Copy command" aria-label="Copy ' + item.name + ' command">Copy</button>',
         '  </div>',
+        // The command alone is only half of what a reader needs when the delegate it
+        // names is not a built-in: it parses, it dry-runs, and it resolves to nothing
+        // until a profile exists (#1132). Cards that need one say so here.
+        item.note ? '  <p class="integ-note">' + item.note + '</p>' : '',
         '</div>'
       );
     });
 
     grid.innerHTML = html.join("\n");
     wireCopyButtons();
+  }
+
+  // A successful copy is announced through the page's live region, as `app.js` does for its
+  // copy buttons (#1212). A button's own aria-label changing is not a live-region update, so
+  // whether it is spoken depends on the screen reader and on focus. It shares `srTimer` with
+  // the filter announcement above, so whichever the reader did last is what they hear, and it
+  // is cleared first and set on the next tick for the same reason the filter is: a second copy
+  // in a row would otherwise leave identical text in place and be announced as nothing.
+  function announceCopied() {
+    var sr = document.getElementById("sr-live-region");
+    if (!sr) return;
+    if (srTimer) { clearTimeout(srTimer); srTimer = null; }
+    sr.textContent = "";
+    srTimer = setTimeout(function () { sr.textContent = "Copied to clipboard"; }, 0);
   }
 
   function wireCopyButtons() {
@@ -374,6 +418,7 @@
           navigator.clipboard.writeText(text).then(function () {
             btn.textContent = "Copied! ✓";
             btn.setAttribute("aria-label", "Copied to clipboard");
+            announceCopied();
             clearTimeout(copyTimer);
             copyTimer = setTimeout(function () {
               btn.textContent = "Copy";
@@ -395,6 +440,7 @@
         btn.classList.add("active");
         btn.setAttribute("aria-checked", "true");
         activeCategory = btn.getAttribute("data-cat");
+        srArmed = true;
         renderGrid();
       };
     });
@@ -403,6 +449,7 @@
     if (searchInput) {
       searchInput.oninput = function (e) {
         searchQuery = e.target.value;
+        srArmed = true;
         renderGrid();
       };
     }

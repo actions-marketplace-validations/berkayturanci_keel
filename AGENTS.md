@@ -57,6 +57,11 @@ make validate   # validate every projects/*.yaml against the bundled schema
 make site       # build the coverage report into website/ and serve at :8000
 ```
 
+`make test` resolves a compatible interpreter itself (`scripts/find_python.sh`: the repo
+venv, then the newest `python3.x` on PATH that is ≥ 3.11 and can import yaml) instead of
+assuming `python3` is one; `PY=/path/to/python make test` still overrides it, and
+`make doctor-python` prints what it resolved.
+
 Run a single module's tests: `PYTHONPATH=src python3 -m unittest tests.test_<module> -v`.
 Run the CLI the same way: `PYTHONPATH=src python3 -m keel …`. That prefix is what makes it
 *your* working tree; without it the command either fails outright or, when a global editable
@@ -114,12 +119,30 @@ the installed `.claude/commands/keel/`, and `.agents/skills/keel-*`). The adapte
 project-neutral — it reads every project specific from `projects/keel.yaml` (this repo's own
 config) via the `keel` CLI and never hardcodes a value. For keel itself:
 
-- **Implementer** — resolved from `knobs.implementer_agents` by the issue's role; keel
-  maps `core → backend-developer`. Overridable per run with `--delegate`; defaults to the
-  host agent. Attribution (`agent:<vendor>` + versionless `model:<base>`) is recorded.
-- **Reviewers** — step s7 dispatches N reviewers, where N is the reviewer count for the
-  risk tier from s5 classify (using `knobs.tier3_globs`). Overridable with
-  `--review-delegate`.
+- **Implementer** — resolved from `knobs.team.implement.by_role` by the issue's role,
+  falling back to `team.implement.default`; keel maps `core → subagent:backend-developer`.
+  (`knobs.implementer_agents` is the deprecated spelling, still accepted and mapped onto
+  this one.) Overridable per run with `--delegate`; defaults to the host agent.
+  Attribution (`agent:<vendor>` + versionless `model:<base>`) is recorded.
+- **Gate review** — `knobs.team.gate` is a mandatory second opinion on every
+  implementation, `distinct_from: implementer`. The adapter dispatches it; core has no
+  evidence item for it, so no merge check can certify that it ran.
+- **Reviewers** — step s7 dispatches the seats `knobs.team.review.by_tier` names for the
+  risk tier from s5 classify (using `knobs.tier3_globs`); a tier named by neither
+  `by_tier` nor `review.default` falls back to the tier-derived count staffed by the host
+  agent. Overridable with `--review-delegate`.
+- **The panel *as* the review** — a project that sets `team.review.by_tier."<tier>": jury`
+  makes s7 dispatch the cross-vendor panel once, with no host bench staffed beside it, and
+  `keel review --from-jury` maps its ballots onto the review verdicts. keel has not adopted
+  this for its own tier 3 — that tier is three named seats, and `projects/keel.yaml` records
+  why the switch is deliberate.
+- **Fixes** — `knobs.team.fix` is who applies review findings (default the alias
+  `implementer`). s9 does not read it directly: `keel fixloop brief` resolves the seat and
+  escalates it along `fixloop.STAGES` — `implementer` → `gate` → `host` — when a round
+  fails.
+- **Lead** — `knobs.team.lead` is the seat that coordinates a batch of ships (a swarm
+  cluster, a work block) and that its workers report through. It defaults to the host agent
+  driving the run, which is what keel uses: `projects/keel.yaml` sets no `lead`.
 - **Gates** — s8 runs the built-in `build`/`lint` command gates (`make test` / `make lint`
   from `knobs`) plus any `tester` Lego; s10 runs `pre-merge` gates.
 
@@ -146,11 +169,27 @@ the schema if the contract changes), not this prose.
   `guard`, `tester`, `test`, and `pre-merge`. The loader is fail-soft.
 - **Tests mirror modules.** Each `src/keel/<m>.py` has `tests/test_<m>.py`. New behaviour
   comes with tests that hold the core at 100 % line + branch.
+- **A re-exporting module declares `__all__`.** A name imported only so *other* modules
+  can read it from there is spelled `from .x import Y as Y` (which `ruff`'s F401 honours)
+  **and** listed in the module's `__all__`: CodeQL's `py/unused-import` counts same-module
+  uses only, so an undeclared re-export is reported as unused (#1070). `__all__` is then
+  the module's *whole* public surface, not the re-exports alone —
+  `tests/test_reexport_surface.py` discovers every re-exporting module and enforces both
+  directions. Do not answer that rule with a dismissal or a repo-wide silence; it catches
+  real defects (#1063).
 - **Dogfooding.** keel drives itself via `projects/keel.yaml`; CI runs `keel` on keel-core
   every push. `keel ship projects/keel.yaml --root .` is the full dry assessment (tier →
   reviewers, window, gates, decision).
 - **Docs impact.** When behaviour, config, or the CLI changes, update `docs/keel/` (and
   `README.md` / `CHANGELOG.md`) or state `Docs Impact: none` with a reason.
+- **A bot's branch is a read-only input.** Never rebase, amend, or push fixes onto a
+  pull-request branch opened by an automation (`jules`, `bolt`, `palette`, `sentinel`,
+  `dependabot`, `copilot`, `renovate`, any spelling). The bot pushes from its own
+  checkout, so its next push replaces the branch and silently reverts whatever landed in
+  between — on #1125 that erased a whole review, 222 deletions including the tests that
+  would have caught it. Re-land on a fresh `fix/` branch cut from `main`, cherry-picking
+  the bot's commit unchanged, and close the bot's pull request with a link. Full rule and
+  the incident: [CONTRIBUTING.md](CONTRIBUTING.md#bot-owned-branches-are-read-only).
 
 ## Repo layout
 
@@ -160,7 +199,8 @@ src/keel/schema/     project.schema.json (bundled, package-data)
 projects/*.yaml      seed configs — one per consumer project (keel itself dogfoods via projects/keel.yaml)
 tests/               unit suite (mirrors src/keel modules)
 src/keel/adapters/commands/   project-neutral adapter source (e.g. ship.md), generated per host
-commands/            generated Claude-plugin (marketplace) command surface — `/plugin install keel`
+commands/            generated plugin (marketplace) command surface — `/plugin install keel`;
+                     installing it per agent is docs/keel/install.md
 .claude/commands/keel/        generated Claude slash-command adapters (per-project install)
 .agents/skills/keel-*         generated shared skill adapters for non-Claude agents (per-project install)
 docs/                docs (docs/keel/*) + proposals (docs/proposals/*)

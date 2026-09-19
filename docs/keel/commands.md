@@ -14,8 +14,10 @@ The `keel` CLI does the deterministic work (config resolution, gate planning/exe
 risk-tier classification, merge window + lock, attribution); these commands are the **agentic**
 flows the host agent runs (per-round review, inline comments, delegation). Every command is
 **project-neutral** — it reads each project value (`base_branch`, `build_gate_cmd`, `lint_cmd`,
-`implementer_agents`, `tier3_globs`, `ci_workflows`, `timezone`, `merge_window`, …) from that
-project's `.keel/project.yaml`.
+`team`, `tier3_globs`, `ci_workflows`, `timezone`, `merge_window`, …) from that project's
+`.keel/project.yaml`. (`knobs.implementer_agents` is still accepted and mapped onto
+`knobs.team.implement.by_role`, but it is **deprecated** — see
+[configuration.md](configuration.md#implementer_agents).)
 
 Keel's product model is work ownership, not isolated automation. `/keel:ship` is the
 one-issue "own this until done" flow; `/keel:swarm` coordinates multi-agent concurrency;
@@ -39,6 +41,15 @@ The allowed skip reasons are closed (`dry-run`, `deferred`, `merge-failed`,
 `recursion-guard`, `capability-unavailable`, `no-policy`), capture is fail-soft after a
 successful merge, and `keel capture-verify` can check the run ledger offline at session end.
 
+With an in-repo learning sink, `learning.enabled: true` and `learning.mode: create-learning`,
+the lesson itself does not wait for the merge. At s10, before the evidence gate, `/keel:ship` runs
+`keel capture-land --write --onto "$BRANCH"`, which writes the Markdown learning and commits it
+onto the pull request so it merges with the work (otherwise it writes and commits nothing). s11 then records the capture with
+`keel ship --live --append-ledger --capture-status applied --capture-artifact <path>`. A sink
+outside the checkout is written at s11 instead, after the merge, and needs no landing. See
+[the sink](configuration.md#policy_packcapturelearningsink) and
+[`keel capture-land`](cli.md#--write-the-lesson-is-written-here-and-recorded-at-s11).
+
 Long-running work blocks expose progress through `keel status`. This is a snapshot command,
 not a daemon: it reads the last safe checkpoint plus the structured run ledger and reports
 the current issue/step, PR/branch/worktree, wait reason, completed item counts, and next
@@ -54,8 +65,8 @@ contract.
 
 | command | what it does |
 |---|---|
-| **`/keel:ship`** | Drive a GitHub issue end-to-end through the keel backbone (select → branch → implement → CI → review → test → merge → close → capture). The full flow: per-round review, inline `file:line` comments, `--delegate` / `--review-delegate` (including hosted-API `anthropic-api:MODEL`/`openai-api:MODEL`/`google-api:MODEL` values — no agent CLI, just an API key; plus configured `openai-compatible` and generic `cli` profiles, see [models guide](models.md)), `--review-comments inline\|summary`, `--reviewers N`, the `jury` gate, the timezone-aware merge window + `mkdir` merge lock, and vendor+model attribution. `--compound` (`--profile compound`) selects the compound-engineering profile: the same backbone, gates, and safety primitives, with `workflow_profile` marking `implement`, `review`, `fixloop`, and `capture` (s4/s7/s9/s11) as compound step overrides. |
-| **`/keel:swarm`** | Multi-agent swarm coordinator — clusters a backlog of issues into disjoint execution waves based on static file overlaps and explicit DAG dependencies, runs parallel workers across isolated git worktrees with dynamic rebalancing, routes across diverse AI vendors (Claude, Gemini, Codex, DeepSeek, Local Ollama), unifies reviews under the AI Jury consensus panel, and executes dual-mode batch landing under the merge lock with self-healing conflict rollback. |
+| **`/keel:ship`** | Drive a GitHub issue end-to-end through the keel backbone (select → branch → implement → CI → review → test → merge → close → capture). The full flow: per-round review, inline `file:line` comments, `--delegate` / `--review-delegate` (including hosted-API `anthropic-api:MODEL`/`openai-api:MODEL`/`google-api:MODEL` values — no agent CLI, just an API key; plus configured `openai-compatible` and generic `cli` profiles, see [models guide](models.md)), `--review-comments inline\|summary`, `--reviewers N`, the `jury` gate, the timezone-aware merge window + `mkdir` merge lock, and vendor+model attribution. `--compound` (`--profile compound`) selects the compound-engineering profile: the same backbone, gates, and safety primitives, with `workflow_profile` marking `implement`, `review`, `fixloop`, and `capture` (s4/s7/s9/s11) as compound step overrides. `--tdd` (`knobs.implement_mode: tdd`) selects the **test-first s4 profile**: s4 runs in two phases — a test-only commit carrying the issue's acceptance criteria, then the implementation — and s8 gains the pure blocking `tdd-order` gate that verifies that commit order against `policy_pack.test_groups` paths (see [configuration](configuration.md#implement_mode)). `--loop` (`knobs.loop`) wraps s4 in a **bounded, gate-verified iteration loop**: after each implement iteration the command gates run; green ends the loop, red starts the next with the same brief plus the gate output, up to `max_iterations` — the gate run is the judge, never the implementer's text, and under `--tdd` the loop wraps phase B only (see [configuration](configuration.md#loop)). |
+| **`/keel:swarm`** | Multi-agent swarm coordinator — clusters a backlog of issues into disjoint execution waves based on static file overlaps and explicit DAG dependencies, scores each cluster's difficulty and staffs it from `knobs.team`, spawns one **team lead** per cluster to run its ships in isolated git worktrees with dynamic rebalancing, routes across diverse AI vendors (Claude, Gemini, Codex, DeepSeek, Local Ollama), unifies reviews under the AI Jury consensus panel, and executes dual-mode batch landing under the merge lock with self-healing conflict rollback. |
 | `keel status` | Read checkpoint + run ledger state and print a concise active/recent progress snapshot for long-running work blocks. Use `--json` for the machine-readable `keel.progress-status.v1` surface. |
 
 ## Per-step (standalone slices of the backbone)
@@ -79,8 +90,8 @@ contract.
 | command | what it does |
 |---|---|
 | `/keel:morning` | Daily morning briefing — cross-session deferrals, shipped-since-last-brief, production/health signals, GitHub status, and a ranked focus list. |
-| `/keel:work-block` | Daytime multi-issue work block — process explicit issue numbers or a queue selector through `/keel:ship`, with per-issue worktrees, readiness refresh between items, operator-visible stop points, progress snapshots, and a final bucketed report. |
-| `/keel:overnight` | Unattended overnight work block — time-aware merge mode keyed on the merge window; runs `/keel:ship` over the queue until the window closes, then writes a session/morning report. |
+| `/keel:work-block` | Daytime multi-issue work block — process explicit issue numbers or a queue selector through `/keel:ship`, with per-issue worktrees, readiness refresh between items, operator-visible stop points, progress snapshots, and a final bucketed report. Accepts `--delegate` / `--review-delegate` / `--effort` / `--team <profile>` and hands them to every child ship. |
+| `/keel:overnight` | Unattended overnight work block — time-aware merge mode keyed on the merge window; runs `/keel:ship` over the queue until the window closes, then writes a session/morning report. Takes the same staffing flags as `/keel:work-block` and records the effective values in the report. |
 | `/keel:wrap` | Finish the current work session — run the configured gates, commit, push, open a PR, and record a session recap. |
 
 ## Audits

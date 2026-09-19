@@ -68,6 +68,12 @@ class CommandResult:
     stdout: str = ""
     #: Captured standard error alone.
     stderr: str = ""
+    #: True when the command could **not be started** — the ``OSError`` path, which for a
+    #: delegate almost always means "that binary is not installed". Distinct from exit
+    #: 127, which a command that *did* run can also return: `run_argv` reports both as
+    #: code 127, so classifying on the code alone cannot tell "no such binary" from "the
+    #: tool ran and said 127". Every caller that needs the difference reads this flag.
+    spawn_failed: bool = False
 
 
 def _result(proc) -> CommandResult:
@@ -89,33 +95,73 @@ def run_command(
             cwd=cwd,
             capture_output=True,
             text=True,
+            # **UTF-8, not the platform default.** `text=True` alone decodes with
+            # `locale.getencoding()`, which on Windows is the ANSI code page: cp1252
+            # leaves 0x81/8D/8F/90/9D undefined, so `git ls-tree -z` on a repository
+            # holding a Cyrillic filename (`Ё` is D0 81) raised UnicodeDecodeError out
+            # of the subprocess call — past `run_argv`'s own `TimeoutExpired`/`OSError`
+            # guards, turning every fail-soft reader into a traceback. `surrogateescape`
+            # also round-trips undecodable bytes back out unchanged, which the landing
+            # needs: the names it reads from `ls-tree` are written straight back to
+            # `mktree`.
+            encoding="utf-8",
+            errors="surrogateescape",
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )  # nosec B604
     except subprocess.TimeoutExpired:
         return CommandResult(False, 124, f"timed out after {timeout}s", timed_out=True)
     except OSError as exc:
-        return CommandResult(False, 127, str(exc), stderr=str(exc))
+        return CommandResult(False, 127, str(exc), stderr=str(exc), spawn_failed=True)
     return _result(proc)
 
 
 def run_argv(
-    argv: list[str], *, cwd: str | None = None, timeout: int = 120, _run=subprocess.run
+    argv: list[str],
+    *,
+    cwd: str | None = None,
+    timeout: int = 120,
+    stdin_text: str | None = None,
+    _run=subprocess.run,
 ) -> CommandResult:
-    """Run an argv list (no shell). Fail-soft on timeout/OS error. Used by git/gh wrappers."""
+    """Run an argv list (no shell). Fail-soft on timeout/OS error. Used by git/gh wrappers.
+
+    ``stdin_text`` feeds the child on standard input instead of closing it. Every delegate
+    CLI keel dispatches to takes its prompt that way (:mod:`keel.delegate`): a prompt
+    carries the diff and the brief, and an argv is world-readable in ``ps`` for the life of
+    the process. The default stays ``DEVNULL`` — a gate left waiting for input in an
+    unattended run is a hang, not a prompt.
+    """
     try:
         proc = _run(
             argv,
             cwd=cwd,
             capture_output=True,
             text=True,
+            # **UTF-8, not the platform default.** `text=True` alone decodes with
+            # `locale.getencoding()`, which on Windows is the ANSI code page: cp1252
+            # leaves 0x81/8D/8F/90/9D undefined, so `git ls-tree -z` on a repository
+            # holding a Cyrillic filename (`Ё` is D0 81) raised UnicodeDecodeError out
+            # of the subprocess call — past `run_argv`'s own `TimeoutExpired`/`OSError`
+            # guards, turning every fail-soft reader into a traceback. `surrogateescape`
+            # also round-trips undecodable bytes back out unchanged, which the landing
+            # needs: the names it reads from `ls-tree` are written straight back to
+            # `mktree`.
+            encoding="utf-8",
+            errors="surrogateescape",
             timeout=timeout,
-            stdin=subprocess.DEVNULL,
+            input=stdin_text,
+            # Written out rather than assembled into a **kwargs dict: #879's sweep in
+            # tests/test_missing_pins.py reads every spawn site's keywords out of the
+            # AST, and a site that hides `stdin` behind a splat is a site the rule
+            # cannot see. `subprocess.run` accepts `stdin=None` beside `input` and
+            # substitutes a PIPE itself.
+            stdin=None if stdin_text is not None else subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         return CommandResult(False, 124, f"timed out after {timeout}s", timed_out=True)
     except OSError as exc:
-        return CommandResult(False, 127, str(exc), stderr=str(exc))
+        return CommandResult(False, 127, str(exc), stderr=str(exc), spawn_failed=True)
     return _result(proc)
 
 

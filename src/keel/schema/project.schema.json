@@ -29,12 +29,12 @@
     },
     "timezone": {
       "type": "string",
-      "description": "IANA tz used for the merge window, e.g. Europe/Istanbul or Etc/GMT-3."
+      "description": "IANA tz used for the merge window, e.g. Europe/Istanbul or Etc/GMT-3. Requires 'merge_window': the pair is all-or-nothing."
     },
     "merge_window": {
       "type": "string",
-      "pattern": "^[0-2][0-9]:[0-5][0-9]-[0-2][0-9]:[0-5][0-9]$",
-      "description": "Open merge window HH:MM-HH:MM (the complement is the night no-merge window)."
+      "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]$",
+      "description": "Open merge window HH:MM-HH:MM, hours 00-23 (the complement is the night no-merge window); it may wrap midnight, but the two ends must differ - a window that opens and closes at the same minute is never open. Requires 'timezone': the pair is all-or-nothing."
     },
     "merge_window_mode": {
       "enum": ["freeze", "pause"],
@@ -53,7 +53,367 @@
         "implementer_agents": {
           "type": "object",
           "additionalProperties": { "type": "string" },
-          "description": "Role -> agent name, e.g. {mobile: flutter-developer}."
+          "description": "DEPRECATED by knobs.team.implement.by_role: role -> agent name, e.g. {mobile: flutter-developer}. Still accepted and mapped onto team.implement.by_role - a value naming a provider keel can resolve is that provider, anything else is a host subagent (subagent:<name>). team.implement wins where both name a role."
+        },
+        "team": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Team policy: which provider implements (per issue role), which one gives the mandatory gate review, which ones review (per risk tier, or 'jury' for the cross-vendor panel), which one applies the review findings in the s9 fix loop ('fix', defaulting to the alias 'implementer'), and how the jury gates. Rendered as 'assignment' by keel plan / keel ship --json so any host runs the same team. Provider names resolve through the same registry keel delegate run uses: a built-in vendor, a knobs.delegate_profiles entry, a machine-level ~/.keel/providers.yaml entry, or 'subagent:<name>' for a host subagent.",
+          "properties": {
+            "implement": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Who writes the change.",
+              "properties": {
+                "default": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["provider"],
+                  "description": "Implementer for any role by_role does not name.",
+                  "properties": {
+                    "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat: a built-in vendor, a knobs.delegate_profiles name, a ~/.keel/providers.yaml entry, or 'subagent:<name>' for a host subagent." },
+                    "model": { "type": ["string", "null"], "description": "Model this seat runs on, overriding the provider's configured default." },
+                    "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary. Rejected for a provider with no spelling for it (claude, ollama, a generic cli profile) rather than silently dropped." }
+                  }
+                },
+                "by_role": {
+                  "type": "object",
+                  "description": "Issue role label -> implementer seat. Supersedes the deprecated knobs.implementer_agents, whose values are still accepted and mapped onto this.",
+                  "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["provider"],
+                    "properties": {
+                      "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat: a built-in vendor, a knobs.delegate_profiles name, a ~/.keel/providers.yaml entry, or 'subagent:<name>' for a host subagent." },
+                      "model": { "type": ["string", "null"], "description": "Model this seat runs on, overriding the provider's configured default." },
+                      "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary. Rejected for a provider with no spelling for it." }
+                    }
+                  }
+                }
+              }
+            },
+            "gate": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["provider"],
+              "description": "One mandatory second opinion on every implementation, before the reviewer panel. Omit for no gate review.",
+              "properties": {
+                "provider": { "type": "string", "minLength": 1, "description": "Provider giving the gate review." },
+                "model": { "type": ["string", "null"], "description": "Model this seat runs on, overriding the provider's configured default." },
+                "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary. Rejected for a provider with no spelling for it." },
+                "distinct_from": { "enum": ["implementer"], "description": "Seat this one may not duplicate. 'implementer' makes the gate a real second opinion: a gate provider equal to any configured implementer is a validation error." }
+              }
+            },
+            "review": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Who reviews, per risk tier.",
+              "properties": {
+                "default": {
+                  "type": ["array", "string"],
+                  "minItems": 1,
+                  "pattern": "^jury$",
+                  "description": "Reviewer seats for any tier by_tier does not name, or 'jury' to make the cross-vendor panel the review.",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["provider"],
+                    "properties": {
+                      "provider": { "type": "string", "minLength": 1, "description": "Provider filling this reviewer slot." },
+                      "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                      "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                    }
+                  }
+                },
+                "by_tier": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "Risk tier -> reviewer seats. Keys are QUOTED strings (\"1\", \"2\", \"3\"): YAML reads a bare 1: as an integer key, which a JSON schema cannot describe.",
+                  "properties": {
+                    "1": {
+                      "type": ["array", "string"],
+                      "minItems": 1,
+                      "pattern": "^jury$",
+                      "description": "Reviewer seats for TIER-N, or 'jury' to make the cross-vendor panel the review (reviewers.count == 0 and the jury gates).",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["provider"],
+                        "properties": {
+                          "provider": { "type": "string", "minLength": 1, "description": "Provider filling this reviewer slot." },
+                          "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                          "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                        }
+                      }
+                    },
+                    "2": {
+                      "type": ["array", "string"],
+                      "minItems": 1,
+                      "pattern": "^jury$",
+                      "description": "Reviewer seats for TIER-N, or 'jury' to make the cross-vendor panel the review (reviewers.count == 0 and the jury gates).",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["provider"],
+                        "properties": {
+                          "provider": { "type": "string", "minLength": 1, "description": "Provider filling this reviewer slot." },
+                          "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                          "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                        }
+                      }
+                    },
+                    "3": {
+                      "type": ["array", "string"],
+                      "minItems": 1,
+                      "pattern": "^jury$",
+                      "description": "Reviewer seats for TIER-N, or 'jury' to make the cross-vendor panel the review (reviewers.count == 0 and the jury gates).",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["provider"],
+                        "properties": {
+                          "provider": { "type": "string", "minLength": 1, "description": "Provider filling this reviewer slot." },
+                          "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                          "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "jury": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Cross-vendor jury policy.",
+              "properties": {
+                "mode": { "enum": ["gating", "advisory"], "description": "How an enabled jury lands: 'gating' blocks the merge on a blocking verdict, 'advisory' reports only. It can soften an enabled jury; it never enables one." },
+                "min_vendors": { "type": "integer", "minimum": 2, "description": "Distinct vendors the panel needs before its verdict gates; below it a gating jury is downgraded to advisory. Raises keel's floor of 2, never lowers it." },
+                "on_unavailable": { "enum": ["fallback", "block"], "description": "What a tier whose review is the panel does when the probe finds the panel cannot be staffed here (an agent CLI missing, unauthenticated, or out of quota). 'fallback' (the default) seats a host bench of the same size and records why; 'block' refuses the run. Availability is measured runner-first and never asserted by a flag: keel asks the panel s7 would dispatch (jury --doctor --json, ai-jury's own readiness document, which is also how the binary identifies itself) and falls back to the inventory keel doctor --providers prints only for a runner that answers but names no agents." }
+              }
+            },
+            "fix": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["provider"],
+              "description": "Who applies review findings. Defaults to the implementer; provider: implementer says so explicitly.",
+              "properties": {
+                "provider": { "type": "string", "minLength": 1, "description": "Provider that applies findings, or 'implementer' for whoever implemented this change." },
+                "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+              }
+            },
+            "lead": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["provider"],
+              "description": "Default team lead: the seat that coordinates a batch of ships (a swarm cluster, a work block) and that its workers report through. Defaults to the host agent driving the run.",
+              "properties": {
+                "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+              }
+            },
+            "by_difficulty": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Difficulty band -> the bench that staffs work of that weight. A band is how much work an issue is (keel swarm-plan scores it from risk tier, predicted file count, priority/size labels and dependency depth); a risk tier is how dangerous the change is. This is what lets one batch say 'the hard cluster gets the strong implementer at high effort, the easy ones go to the cheap model'.",
+              "properties": {
+                "easy": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "Bench for the lightest work.",
+                  "properties": {
+                    "lead": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["provider"],
+                      "description": "Team lead for this bench: the seat that runs the batch and reports its workers.",
+                      "properties": {
+                        "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                        "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                        "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                      }
+                    },
+                    "implement": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["provider"],
+                      "description": "Implementer for work staffed from this bench. Outranks implement.by_role, which says which part of the system the work is in rather than what it costs.",
+                      "properties": {
+                        "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                        "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                        "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                      }
+                    },
+                    "review": {
+                      "type": ["array", "string"],
+                      "minItems": 1,
+                      "pattern": "^jury$",
+                      "description": "Reviewer seats for work staffed from this bench, or 'jury' for the cross-vendor panel. Overrides review.by_tier for this work.",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["provider"],
+                        "description": "Provider filling this reviewer slot.",
+                        "properties": {
+                          "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                          "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                          "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                        }
+                      }
+                    },
+                    "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort for this bench's implementer when the seat does not name one itself." }
+                  }
+                },
+                "standard": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "Bench for ordinary work.",
+                  "properties": {
+                    "lead": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["provider"],
+                      "description": "Team lead for this bench: the seat that runs the batch and reports its workers.",
+                      "properties": {
+                        "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                        "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                        "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                      }
+                    },
+                    "implement": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["provider"],
+                      "description": "Implementer for work staffed from this bench. Outranks implement.by_role, which says which part of the system the work is in rather than what it costs.",
+                      "properties": {
+                        "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                        "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                        "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                      }
+                    },
+                    "review": {
+                      "type": ["array", "string"],
+                      "minItems": 1,
+                      "pattern": "^jury$",
+                      "description": "Reviewer seats for work staffed from this bench, or 'jury' for the cross-vendor panel. Overrides review.by_tier for this work.",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["provider"],
+                        "description": "Provider filling this reviewer slot.",
+                        "properties": {
+                          "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                          "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                          "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                        }
+                      }
+                    },
+                    "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort for this bench's implementer when the seat does not name one itself." }
+                  }
+                },
+                "hard": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "Bench for the heaviest work.",
+                  "properties": {
+                    "lead": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["provider"],
+                      "description": "Team lead for this bench: the seat that runs the batch and reports its workers.",
+                      "properties": {
+                        "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                        "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                        "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                      }
+                    },
+                    "implement": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["provider"],
+                      "description": "Implementer for work staffed from this bench. Outranks implement.by_role, which says which part of the system the work is in rather than what it costs.",
+                      "properties": {
+                        "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                        "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                        "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                      }
+                    },
+                    "review": {
+                      "type": ["array", "string"],
+                      "minItems": 1,
+                      "pattern": "^jury$",
+                      "description": "Reviewer seats for work staffed from this bench, or 'jury' for the cross-vendor panel. Overrides review.by_tier for this work.",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["provider"],
+                        "description": "Provider filling this reviewer slot.",
+                        "properties": {
+                          "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                          "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                          "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                        }
+                      }
+                    },
+                    "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort for this bench's implementer when the seat does not name one itself." }
+                  }
+                }
+              }
+            },
+            "profiles": {
+              "type": "object",
+              "description": "Named benches an operator selects with --team <profile> on work-block, overnight and swarm. Outranks by_difficulty: it is the operator naming the bench for this batch.",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "One selectable bench.",
+                "properties": {
+                  "lead": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["provider"],
+                    "description": "Team lead for this bench: the seat that runs the batch and reports its workers.",
+                    "properties": {
+                      "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                      "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                      "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                    }
+                  },
+                  "implement": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["provider"],
+                    "description": "Implementer for work staffed from this bench. Outranks implement.by_role, which says which part of the system the work is in rather than what it costs.",
+                    "properties": {
+                      "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                      "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                      "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                    }
+                  },
+                  "review": {
+                    "type": ["array", "string"],
+                    "minItems": 1,
+                    "pattern": "^jury$",
+                    "description": "Reviewer seats for work staffed from this bench, or 'jury' for the cross-vendor panel. Overrides review.by_tier for this work.",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["provider"],
+                      "description": "Provider filling this reviewer slot.",
+                      "properties": {
+                        "provider": { "type": "string", "minLength": 1, "description": "Provider filling this seat." },
+                        "model": { "type": ["string", "null"], "description": "Model this seat runs on." },
+                        "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort in keel's vendor-neutral vocabulary." }
+                      }
+                    }
+                  },
+                  "effort": { "enum": ["low", "medium", "high"], "description": "Reasoning effort for this bench's implementer when the seat does not name one itself." }
+                }
+              }
+            }
+          }
         },
         "delegate_profiles": {
           "type": "object",
@@ -103,10 +463,41 @@
                 "type": "string",
                 "minLength": 1,
                 "description": "Flag the command takes the effective model on, applied as '<model_arg> <model>'. Defaults to --model; set it for a CLI that spells model selection differently."
+              },
+              "vendor_label": {
+                "type": ["string", "null"],
+                "description": "What agent:<vendor> should say for this entry, when 'vendor' names the transport rather than the model's maker, e.g. 'xai' for a cli profile driving Grok. Unset leaves the label as agent:<vendor>. May not shadow a built-in vendor or restate 'cli'/'openai-compatible'; lowercase letters, digits, '.', '-' and '_' only, since the value becomes a GitHub label attribution_check reads back."
               }
             }
           },
           "description": "Named generic delegate profiles, referenced as --delegate <name>. A profile name may not shadow a built-in delegate vendor (claude, codex, agy, ollama, anthropic-api, openai-api) - that is a validation error, not a silent override."
+        },
+        "implement_mode": {
+          "type": "string",
+          "enum": ["default", "tdd"],
+          "description": "The s4 implement profile. 'default' (the default) is the single implement pass. 'tdd' splits s4 into two phases against the same provider - a test-only commit carrying the failing tests derived from the issue's acceptance criteria, then the implementation that turns them green - and adds the pure 'tdd-order' gate at s8, which verifies that commit order against policy_pack.test_groups paths. Backbone step ids are unchanged; this is an s4 profile like the compound workflow profile. --tdd selects it for a single run."
+        },
+        "loop": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether the s4 iteration loop is on. Defaults to true when the loop block is present; false keeps the block's numbers and switches the loop off (--loop switches it back on for one run)."
+            },
+            "max_iterations": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "description": "How many implement iterations s4 may run before a red gate run blocks the issue. Default 3; 1 is the single pass keel has always run."
+            },
+            "gate_output_max_bytes": {
+              "type": "integer",
+              "minimum": 256,
+              "description": "Cap on each gate's output quoted into the next iteration's brief, in bytes of UTF-8 of gate text. Default 16384. A prompt has a budget."
+            }
+          },
+          "description": "The s4 iteration loop (#1165). After each implement iteration the orchestrator runs the gates the loop can make green (keel run-gates --defer-jury --json: the guard and test phases, command or built-in; agentic, jury and pre-merge gates are deferred to the phases that run them); green ends the loop, red starts the next iteration with the same brief plus the gate output, up to max_iterations. The gate run is the judge, never the implementer's text. Composes with implement_mode: tdd, where it wraps phase B only. --loop selects it for a single run."
         },
         "build_gate_cmd": { "type": "string", "minLength": 1 },
         "lint_cmd": { "type": "string" },
@@ -136,7 +527,7 @@
         },
         "evidence_require_distinct_vendors": {
           "type": "boolean",
-          "description": "When true, evidence-verify additionally requires that each required review verdict carries vendor provenance and that no two share a vendor. Off by default (back-compatible: count + head-pin only). Jury-agnostic — works with any reviewer carrying vendor provenance."
+          "description": "When true, evidence-verify additionally requires that each required review verdict carries vendor provenance and that no two share a vendor. OPT-IN: unset (the default) is false on every risk tier, because vendor distinctness is an independence claim only the project can make - a reviewer bench drawn from one vendor is the normal case for someone running a single agent CLI, and it must still be able to land a TIER-3 change. Set it to true on a project whose bench really does span vendors. Jury-agnostic — works with any reviewer carrying vendor provenance."
         },
         "swarm_review_evidence": {
           "type": "boolean",
@@ -287,6 +678,11 @@
             "properties": {
               "command": { "type": "string", "minLength": 1 },
               "paths": { "type": "array", "items": { "type": "string" } },
+              "test_paths": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Paths this group's TESTS live in, when they differ from the 'paths' selectors that make the group relevant. Read by the implement_mode: tdd 'tdd-order' gate: 'paths' routinely include the implementation surface, which would make a test-first check vacuous. When any group declares test_paths, only the declared ones count."
+              },
               "reports": { "type": "array", "items": { "type": "string" } },
               "required_capabilities": { "type": "array", "items": { "type": "string" } },
               "optional_capabilities": { "type": "array", "items": { "type": "string" } }
@@ -500,12 +896,43 @@
                       "description": "Whether stable learning fingerprints suppress duplicate durable learning candidates."
                     }
                   }
+                },
+                "sink": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "markdown-dir"
+                      ],
+                      "description": "The only sink kind: a directory of Markdown files with stable frontmatter. keel never learns what reads that directory."
+                    },
+                    "path": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Destination directory. Expands ~ and the placeholders {owner}, {repo}, {base_branch}, {date}, {pr}, {slug}, {fingerprint}. Defaults to .keel/learning."
+                    },
+                    "filename": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "File name template, same placeholders. Must contain {fingerprint}, or two lessons on one pull request overwrite each other. Defaults to {date}-pr{pr}-{slug}-{fingerprint}.md."
+                    }
+                  },
+                  "description": "Where an applied capture writes its durable learning file. Omit it and keel records the marker and writes nothing, which is the behaviour before #1154."
+                },
+                "source": {
+                  "oneOf": [
+                    { "type": "string", "minLength": 1 },
+                    { "type": "array", "items": { "type": "string", "minLength": 1 } }
+                  ],
+                  "description": "Directories the implement and review briefs retrieve past learnings from. Defaults to the sink's path, else .keel/learning. A list reads several, e.g. a repo-local folder plus a shared cross-project one. Placeholders: {owner}, {repo}, {base_branch}."
                 }
               },
               "description": "Policy for optional durable learning artifacts. Core records the decision in capture.learning and suppresses duplicates by stable fingerprint."
             }
           },
-          "description": "Project-owned post-merge capture policy. Core owns marker/verifier mechanics; capture content and destinations remain extension-owned."
+          "description": "Project-owned post-merge capture policy. Core owns marker/verifier mechanics and capture content stays extension-owned; so does the destination, unless learning.sink names one — then core writes the file and fills capture.artifact."
         },
         "review": {
           "type": "object",

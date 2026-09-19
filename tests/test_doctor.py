@@ -3,13 +3,17 @@
 import contextlib
 import io
 import json
+import os
+import sys
 import tempfile
 import unittest
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from keel import __version__, api_delegate, cli, doctor, install
+from keel import __version__, agents, api_delegate, cli, doctor, install, providers
+from keel import config as cfg
 
 PROJECTS = Path(__file__).resolve().parent.parent / "projects"
 SAMPLE_PROJECT = PROJECTS / "example-android.yaml"
@@ -405,6 +409,8 @@ class TestDoctorCli(unittest.TestCase):
                 "orphan_adapters",
                 "core_version",
                 "state_paths",
+                "python_toolchain",
+                "policy_labels",
             },
         )
         # --offline => latest unknown.
@@ -585,6 +591,1099 @@ class TestDoctorCheckoutRoot(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "src" / "keel" / "__init__.py").mkdir(parents=True)
             self.assertIsNone(cli._doctor_checkout_root(d))
+
+
+class TestPythonToolchainCheck(unittest.TestCase):
+    """The pure classifier: is the build gate's interpreter one keel can run on?"""
+
+    def _run_check(self, **toolchain):
+        base = {
+            "interpreter": "/opt/py312/bin/python",
+            "source": "scripts/find_python.sh",
+            "version": "3.12.4",
+            "yaml": True,
+            "reason": "",
+        }
+        base.update(toolchain)
+        return _check(_doctor(python_toolchain=base), "python_toolchain")
+
+    def test_not_probed_is_ok(self):
+        check = _check(_doctor(), "python_toolchain")
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("not probed", check["summary"])
+        self.assertEqual(check["detail"], {})
+
+    def test_supported_interpreter_with_pyyaml_is_ok(self):
+        check = self._run_check()
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("/opt/py312/bin/python", check["summary"])
+        self.assertIn("3.12.4", check["summary"])
+
+    def test_detail_carries_the_gathered_facts(self):
+        check = self._run_check(source="PY (environment)")
+        self.assertEqual(check["detail"]["source"], "PY (environment)")
+        self.assertEqual(check["detail"]["interpreter"], "/opt/py312/bin/python")
+        self.assertTrue(check["detail"]["yaml"])
+
+    def test_no_interpreter_warns_with_the_reason(self):
+        check = self._run_check(interpreter=None, reason="scripts/find_python.sh resolved none")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("no usable interpreter", check["summary"])
+        self.assertIn("resolved none", check["summary"])
+
+    def test_no_interpreter_and_no_reason_still_says_something(self):
+        check = self._run_check(interpreter=None, reason="")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("no interpreter resolved", check["summary"])
+
+    def test_unreadable_version_warns(self):
+        check = self._run_check(version=None, reason="probing /opt/py312/bin/python failed: boom")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("version is unknown", check["summary"])
+        self.assertIn("boom", check["summary"])
+
+    def test_non_string_version_warns(self):
+        check = self._run_check(version=312)
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("version is unknown", check["summary"])
+
+    def test_unparseable_version_warns(self):
+        check = self._run_check(version="3.13.0rc1")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("version is unknown", check["summary"])
+
+    def test_below_the_minimum_warns_and_names_it(self):
+        # The #1022 case: Xcode's python3 on macOS.
+        check = self._run_check(interpreter="/usr/bin/python3", version="3.9.6")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("/usr/bin/python3", check["summary"])
+        self.assertIn("below the required 3.11", check["summary"])
+
+    def test_missing_pyyaml_warns(self):
+        check = self._run_check(yaml=False)
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("PyYAML is not importable", check["summary"])
+
+    def test_old_interpreter_without_pyyaml_reports_both(self):
+        check = self._run_check(version="3.9.6", yaml=False)
+        self.assertIn("below the required 3.11", check["summary"])
+        self.assertIn("PyYAML is not importable", check["summary"])
+
+    def test_never_escalates_to_fail(self):
+        # keel cannot know a red gate is *this* problem — advisory only.
+        report = _doctor(
+            python_toolchain={
+                "interpreter": "/usr/bin/python3",
+                "source": "python3 on PATH",
+                "version": "3.9.6",
+                "yaml": False,
+                "reason": "",
+            }
+        )
+        self.assertEqual(report["counts"]["fail"], 0)
+        self.assertEqual(report["status"], "warn")
+
+    def test_the_minimum_matches_requires_python(self):
+        pyproject = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+        minimum = ".".join(str(part) for part in doctor.MIN_PYTHON)
+        self.assertIn(f'requires-python = ">={minimum}"', pyproject)
+
+
+class _Proc:
+    """Stand-in for what ``subprocess.run`` hands back to ``run_argv``."""
+
+    def __init__(self, *, stdout="", stderr="", returncode=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+def _fake_run(*results):
+    """A ``subprocess.run`` seam that replays ``results`` and records its calls."""
+    calls = []
+
+    def fake(argv, **kwargs):
+        calls.append({"argv": list(argv), **kwargs})
+        return results[len(calls) - 1]
+
+    return fake, calls
+
+
+def _ok(stdout):
+    return _Proc(stdout=stdout)
+
+
+def _failed(output, code=2):
+    return _Proc(stderr=output, returncode=code)
+
+
+def _config(build_gate_cmd):
+    return SimpleNamespace(knobs=SimpleNamespace(build_gate_cmd=build_gate_cmd))
+
+
+PROBE_OK = _ok('{"version": "3.12.4", "yaml": true}')
+
+
+class TestDoctorPythonToolchain(unittest.TestCase):
+    """Thin I/O: which interpreter will the configured build gate run on?"""
+
+    def test_a_non_make_gate_reports_this_interpreter(self):
+        # Nothing to resolve: the gate runs in this process's world.
+        fake_run, calls = _fake_run()
+        facts = cli._doctor_python_toolchain(
+            ".", _config("./gradlew test"), _run=fake_run, _which=lambda _: None, _env={}
+        )
+        self.assertEqual(facts["interpreter"], sys.executable)
+        self.assertEqual(facts["source"], "sys.executable")
+        self.assertEqual(facts["version"], ".".join(str(p) for p in sys.version_info[:3]))
+        self.assertTrue(facts["yaml"])
+        self.assertEqual(calls, [])  # no subprocess for ourselves
+
+    def test_no_config_reports_this_interpreter(self):
+        fake_run, _ = _fake_run()
+        facts = cli._doctor_python_toolchain(
+            ".", None, _run=fake_run, _which=lambda _: None, _env={}
+        )
+        self.assertEqual(facts["interpreter"], sys.executable)
+
+    def test_an_exported_py_wins_over_the_resolver(self):
+        # `PY=` is what the Makefile honours first, so doctor must report it.
+        fake_run, calls = _fake_run(PROBE_OK)
+        with tempfile.TemporaryDirectory() as d:
+            _write_resolver(d)
+            facts = cli._doctor_python_toolchain(
+                d,
+                _config("make test"),
+                _run=fake_run,
+                _which=lambda _: None,
+                _env={"PY": " /opt/py312/bin/python "},
+            )
+        self.assertEqual(facts["interpreter"], "/opt/py312/bin/python")
+        self.assertEqual(facts["source"], "PY (environment)")
+        self.assertEqual(facts["version"], "3.12.4")
+        self.assertEqual(calls[0]["argv"][0], "/opt/py312/bin/python")
+
+    def test_an_empty_py_is_not_an_override(self):
+        fake_run, calls = _fake_run(_ok("/opt/py313/bin/python\n"), PROBE_OK)
+        with tempfile.TemporaryDirectory() as d:
+            _write_resolver(d)
+            facts = cli._doctor_python_toolchain(
+                d, _config("make test"), _run=fake_run, _which=lambda _: None, _env={"PY": "  "}
+            )
+        self.assertEqual(facts["source"], "scripts/find_python.sh")
+        self.assertEqual(facts["interpreter"], "/opt/py313/bin/python")
+
+    def test_a_make_gate_asks_the_resolver(self):
+        fake_run, calls = _fake_run(_ok("/opt/py313/bin/python\n"), PROBE_OK)
+        with tempfile.TemporaryDirectory() as d:
+            resolver = _write_resolver(d)
+            facts = cli._doctor_python_toolchain(
+                d, _config("make test"), _run=fake_run, _which=lambda _: None, _env={}
+            )
+        self.assertEqual(calls[0]["argv"], ["/bin/sh", str(resolver)])
+        self.assertEqual(facts["interpreter"], "/opt/py313/bin/python")
+        self.assertEqual(facts["source"], "scripts/find_python.sh")
+
+    def test_a_resolver_that_finds_nothing_warns_with_its_message(self):
+        fake_run, _ = _fake_run(_failed("find_python: no Python >= 3.11 with PyYAML found"))
+        with tempfile.TemporaryDirectory() as d:
+            _write_resolver(d)
+            facts = cli._doctor_python_toolchain(
+                d, _config("make test"), _run=fake_run, _which=lambda _: None, _env={}
+            )
+        self.assertIsNone(facts["interpreter"])
+        self.assertIn("no Python >= 3.11", facts["reason"])
+        self.assertFalse(facts["yaml"])
+
+    def test_a_silent_resolver_is_not_an_interpreter(self):
+        fake_run, _ = _fake_run(_ok("   \n"))
+        with tempfile.TemporaryDirectory() as d:
+            _write_resolver(d)
+            facts = cli._doctor_python_toolchain(
+                d, _config("make test"), _run=fake_run, _which=lambda _: None, _env={}
+            )
+        self.assertIsNone(facts["interpreter"])
+
+    def test_a_project_without_the_resolver_falls_back_to_python3(self):
+        # Someone else's `make test` runs whatever their Makefile picks — `python3`.
+        fake_run, calls = _fake_run(PROBE_OK)
+        with tempfile.TemporaryDirectory() as d:
+            facts = cli._doctor_python_toolchain(
+                d,
+                _config("make -C build test"),
+                _run=fake_run,
+                _which=lambda name: f"/usr/bin/{name}",
+                _env={},
+            )
+        self.assertEqual(facts["interpreter"], "/usr/bin/python3")
+        self.assertEqual(facts["source"], "python3 on PATH")
+        self.assertEqual(calls[0]["argv"][0], "/usr/bin/python3")
+
+    def test_no_python3_at_all_warns(self):
+        fake_run, _ = _fake_run()
+        with tempfile.TemporaryDirectory() as d:
+            facts = cli._doctor_python_toolchain(
+                d, _config("make test"), _run=fake_run, _which=lambda _: None, _env={}
+            )
+        self.assertIsNone(facts["interpreter"])
+        self.assertIn("no python3 on PATH", facts["reason"])
+
+    def test_an_interpreter_that_cannot_be_probed_reports_the_failure(self):
+        fake_run, _ = _fake_run(_failed("bad interpreter: Permission denied", code=126))
+        facts = cli._doctor_python_toolchain(
+            ".",
+            _config("make test"),
+            _run=fake_run,
+            _which=lambda _: None,
+            _env={"PY": "/opt/broken/python"},
+        )
+        self.assertEqual(facts["interpreter"], "/opt/broken/python")
+        self.assertIsNone(facts["version"])
+        self.assertIn("Permission denied", facts["reason"])
+
+    def test_unreadable_probe_output_is_not_a_crash(self):
+        fake_run, _ = _fake_run(_ok("not json"))
+        facts = cli._doctor_python_toolchain(
+            ".",
+            _config("make test"),
+            _run=fake_run,
+            _which=lambda _: None,
+            _env={"PY": "/opt/py312/bin/python"},
+        )
+        self.assertIsNone(facts["version"])
+        self.assertIn("failed", facts["reason"])
+
+    def test_probe_output_missing_a_field_is_not_a_crash(self):
+        fake_run, _ = _fake_run(_ok('{"version": "3.12.4"}'))
+        facts = cli._doctor_python_toolchain(
+            ".",
+            _config("make test"),
+            _run=fake_run,
+            _which=lambda _: None,
+            _env={"PY": "/opt/py312/bin/python"},
+        )
+        self.assertIsNone(facts["version"])
+
+    def test_probe_output_of_the_wrong_shape_is_not_a_crash(self):
+        fake_run, _ = _fake_run(_ok("[1, 2]"))
+        facts = cli._doctor_python_toolchain(
+            ".",
+            _config("make test"),
+            _run=fake_run,
+            _which=lambda _: None,
+            _env={"PY": "/opt/py312/bin/python"},
+        )
+        self.assertIsNone(facts["version"])
+
+    def test_a_missing_pyyaml_is_reported_not_hidden(self):
+        fake_run, _ = _fake_run(_ok('{"version": "3.12.4", "yaml": false}'))
+        facts = cli._doctor_python_toolchain(
+            ".",
+            _config("make test"),
+            _run=fake_run,
+            _which=lambda _: None,
+            _env={"PY": "/opt/py312/bin/python"},
+        )
+        self.assertFalse(facts["yaml"])
+
+    def test_long_tool_output_is_trimmed_into_one_line(self):
+        self.assertEqual(cli._short("a\n  b\tc  "), "a b c")
+        self.assertEqual(len(cli._short("x " * 500)), 160)
+
+    def test_the_cli_wires_the_check_up(self):
+        # End to end through `keel doctor` with the real seams: the sample
+        # project's gate is not `make`, so the answer is this interpreter and
+        # nothing is spawned.
+        with tempfile.TemporaryDirectory() as d:
+            install.install_all(d)
+            rc, out, _err = run(["doctor", str(SAMPLE_PROJECT), "--root", d, "--offline", "--json"])
+        self.assertEqual(rc, 0)
+        check = _check(json.loads(out), "python_toolchain")
+        self.assertEqual(check["status"], "ok")
+        self.assertEqual(check["detail"]["interpreter"], sys.executable)
+        self.assertEqual(check["detail"]["source"], "sys.executable")
+
+
+def _write_resolver(root):
+    """Place a stand-in ``scripts/find_python.sh`` under ``root`` (never executed)."""
+    resolver = Path(root) / "scripts" / "find_python.sh"
+    resolver.parent.mkdir(parents=True, exist_ok=True)
+    resolver.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+    return resolver
+
+
+class TestProvidersCheck(unittest.TestCase):
+    """The `providers` check classifies an already-probed report (#1011)."""
+
+    @staticmethod
+    def _payload(**overrides):
+        base = {
+            "providers": [],
+            "registry_path": "/home/op/.keel/providers.yaml",
+            "registry_present": False,
+            "warnings": [],
+            "errors": [],
+            "available": 2,
+            "total": 7,
+        }
+        base.update(overrides)
+        return base
+
+    def test_absent_by_default_so_the_existing_checks_are_untouched(self):
+        report = _doctor()
+        self.assertNotIn("providers", {c["name"] for c in report["checks"]})
+        self.assertNotIn("providers", report)
+
+    def test_available_providers_are_ok_and_counted(self):
+        check = _check(_doctor(providers=self._payload()), "providers")
+        self.assertEqual(check["status"], "ok")
+        self.assertEqual(check["summary"], "2 of 7 provider(s) available")
+        self.assertEqual(check["detail"]["registry_present"], False)
+
+    def test_a_name_clash_is_a_fail_that_names_both_sources(self):
+        payload = self._payload(
+            errors=[
+                "~/.keel/providers.yaml: provider 'cursor' clashes with the project "
+                "profile knobs.delegate_profiles.cursor; the project profile wins"
+            ]
+        )
+        check = _check(_doctor(providers=payload), "providers")
+        self.assertEqual(check["status"], "fail")
+        self.assertIn("knobs.delegate_profiles.cursor", check["summary"])
+        self.assertEqual(_doctor(providers=payload)["status"], "fail")
+
+    def test_a_malformed_registry_is_a_warn_not_a_fail(self):
+        payload = self._payload(warnings=["providers.yaml: unknown transport 'telepathy'"])
+        check = _check(_doctor(providers=payload), "providers")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("telepathy", check["summary"])
+
+    def test_a_machine_with_no_usable_delegate_warns(self):
+        check = _check(_doctor(providers=self._payload(available=0)), "providers")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("no delegate is usable", check["summary"])
+
+    def test_the_document_is_merged_at_the_top_level(self):
+        rows = [{"name": "claude", "available": True}]
+        report = _doctor(providers=self._payload(providers=rows, warnings=["w"], errors=[]))
+        self.assertEqual(report["providers"], rows)
+        self.assertEqual(report["registry_path"], "/home/op/.keel/providers.yaml")
+        self.assertEqual(report["warnings"], ["w"])
+        self.assertEqual(report["errors"], [])
+
+
+class TestRenderProviders(unittest.TestCase):
+    def _row(self, **overrides):
+        row = {
+            "name": "claude",
+            "transport": "cli",
+            "source": "builtin",
+            "available": True,
+            "reason": "/bin/claude (2.1.0)",
+            "models": [],
+            "capabilities": {"tools": True, "read_only_mode": True, "model_selection": True},
+        }
+        row.update(overrides)
+        return row
+
+    def test_table_names_transport_source_capabilities_and_reason(self):
+        payload = {
+            "providers": [
+                self._row(),
+                self._row(
+                    name="ollama",
+                    transport="local",
+                    available=False,
+                    reason="unreachable",
+                    capabilities={
+                        "tools": False,
+                        "read_only_mode": False,
+                        "model_selection": False,
+                    },
+                ),
+            ],
+            "registry_path": "/home/op/.keel/providers.yaml",
+            "registry_present": True,
+            "available": 1,
+            "total": 2,
+            "warnings": ["bad entry"],
+            "errors": ["name clash"],
+        }
+        text = doctor.render_providers(payload)
+        self.assertIn("keel providers — 1 of 2 available", text)
+        self.assertIn("/home/op/.keel/providers.yaml (present)", text)
+        self.assertIn("yes  claude", text)
+        self.assertIn("tools,read-only,model", text)
+        self.assertIn(" no  ollama", text)
+        self.assertIn("warn  bad entry", text)
+        self.assertIn("FAIL  name clash", text)
+
+    def test_a_provider_with_no_capabilities_renders_a_dash(self):
+        payload = {"providers": [self._row(capabilities={})], "available": 1, "total": 1}
+        self.assertIn(" -  ", doctor.render_providers(payload))
+        self.assertIn("(none) (not present)", doctor.render_providers(payload))
+
+    def test_a_long_model_list_is_summarised(self):
+        models = [f"m{i}" for i in range(9)]
+        payload = {"providers": [self._row(name="agy", models=models)], "available": 1, "total": 1}
+        text = doctor.render_providers(payload)
+        self.assertIn("models: m0, m1, m2, m3, m4, m5, +3 more", text)
+
+    def test_a_short_model_list_is_shown_whole(self):
+        payload = {"providers": [self._row(models=["a", "b"])], "available": 1, "total": 1}
+        self.assertIn("models: a, b\n", doctor.render_providers(payload) + "\n")
+        self.assertNotIn("more", doctor.render_providers(payload))
+
+
+class TestDoctorProvidersCli(unittest.TestCase):
+    """`keel doctor --providers` wires the probe in without touching this machine."""
+
+    def setUp(self):
+        self._real_fetch = cli._fetch_latest_pypi_version
+        cli._fetch_latest_pypi_version = lambda **kw: __version__
+
+    def tearDown(self):
+        cli._fetch_latest_pypi_version = self._real_fetch
+
+    @staticmethod
+    def _collect(**overrides):
+        payload = {
+            "schema_version": "keel.providers.v1",
+            "providers": [
+                {
+                    "name": "claude",
+                    "transport": "cli",
+                    "source": "builtin",
+                    "available": True,
+                    "reason": "/bin/claude (2.1.0)",
+                    "models": [],
+                    "capabilities": {
+                        "tools": True,
+                        "read_only_mode": True,
+                        "model_selection": True,
+                    },
+                },
+                {
+                    "name": "codex",
+                    "transport": "cli",
+                    "source": "builtin",
+                    "available": False,
+                    "reason": "codex not found on PATH",
+                    "models": [],
+                    "capabilities": {
+                        "tools": True,
+                        "read_only_mode": True,
+                        "model_selection": True,
+                    },
+                },
+            ],
+            "registry_path": "/home/op/.keel/providers.yaml",
+            "registry_present": False,
+            "warnings": [],
+            "errors": [],
+            "available": 1,
+            "total": 2,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_no_probe_runs_without_the_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(cli.providerprobe, "collect") as collect:
+                rc, out, _ = run(["doctor", "--root", d, "--offline", "--json"])
+        collect.assert_not_called()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("providers", json.loads(out))
+
+    def test_json_lists_every_provider_with_a_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(cli.providerprobe, "collect", return_value=self._collect()):
+                rc, out, _ = run(["doctor", "--root", d, "--offline", "--providers", "--json"])
+        report = json.loads(out)
+        self.assertEqual(rc, 0)
+        self.assertEqual([p["name"] for p in report["providers"]], ["claude", "codex"])
+        self.assertTrue(report["providers"][0]["available"])
+        self.assertEqual(report["providers"][1]["reason"], "codex not found on PATH")
+        self.assertEqual(report["registry_path"], "/home/op/.keel/providers.yaml")
+        self.assertEqual(report["warnings"], [])
+        self.assertEqual(_check(report, "providers")["status"], "ok")
+
+    def test_human_output_prints_the_table_under_the_checks(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(cli.providerprobe, "collect", return_value=self._collect()):
+                rc, out, _ = run(["doctor", "--root", d, "--offline", "--providers"])
+        self.assertEqual(rc, 0)
+        self.assertIn("keel doctor", out)
+        self.assertIn("keel providers — 1 of 2 available", out)
+        self.assertIn("codex not found on PATH", out)
+
+    def test_a_registry_name_clash_fails_under_strict(self):
+        payload = self._collect(errors=["providers.yaml: provider 'codex' shadows the built-in"])
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(cli.providerprobe, "collect", return_value=payload):
+                rc, out, _ = run(["doctor", "--root", d, "--offline", "--providers", "--strict"])
+        self.assertEqual(rc, 1)
+        self.assertIn("shadows the built-in", out)
+
+    def test_the_probe_sees_the_loaded_project_config(self):
+        seen = {}
+
+        def fake_collect(config, **kwargs):
+            seen["config"] = config
+            seen.update(kwargs)
+            return self._collect()
+
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(cli.providerprobe, "collect", fake_collect):
+                rc, _, _ = run(
+                    ["doctor", str(SAMPLE_PROJECT), "--root", d, "--offline", "--providers"]
+                )
+        self.assertEqual(rc, 0)
+        self.assertIsNotNone(seen["config"])
+
+
+class TestDeclaredLabels(unittest.TestCase):
+    """What a policy pack declares, normalised to the names GitHub stores (#1021)."""
+
+    def test_a_bare_vocabulary_entry_is_qualified_with_its_group(self):
+        pack = {"labels": {"role": ["core"], "status": ["status:done"]}}
+        self.assertEqual(doctor.declared_labels(pack), ("role:core", "status:done"))
+
+    def test_scan_issue_labels_count_too(self):
+        pack = {"scan": {"issue_labels": {"regression": ["type:bug", "source:regression-scan"]}}}
+        self.assertEqual(doctor.declared_labels(pack), ("source:regression-scan", "type:bug"))
+
+    def test_attribution_labels_join_the_set(self):
+        self.assertEqual(
+            doctor.declared_labels({}, attribution=["agent:claude", "   ", "model:opus"]),
+            ("agent:claude", "model:opus"),
+        )
+
+    def test_duplicates_collapse_and_the_result_is_sorted(self):
+        pack = {
+            "labels": {"status": ["status:done", "done"]},
+            "scan": {"issue_labels": {"regression": ["status:done"]}},
+        }
+        self.assertEqual(
+            doctor.declared_labels(pack, attribution=["status:done"]), ("status:done",)
+        )
+
+    def test_a_malformed_pack_contributes_nothing_rather_than_raising(self):
+        # Every shape the schema does not guarantee at this depth: a pack that is not a
+        # mapping, groups that are not lists, entries that are not strings or are blank.
+        self.assertEqual(doctor.declared_labels("not-a-pack"), ())
+        self.assertEqual(doctor.declared_labels({"labels": [], "scan": []}), ())
+        self.assertEqual(
+            doctor.declared_labels(
+                {"labels": {"status": "backlog"}, "scan": {"issue_labels": ["x"]}}
+            ),
+            (),
+        )
+        self.assertEqual(
+            doctor.declared_labels({"labels": {"status": ["", 3, " ok "]}}), ("status:ok",)
+        )
+
+
+class TestMissingLabels(unittest.TestCase):
+    def test_case_only_differences_are_not_missing(self):
+        # GitHub rejects `Bug` when `bug` exists, so a case difference is not a gap.
+        self.assertEqual(
+            doctor.missing_labels(["Status:Done", "role:core"], [" status:done "]),
+            ("role:core",),
+        )
+
+    def test_nothing_missing(self):
+        self.assertEqual(doctor.missing_labels(["a"], ["a", "b"]), ())
+
+    def test_result_is_sorted_and_deduplicated(self):
+        self.assertEqual(doctor.missing_labels(["b", "a", "a"], []), ("a", "b"))
+
+
+def _labels(**overrides):
+    facts = {
+        "repo": "berkayturanci/keel",
+        "declared": ["role:core", "status:done"],
+        "existing": ["role:core", "status:done"],
+        "missing": [],
+        "commands": [],
+        "available": True,
+        "reason": "",
+    }
+    facts.update(overrides)
+    return facts
+
+
+class TestPolicyLabelsCheck(unittest.TestCase):
+    """The pure classifier over already-gathered label facts (#1021)."""
+
+    def test_without_a_config_the_check_is_skipped(self):
+        report = _doctor()
+        check = _check(report, "policy_labels")
+        self.assertEqual(check["status"], "skipped")
+        self.assertIn("no project config", check["summary"])
+        self.assertEqual(report["counts"]["skipped"], 1)
+
+    def test_a_check_that_could_not_look_is_skipped_never_failed(self):
+        facts = _labels(available=False, reason="gh not found on PATH — labels not read")
+        report = _doctor(policy_labels=facts, latest_version="1.2.3", core_version="^1.0")
+        check = _check(report, "policy_labels")
+        self.assertEqual(check["status"], "skipped")
+        self.assertIn("gh not found on PATH", check["summary"])
+        # A skipped check never speaks for the roll-up.
+        self.assertNotEqual(report["status"], "skipped")
+        self.assertEqual(report["counts"]["fail"], 0)
+
+    def test_every_declared_label_present_is_ok(self):
+        check = _check(_doctor(policy_labels=_labels()), "policy_labels")
+        self.assertEqual(check["status"], "ok")
+        self.assertIn("all 2 declared label(s) exist on berkayturanci/keel", check["summary"])
+        self.assertEqual(check["detail"]["existing"], 2)
+
+    def test_missing_labels_warn_and_carry_the_create_commands(self):
+        facts = _labels(
+            missing=["status:done"],
+            existing=["role:core"],
+            commands=["gh label create status:done --repo berkayturanci/keel"],
+        )
+        report = _doctor(policy_labels=facts)
+        check = _check(report, "policy_labels")
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("1 of 2 declared label(s) missing", check["summary"])
+        self.assertIn("status:done", check["summary"])
+        self.assertIn("keel doctor --fix", check["summary"])
+        self.assertEqual(
+            check["detail"]["commands"],
+            ["gh label create status:done --repo berkayturanci/keel"],
+        )
+
+    def test_a_long_missing_list_is_summarised(self):
+        missing = [f"status:{i}" for i in range(9)]
+        check = _check(_doctor(policy_labels=_labels(missing=missing)), "policy_labels")
+        self.assertIn("status:0, status:1, status:2, status:3, status:4, +4 more", check["summary"])
+
+
+class TestRenderReportWithLabels(unittest.TestCase):
+    def test_skipped_renders_as_a_four_character_state_and_is_counted(self):
+        text = doctor.render_report(_doctor())
+        self.assertIn("SKIP  policy_labels", text)
+        self.assertIn("1 skipped", text)
+
+    def test_the_fix_commands_are_printed_under_the_check(self):
+        facts = _labels(
+            missing=["status:done"],
+            commands=["gh label create status:done --repo berkayturanci/keel"],
+        )
+        text = doctor.render_report(_doctor(policy_labels=facts))
+        self.assertIn("$ gh label create status:done --repo berkayturanci/keel", text)
+
+
+def _label_config(**overrides):
+    data = {
+        "extends": "keel",
+        "core_version": "^1.0",
+        "base_branch": "main",
+        "owner": "berkayturanci",
+        "repo": "keel",
+        "knobs": {"build_gate_cmd": "make test"},
+        "policy_pack": {"name": "keel-python", "labels": {"role": ["core"]}},
+    }
+    # A key set to None is *removed*: `owner`/`repo` are optional in the schema but
+    # must be strings when present, which is how a config with neither is built here.
+    data.update(overrides)
+    return cfg.parse_config({k: v for k, v in data.items() if v is not None})
+
+
+LABEL_LIST_OK = _ok('[{"name": "agent:claude"}, {"name": "role:core"}]')
+
+
+def _gh_on_path(name):
+    """A PATH lookup where only ``gh`` resolves — nothing else may be probed."""
+    return "/bin/gh" if name == "gh" else None
+
+
+class TestDoctorPolicyLabelFacts(unittest.TestCase):
+    """Thin I/O: read the repository's labels through one injected ``gh`` call."""
+
+    def test_no_config_means_no_facts_at_all(self):
+        self.assertIsNone(cli._doctor_policy_labels(None))
+
+    def test_a_config_without_owner_repo_is_reported_not_guessed(self):
+        facts = cli._doctor_policy_labels(_label_config(owner=None, repo=None))
+        self.assertFalse(facts["available"])
+        self.assertIn("names no owner/repo", facts["reason"])
+        self.assertIsNone(facts["repo"])
+
+    def test_offline_does_not_touch_the_network(self):
+        fake_run, calls = _fake_run()
+        facts = cli._doctor_policy_labels(
+            _label_config(), offline=True, _which=lambda _: "/bin/gh", _run=fake_run
+        )
+        self.assertFalse(facts["available"])
+        self.assertIn("--offline", facts["reason"])
+        self.assertEqual(calls, [])
+
+    def test_gh_absent_is_skipped_with_a_reason(self):
+        fake_run, calls = _fake_run()
+        facts = cli._doctor_policy_labels(_label_config(), _which=lambda _: None, _run=fake_run)
+        self.assertFalse(facts["available"])
+        self.assertIn("gh not found on PATH", facts["reason"])
+        self.assertEqual(calls, [])
+
+    def test_a_failed_gh_call_is_skipped_never_failed(self):
+        fake_run, _ = _fake_run(_failed("gh: not authenticated"))
+        facts = cli._doctor_policy_labels(
+            _label_config(), _which=lambda _: "/bin/gh", _run=fake_run
+        )
+        self.assertFalse(facts["available"])
+        self.assertIn("not authenticated", facts["reason"])
+
+    def test_unreadable_json_is_skipped(self):
+        fake_run, _ = _fake_run(_ok("not json at all"))
+        facts = cli._doctor_policy_labels(
+            _label_config(), _which=lambda _: "/bin/gh", _run=fake_run
+        )
+        self.assertFalse(facts["available"])
+        self.assertIn("unreadable JSON", facts["reason"])
+
+    def test_json_without_the_name_field_is_skipped(self):
+        fake_run, _ = _fake_run(_ok('[{"colour": "f29513"}]'))
+        facts = cli._doctor_policy_labels(
+            _label_config(), _which=lambda _: "/bin/gh", _run=fake_run
+        )
+        self.assertFalse(facts["available"])
+        self.assertIn("unreadable JSON", facts["reason"])
+
+    def test_missing_labels_come_back_with_the_exact_create_commands(self):
+        fake_run, calls = _fake_run(LABEL_LIST_OK)
+        facts = cli._doctor_policy_labels(
+            _label_config(), root="/tmp/x", _which=lambda _: "/bin/gh", _run=fake_run
+        )
+        self.assertTrue(facts["available"])
+        self.assertEqual(facts["repo"], "berkayturanci/keel")
+        self.assertIn("role:core", facts["declared"])
+        self.assertIn("agent:codex", facts["missing"])
+        self.assertNotIn("role:core", facts["missing"])
+        self.assertNotIn("agent:claude", facts["missing"])
+        self.assertIn("gh label create agent:codex --repo berkayturanci/keel", facts["commands"])
+        self.assertEqual(calls[0]["argv"][:3], ["gh", "label", "list"])
+        self.assertEqual(calls[0]["cwd"], "/tmp/x")
+
+    def test_a_repository_with_every_label_reports_none_missing(self):
+        declared = doctor.declared_labels(
+            {"labels": {"role": ["core"]}}, attribution=agents.attribution_labels(_label_config())
+        )
+        rows = json.dumps([{"name": name} for name in declared])
+        fake_run, _ = _fake_run(_ok(rows))
+        facts = cli._doctor_policy_labels(
+            _label_config(), _which=lambda _: "/bin/gh", _run=fake_run
+        )
+        self.assertEqual(facts["missing"], [])
+        self.assertEqual(facts["commands"], [])
+
+
+def _fix_args(**overrides):
+    args = {
+        "json": False,
+        "approve_scope": [],
+        "operator": None,
+        "consent_mode": None,
+        "live": False,
+    }
+    args.update(overrides)
+    return SimpleNamespace(**args)
+
+
+class TestDoctorFixLabels(unittest.TestCase):
+    """``--fix`` is the one mutation doctor performs, and it is consent-gated."""
+
+    def test_without_a_config_there_is_nothing_to_create(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli._doctor_fix_labels(_fix_args(), None, None)
+        self.assertEqual(rc, 1)
+        self.assertIn("needs a project.yaml", err.getvalue())
+
+    def test_a_check_that_could_not_look_refuses_to_fix(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli._doctor_fix_labels(
+                _fix_args(), _label_config(), _labels(available=False, reason="gh not found")
+            )
+        self.assertEqual(rc, 1)
+        self.assertIn("gh not found", err.getvalue())
+
+    def test_nothing_missing_is_a_no_op(self):
+        fake_run, calls = _fake_run()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli._doctor_fix_labels(_fix_args(), _label_config(), _labels(), _run=fake_run)
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing to fix", out.getvalue())
+        self.assertEqual(calls, [])
+
+    def test_creation_is_refused_without_an_approved_github_scope(self):
+        fake_run, calls = _fake_run()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli._doctor_fix_labels(
+                _fix_args(), _label_config(), _labels(missing=["role:core"]), _run=fake_run
+            )
+        self.assertEqual(rc, 1)
+        self.assertIn("operator consent required", err.getvalue())
+        self.assertEqual(calls, [])  # nothing was created
+
+    def test_an_approved_scope_creates_each_missing_label(self):
+        fake_run, calls = _fake_run(_ok(""), _ok(""))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli._doctor_fix_labels(
+                _fix_args(approve_scope=["github"], operator="berkay"),
+                _label_config(),
+                _labels(missing=["agent:codex", "role:core"]),
+                _run=fake_run,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [call["argv"] for call in calls],
+            [
+                ["gh", "label", "create", "agent:codex", "--repo", "berkayturanci/keel"],
+                ["gh", "label", "create", "role:core", "--repo", "berkayturanci/keel"],
+            ],
+        )
+        self.assertIn("created  role:core", out.getvalue())
+
+    def test_a_failed_creation_is_reported_per_label_and_exits_non_zero(self):
+        fake_run, calls = _fake_run(_failed("label already exists"), _ok(""))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli._doctor_fix_labels(
+                _fix_args(approve_scope=["github"], operator="berkay"),
+                _label_config(),
+                _labels(missing=["agent:codex", "role:core"]),
+                _run=fake_run,
+            )
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(calls), 2)  # one failure does not stop the rest
+        self.assertIn("FAILED   agent:codex", err.getvalue())
+        self.assertIn("created  role:core", out.getvalue())
+
+    def test_a_broken_standing_consent_record_is_an_error_not_a_traceback(self):
+        fake_run, calls = _fake_run()
+        out, err = io.StringIO(), io.StringIO()
+        env = {"KEEL_APPROVE_SCOPE": "github", "KEEL_CONSENT_MODE": "standing"}
+        with patch.dict(cli.os.environ, env, clear=False):
+            cli.os.environ.pop("KEEL_OPERATOR", None)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = cli._doctor_fix_labels(
+                    _fix_args(consent_mode="standing"),
+                    _label_config(),
+                    _labels(missing=["role:core"]),
+                    _run=fake_run,
+                )
+        self.assertEqual(rc, 1)
+        self.assertIn("KEEL_OPERATOR is required", err.getvalue())
+        self.assertEqual(calls, [])
+
+    def test_json_output_keeps_the_creation_log_off_stdout(self):
+        fake_run, _ = _fake_run(_ok(""))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli._doctor_fix_labels(
+                _fix_args(json=True, approve_scope=["github"], operator="berkay"),
+                _label_config(),
+                _labels(missing=["role:core"]),
+                _run=fake_run,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("created  role:core", err.getvalue())
+
+
+class TestDoctorLabelsCli(unittest.TestCase):
+    """`keel doctor` wires the label check in without touching this machine."""
+
+    def setUp(self):
+        self._real_fetch = cli._fetch_latest_pypi_version
+        cli._fetch_latest_pypi_version = lambda **kw: __version__
+
+    def tearDown(self):
+        cli._fetch_latest_pypi_version = self._real_fetch
+
+    def test_offline_with_a_config_skips_the_label_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(cli.github, "list_labels") as list_labels:
+                rc, out, _ = run(
+                    ["doctor", str(SAMPLE_PROJECT), "--root", d, "--offline", "--json"]
+                )
+        list_labels.assert_not_called()
+        self.assertEqual(rc, 0)
+        check = _check(json.loads(out), "policy_labels")
+        self.assertEqual(check["status"], "skipped")
+
+    def test_a_missing_label_warns_with_a_runnable_command(self):
+        listing = cli.github.CommandResult(
+            True, 0, "", stdout=json.dumps([{"name": "status:backlog"}])
+        )
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(cli.shutil, "which", _gh_on_path):
+                with patch.object(cli.github, "list_labels", return_value=listing) as list_labels:
+                    rc, out, _ = run(["doctor", str(SAMPLE_PROJECT), "--root", d])
+        self.assertEqual(rc, 0)  # advisory without --strict
+        self.assertEqual(list_labels.call_args.kwargs["repo"], "berkayturanci/example-android")
+        self.assertIn("WARN  policy_labels", out)
+        self.assertIn("$ gh label create ", out)
+        self.assertIn("--repo berkayturanci/example-android", out)
+
+    def test_a_label_warning_never_fails_a_strict_run(self):
+        listing = cli.github.CommandResult(True, 0, "", stdout="[]")
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(cli.shutil, "which", _gh_on_path):
+                with patch.object(cli.github, "list_labels", return_value=listing):
+                    rc, out, _ = run(
+                        ["doctor", str(SAMPLE_PROJECT), "--root", d, "--strict", "--json"]
+                    )
+        report = json.loads(out)
+        self.assertEqual(_check(report, "policy_labels")["status"], "warn")
+        self.assertEqual(rc, 0)
+
+    def test_fix_without_a_config_exits_non_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, _, err = run(["doctor", "--root", d, "--offline", "--fix"])
+        self.assertEqual(rc, 1)
+        self.assertIn("needs a project.yaml", err)
+
+
+class TheProvidersProbeReadsTheRegistryItWasPointedAt(unittest.TestCase):
+    """`doctor --providers` takes `--registry`, like `delegate run` (#1130).
+
+    Before it did, the flag was silently not a flag: the command ran against the
+    default `~/.keel/providers.yaml`, reported `registry: … (not present)`, and the
+    entry the operator was checking did not appear. Nothing was wrong with the
+    registry — the command answered about a different file, with no error.
+
+    So these assert the **report**, not the plumbing. Spying on the keyword
+    argument is not enough: keep `registry_path=args.registry` and overwrite
+    `registry_path` in the payload before it renders, and a kwarg assertion stays
+    green while the operator sees the default path again — the original bug's
+    exact shape. Found by the gate review of this change.
+    """
+
+    _ENTRY = "keel-1130-probe"
+
+    @contextlib.contextmanager
+    def _registry(self):
+        """A real registry file at a path that is not the default."""
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "providers.yaml"
+            path.write_text(
+                "providers:\n"
+                f"  {self._ENTRY}:\n"
+                "    transport: cli\n"
+                "    command: keel-1130-not-on-path\n",
+                encoding="utf-8",
+            )
+            yield path
+
+    def test_the_report_names_the_registry_it_was_given(self):
+        with self._registry() as path, tempfile.TemporaryDirectory() as root:
+            rc, out, _ = run(
+                [
+                    "doctor",
+                    "--root",
+                    root,
+                    "--offline",
+                    "--providers",
+                    "--registry",
+                    str(path),
+                    "--json",
+                ]
+            )
+            report = json.loads(out)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(report["registry_path"], str(path))
+
+    def test_the_entries_of_that_registry_are_probed(self):
+        """The path alone could be echoed; this needs the file to have been read."""
+        with self._registry() as path, tempfile.TemporaryDirectory() as root:
+            _, out, _ = run(
+                [
+                    "doctor",
+                    "--root",
+                    root,
+                    "--offline",
+                    "--providers",
+                    "--registry",
+                    str(path),
+                    "--json",
+                ]
+            )
+            report = json.loads(out)
+
+        self.assertIn(self._ENTRY, [p["name"] for p in report["providers"]])
+
+    def _report(self, argv, env):
+        """`doctor --providers --json` under an environment of our choosing."""
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, env, clear=False):
+            os.environ.pop(providers.REGISTRY_ENV, None)
+            os.environ.update(env)
+            argv = ["doctor", "--root", root, "--offline", "--providers", "--json", *argv]
+            rc, out, _ = run(argv)
+        self.assertEqual(rc, 0)
+        return json.loads(out)
+
+    def test_without_the_flag_it_reads_the_default_path(self):
+        """Equality, not a substring.
+
+        The first cut asserted that the reported path was *not* the default one
+        after blanking it out — which any wrong path also satisfies, including
+        `$KEEL_PROVIDERS` leaking in from the machine running the tests.
+        """
+        with tempfile.TemporaryDirectory() as home:
+            report = self._report([], {"HOME": home})
+
+        self.assertEqual(report["registry_path"], str(Path(home) / ".keel" / "providers.yaml"))
+
+    def test_without_the_flag_the_environment_still_wins_over_the_home_default(self):
+        with self._registry() as path, tempfile.TemporaryDirectory() as home:
+            report = self._report([], {"HOME": home, providers.REGISTRY_ENV: str(path)})
+
+        self.assertEqual(report["registry_path"], str(path))
+
+    def test_the_flag_wins_over_the_environment(self):
+        """flag > `$KEEL_PROVIDERS` > `~/.keel/providers.yaml` — the order `delegate
+        run` documents, asserted rather than assumed."""
+        with self._registry() as flagged, self._registry() as env_path:
+            report = self._report(
+                ["--registry", str(flagged)], {providers.REGISTRY_ENV: str(env_path)}
+            )
+
+        self.assertEqual(report["registry_path"], str(flagged))
+
+    def test_the_flag_without_providers_says_it_did_nothing(self):
+        """It used to be an argparse error; accepting it silently would be the
+        same quiet mismatch one flag further out."""
+        with tempfile.TemporaryDirectory() as root:
+            rc, out, err = run(["doctor", "--root", root, "--offline", "--registry", "/tmp/x.yaml"])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("--registry applies only with --providers", err)
+        self.assertNotIn("--registry applies only with --providers", out)
+
+    def test_that_note_does_not_land_in_the_json_document(self):
+        """The note went to stdout first, so `doctor --registry X --json | jq` died
+        on the warning about the flag it had just been given. Found by the gate
+        review of this change."""
+        with tempfile.TemporaryDirectory() as root:
+            rc, out, err = run(
+                ["doctor", "--root", root, "--offline", "--registry", "/tmp/x.yaml", "--json"]
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertIn("--registry applies only with --providers", err)
+        json.loads(out)  # the whole of stdout is one JSON document, or this raises
 
 
 if __name__ == "__main__":

@@ -7,12 +7,13 @@ fixing) are pure and live here, so they are reproducible and fully unit-tested.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from . import classify
-from .findings import Verdict
+from . import team as team_policy
+from .findings import Verdict, decision_for
 from .window import is_merge_open
 
 #: Hard cap on review→fix rounds (matches ship's budget).
@@ -28,6 +29,22 @@ POSTING_MODES = frozenset({"inline", "summary"})
 # and a run where no agent produced output counts as zero, which is how "a jury
 # that did not complete cleanly never gates" falls out of the same comparison.
 MINIMUM_JURY_VENDORS = 2
+
+#: What ``keel merge --hotfix`` actually skips, named by the keys the ``keel.merge.v1``
+#: record marks ``{"bypassed": true, "reason": "hotfix"}``.
+#:
+#: The contract used to publish a single ``hotfix_bypasses_window_only: True``, which
+#: has been false since the gates-SHA bypass landed: a consumer reading it would treat a
+#: hotfix merge as gates-verified when no gates-pass ledger record was ever matched
+#: (#1078). Keep this tuple derived from :func:`keel.cli._cmd_merge` — the agreement is
+#: pinned by ``tests/test_cli.py``, which reads it back off a real ``--hotfix`` run.
+HOTFIX_BYPASSES = ("gates_sha", "window")
+
+#: What ``--hotfix`` never skips. All but ``findings`` are keys of the same merge record,
+#: present and un-bypassed on a hotfix run. ``findings`` blocks earlier — at the review
+#: verdict this contract's ``finding_policy`` block governs — so a blocked change never
+#: reaches the merge command to have a key there at all.
+HOTFIX_NEVER_BYPASSES = ("checkpoint_gate", "ci", "evidence", "findings", "lock")
 
 REVIEW_FOCUS_A = (
     "logic correctness",
@@ -55,7 +72,14 @@ def reviewer_count(tier: int) -> int:
 
 
 def reviewer_focuses(count: int) -> tuple[dict[str, Any], ...]:
-    """Focus coverage for each reviewer slot. Lower counts merge focus; none are dropped."""
+    """Focus coverage for each reviewer slot. Lower counts merge focus; none are dropped.
+
+    Zero slots is not "one slot with everything merged in": it is a tier whose
+    ``knobs.team`` policy made the jury the review panel (#1014), so there is no host
+    reviewer to carry a focus. The panel's own coverage is the jury's business.
+    """
+    if count <= 0:
+        return ()
     if count <= 1:
         return (
             {
@@ -92,23 +116,78 @@ def resolve_jury(
     no_jury: bool = False,
     jury_advisory: bool = False,
     participating_vendors: int | None = None,
+    panel_is_jury: bool = False,
+    policy_mode: str | None = None,
+    minimum_vendors: int = MINIMUM_JURY_VENDORS,
+    panel_unavailable: bool = False,
 ) -> dict[str, Any]:
     """Resolve the cross-vendor jury mode using ship flag precedence.
 
+    ``panel_unavailable`` outranks everything, including ``tier == 3``'s auto-on (#1066).
+    It is set only when a measured probe found the panel unstaffable *and* the project's
+    ``team.jury.on_unavailable`` allowed a host bench in its place, and it turns the jury
+    off because there is no panel to produce a verdict: leaving ``tier-3 auto`` standing
+    would require a ``jury-verdict`` artifact from a panel this machine just established
+    cannot convene, which is the tier stuck all over again one layer down. It is not the
+    flag route #1014 closed — a preference still cannot do this, and the reason string
+    names the fallback so nothing reads it as a plain ``--no-jury``.
+
+    ``panel_is_jury`` is a ``knobs.team`` tier whose review policy is ``jury``, and it
+    **outranks every per-run jury flag**. At such a tier the panel *is* the review: there
+    are no host reviewer slots, so a flag that turned the jury off or made it advisory
+    would leave that tier with no required review evidence at all — a stricter policy
+    producing a weaker gate. It is also the only answer the six commands that resolve this
+    contract can agree on, because they are not all *given* the flags: every surface
+    accepts them since #1043, but keel's CI passes ``--no-jury`` to ``evidence-verify`` on
+    every run and to ``ship``/``plan`` on none. So on a panel tier the verdict stays
+    required, whatever was typed; the flag is recorded in ``assignment.warnings`` instead
+    of applied. Below that
+    tier ``--no-jury`` keeps its pre-existing meaning and still beats the tier-3 auto-jury.
+
+    ``policy_mode`` is ``team.jury.mode``, which can make an enabled jury *advisory* — a
+    project cannot promote a jury that ``--no-jury`` turned off. Pairing it with a jury
+    *panel* is refused by :func:`keel.team.team_issues`, because "the panel is the review"
+    and "the panel does not gate" together mean the tier has no enforceable review at all.
+    ``minimum_vendors`` is ``team.jury.min_vendors``, which may raise
+    :data:`MINIMUM_JURY_VENDORS` but never lowers it (the schema's floor is 2).
+
     ``participating_vendors`` is the count of distinct vendors that actually took
     part in the panel. Below :data:`MINIMUM_JURY_VENDORS` a gating mode is
-    downgraded to advisory, because a panel that small cannot produce
-    cross-vendor consensus — and a run where no agent returned output is simply
-    zero, so "a jury that did not complete cleanly never gates" needs no separate
-    branch. ``None`` means the panel is not known yet (planning, ``keel plan``,
-    any caller resolving the contract before s8 runs), and leaves the mode alone.
+    downgraded to advisory **unless the panel is the tier's review**, because a
+    panel that small cannot produce cross-vendor consensus — and a run where no
+    agent returned output is simply zero, so "a jury that did not complete cleanly
+    never gates" needs no separate branch. ``None`` means the panel is not known
+    yet (planning, ``keel plan``, any caller resolving the contract before s8
+    runs), and leaves the mode alone.
 
     The downgrade must live here rather than in adapter prose: the evidence gate
     derives its ``jury-verdict`` requirement from this ``mode``, so a mode that
     ignores the real panel makes the gate demand a verdict the jury step would
     decline to treat as gating.
+
+    On a **panel tier** the downgrade is suppressed for the mirror-image reason.
+    There the verdict is not a second opinion beside a host bench — it is the
+    tier's own consensus record, and dropping it because the panel came back
+    short lets a short panel excuse itself from the one artifact that says so.
+    The short panel is still refused, by
+    :func:`keel.evidence.panel_vendor_check`; what it may not do is quietly stop
+    being required. ``downgraded`` reports ``False`` there, and the reason string
+    is left alone, so nothing downstream reads a relaxation that did not happen.
     """
-    if no_jury:
+    if panel_unavailable:
+        enabled = False
+        reason = "jury panel unavailable; host bench fallback (team.jury.on_unavailable)"
+    elif panel_is_jury:
+        enabled = True
+        reason = "team.review panel"
+        ignored = [
+            flag
+            for flag, passed in (("--no-jury", no_jury), ("--jury-advisory", jury_advisory))
+            if passed
+        ]
+        if ignored:
+            reason = f"{reason} ({' and '.join(ignored)} does not apply: the panel is the review)"
+    elif no_jury:
         enabled = False
         reason = "--no-jury"
     elif jury:
@@ -120,18 +199,29 @@ def resolve_jury(
     else:
         enabled = False
         reason = "default"
-    mode = "off" if not enabled else ("advisory" if jury_advisory else "gating")
+    # A panel tier gates, full stop: it has no host reviewers to fall back on, so an
+    # advisory panel there is a tier with nothing required of it.
+    advisory = not panel_is_jury and (jury_advisory or policy_mode == "advisory")
+    mode = "off" if not enabled else ("advisory" if advisory else "gating")
+    # …and the vendor downgrade is the same door, so it carries the same guard. Round 3
+    # of #1014 closed the flag route only; a panel tier reaching this with one
+    # participating vendor still came out advisory, which drops `jury-verdict` from the
+    # required evidence of a tier whose panel is the *whole* review. That is the short
+    # panel excusing itself from the verdict it came back short on. Elsewhere the
+    # downgrade is right and stays: a jury sitting beside a host bench that did not
+    # convene cross-vendor should not gate, because the bench still reviewed the change.
     downgraded = (
-        mode == "gating"
+        not panel_is_jury
+        and mode == "gating"
         and participating_vendors is not None
-        and participating_vendors < MINIMUM_JURY_VENDORS
+        and participating_vendors < minimum_vendors
     )
     if downgraded:
         mode = "advisory"
         reason = (
             f"{reason}; downgraded to advisory "
             f"({participating_vendors} participating vendor(s), "
-            f"minimum {MINIMUM_JURY_VENDORS})"
+            f"minimum {minimum_vendors})"
         )
     return {
         "enabled": enabled,
@@ -139,7 +229,7 @@ def resolve_jury(
         "reason": reason,
         "configured_gate": "jury" in gates,
         "fail_soft": True,
-        "minimum_vendors": MINIMUM_JURY_VENDORS,
+        "minimum_vendors": minimum_vendors,
         "participating_vendors": participating_vendors,
         "downgraded": downgraded,
         "verified_consensus_gates": enabled and mode == "gating",
@@ -152,6 +242,92 @@ def resolve_jury(
     }
 
 
+def panel_fell_back(assignment: dict[str, Any] | None) -> bool:
+    """Did a measured probe move this tier's review off the panel and onto a host bench?
+
+    Read off the resolved assignment rather than re-derived, so every surface that resolves
+    the review contract reaches the same answer from the same measurement (#1066). Total:
+    an assignment from before the block existed, or one with no availability recorded,
+    reads as "no fallback" — the answer that leaves the contract exactly as it was.
+    """
+    if not isinstance(assignment, dict):
+        return False
+    jury = assignment.get("jury")
+    availability = jury.get("availability") if isinstance(jury, dict) else None
+    if not isinstance(availability, dict):
+        return False
+    return availability.get("decision") == team_policy.JURY_ON_UNAVAILABLE[0]
+
+
+def check_reviewer_override(reviewer_override: int | None) -> None:
+    """Refuse a reviewer count keel has no reviewer vocabulary for.
+
+    Extracted so :func:`assess` can apply it **before** it resolves the team: the
+    assignment is resolved first, and an out-of-range override reaching that resolver
+    produced an ``IndexError`` from inside it instead of the documented ``ValueError``
+    the caller has always been able to catch.
+    """
+    if reviewer_override is not None and reviewer_override not in {1, 2, 3}:
+        raise ValueError("reviewer_override must be one of 1, 2, or 3")
+
+
+def _jury_panel_size(jury_record: dict[str, Any], panel_size: int | None) -> int:
+    """How many verdicts a jury-panel tier requires (#1015).
+
+    The panel *is* the review there, so its ballots are the required s7 verdicts —
+    ``keel review --from-jury`` posts one head-pinned verdict per ballot — and the
+    required count is the panel's own size, declared as ``panelists: <N>`` on the
+    posted jury verdict.
+
+    ``minimum_vendors`` is a **floor, not a fallback**: the answer is
+    ``max(declared, minimum_vendors)``, so a declared count can only ever *raise*
+    the requirement. Taking the declared count verbatim let a verdict lower it —
+    ``panelists: 1`` against a minimum of 2 asked for one ballot, while the
+    unmeasured cases (absent, ``0``, negative) still asked for two, so the one
+    shape that means "the panel came back short" was the one shape that relaxed
+    the gate. The declared count is attacker-adjacent evidence in exactly the way
+    the vendor count is: it is read off a comment, and it must not be able to
+    shrink what the tier owes.
+
+    **What this deliberately does not do is move the bench.** Neither a jury flag
+    nor the measured participating-vendor count may change *who reviews*, only
+    whether the panel's verdict gates. The bench is a pure function of config +
+    tier + role + ``--reviewers``/``--review-delegate`` (:func:`keel.team._review_seats`),
+    and for the same reason: the six commands that resolve this contract are not
+    *given* the other inputs uniformly. All six accept the jury flags since #1043,
+    but keel's CI passes ``--no-jury`` to ``evidence-verify`` on every run and to
+    ``ship``/``plan`` on none, and only the surfaces that can read the PR's posted
+    jury verdict — ``evidence-verify`` and ``keel merge`` — ever see a vendor
+    count. A bench that
+    moved with either input would have ``keel plan`` requiring the panel's ballots
+    while ``evidence-verify`` demanded a host bench of the same PR, which is the
+    contract disagreement #1014 exists to prevent, reintroduced along a new axis.
+
+    A short panel therefore does not buy fewer eyes: the ballots stay required in
+    full, the jury verdict stays required (:func:`resolve_jury` suppresses the
+    downgrade on a panel tier), and a panel that spans too few vendors is refused
+    by :func:`keel.evidence.panel_vendor_check` rather than quietly swapped for a
+    bench nobody dispatched.
+
+    **Why the planning surfaces publish the floor rather than the real count.**
+    ``keel plan`` is offline by construction and has no pull request to read a
+    verdict from. ``keel ship --pr N`` does have one — it already makes three
+    GitHub reads for CI status, and could make a fourth for the posted
+    ``panelists`` — and deliberately does not. Two reasons, both about keeping one
+    answer rather than two: the floor is *provably conservative* (this function
+    only ever raises, so a planning surface can under-state what will be required
+    and never over-state it), and ``keel ship`` without ``--pr``, and every dry
+    run, must resolve the same contract with no verdict in reach — so the floor
+    has to be right on its own regardless. Reading it only sometimes would buy a
+    number that is sharper on some runs and identical on the rest, at the cost of
+    a contract whose value depends on which flags the caller happened to pass.
+    """
+    floor = jury_record["minimum_vendors"]
+    if isinstance(panel_size, int) and panel_size > floor:
+        return panel_size
+    return floor
+
+
 def resolve_review_contract(
     *,
     tier: int | None,
@@ -162,20 +338,71 @@ def resolve_review_contract(
     jury: bool = False,
     no_jury: bool = False,
     jury_advisory: bool = False,
-    require_distinct_vendors: bool = False,
+    require_distinct_vendors: bool | None = None,
     jury_participating_vendors: int | None = None,
+    jury_panel_size: int | None = None,
+    assignment: dict[str, Any] | None = None,
+    learnings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Machine-readable review, jury, test, and merge-gate plan for ship-like flows."""
-    if reviewer_override is not None and reviewer_override not in {1, 2, 3}:
-        raise ValueError("reviewer_override must be one of 1, 2, or 3")
+    """Machine-readable review, jury, test, and merge-gate plan for ship-like flows.
+
+    ``assignment`` is the resolved ``knobs.team`` team (:func:`keel.team.resolve_assignment`).
+    When one is supplied it owns the reviewer bench — how many slots there are, who sits in
+    each, and whether the jury is the panel instead — so the contract a host executes and
+    the assignment it renders cannot disagree. Without one the tier-derived counts stand,
+    which is every pre-#1014 caller.
+
+    ``require_distinct_vendors`` is tri-state at the config boundary, but ``None`` — unset
+    — resolves to ``False`` on every tier (#1065): the independence claim is opt-in, and a
+    bool is the project's explicit answer.
+
+    ``jury_panel_size`` is the number of ballots a jury panel actually returned, which
+    only a run that has seen the panel can know (a posted jury verdict declares it; see
+    :func:`keel.evidence.jury_panel_size`). On a tier whose panel *is* the review it
+    becomes the required reviewer count, so the panel sizes its own bench (#1015).
+    """
+    check_reviewer_override(reviewer_override)
     if review_comments not in POSTING_MODES:
         raise ValueError("review_comments must be 'inline' or 'summary'")
-    count = reviewer_override if reviewer_override is not None else reviewer_count(tier or 2)
-    source = (
-        "override"
-        if reviewer_override is not None
-        else ("risk-tier" if tier is not None else "unresolved")
+    if assignment is None:
+        count = reviewer_override if reviewer_override is not None else reviewer_count(tier or 2)
+        source = (
+            "override"
+            if reviewer_override is not None
+            else ("risk-tier" if tier is not None else "unresolved")
+        )
+        panel, slots = "reviewers", []
+        panel_is_jury = False
+        panel_unavailable = False
+    else:
+        count = assignment["reviewer_count"]
+        source = assignment["reviewer_source"]
+        panel = assignment["review_panel"]
+        slots = list(assignment["reviewers"])
+        panel_is_jury = bool(assignment["jury"]["panel_is_review"])
+        panel_unavailable = panel_fell_back(assignment)
+    jury_record = resolve_jury(
+        tier=tier,
+        gates=gates,
+        jury=jury,
+        no_jury=no_jury,
+        jury_advisory=jury_advisory,
+        participating_vendors=jury_participating_vendors,
+        panel_is_jury=panel_is_jury,
+        policy_mode=None if assignment is None else assignment["jury"]["mode"],
+        minimum_vendors=(
+            MINIMUM_JURY_VENDORS if assignment is None else assignment["jury"]["min_vendors"]
+        ),
+        panel_unavailable=panel_unavailable,
     )
+    # The probe's verdict travels *on the contract*, not only in the assignment (#1066).
+    # `evidence-verify`, the ledger and the closure comment all read the contract, and a
+    # fallback that only the assignment recorded would be exactly the silent downgrade
+    # ai-jury #682 was opened for: a review that says nothing about the panel it replaced.
+    jury_record["panel_unavailable"] = panel_unavailable
+    jury_record["availability"] = None if assignment is None else assignment["jury"]["availability"]
+    if panel_is_jury:
+        count, source = _jury_panel_size(jury_record, jury_panel_size), "jury"
     pack = policy_pack or {}
     review_policy = pack.get("review", {}) if isinstance(pack.get("review", {}), dict) else {}
     return {
@@ -186,11 +413,27 @@ def resolve_review_contract(
             "independent": True,
             "self_review_counts_toward_lgtm": False,
             "minimum_lgtm": count,
-            "require_distinct_vendors": bool(require_distinct_vendors),
+            "require_distinct_vendors": team_policy.require_distinct_vendors(
+                require_distinct_vendors
+            ),
             "orchestrator_owns_writes": True,
-            "focuses": list(reviewer_focuses(count)),
+            "panel": panel,
+            # Per-slot provider/model/effort, so a host dispatches the configured vendor
+            # for slot B instead of running one vendor N times (#1014). Empty for every
+            # caller that resolves no team, which keeps the pre-#1014 contract intact.
+            "slots": slots,
+            # A panel picks its own coverage; keel's A/B/C focus slices describe a bench
+            # keel staffs, and handing them to ai-jury would be keel briefing reviewers it
+            # never dispatched.
+            "focuses": ([] if panel == team_policy.JURY_PANEL else list(reviewer_focuses(count))),
             "project_additions": list(review_policy.get("additions", [])),
             "required_sections": list(review_policy.get("required_sections", [])),
+            # The lessons this project already recorded about work of this shape
+            # (#1155), same shape as `project_additions` and for the same reason:
+            # a reviewer who is told what went wrong last time can check the
+            # implementation against it. Empty for every project with no
+            # learnings on disk, which is every project until it has some.
+            "past_learnings": list((learnings or {}).get("hits", [])),
         },
         "posting": {
             "mode": review_comments,
@@ -198,14 +441,7 @@ def resolve_review_contract(
             "per_reviewer_inline_fallback": "summary",
             "summary_mode": review_comments == "summary",
         },
-        "jury": resolve_jury(
-            tier=tier,
-            gates=gates,
-            jury=jury,
-            no_jury=no_jury,
-            jury_advisory=jury_advisory,
-            participating_vendors=jury_participating_vendors,
-        ),
+        "jury": jury_record,
         "finding_policy": {
             "critical": "block",
             "major": "block",
@@ -232,8 +468,8 @@ def resolve_review_contract(
             "merge_window_applies_to": "literal-merge-only",
             "merge_lock_scope": "literal-merge-only",
             "final_mergeability_recheck_inside_lock": True,
-            "hotfix_bypasses_window_only": True,
-            "hotfix_never_bypasses_findings_or_ci": True,
+            "hotfix_bypasses": list(HOTFIX_BYPASSES),
+            "hotfix_never_bypasses": list(HOTFIX_NEVER_BYPASSES),
             "pr_merged_state_authoritative": True,
         },
         "closeout": {
@@ -248,6 +484,53 @@ def resolve_review_contract(
 class MergeDecision:
     action: str  # "merge" | "defer" | "block"
     reason: str
+
+
+#: The built-in jury gate writes ``jury:<reviewer>`` (and ``jury:consensus`` /
+#: ``jury:incomplete-run`` / …) as a finding's source: one gate with several voices.
+_JURY_SOURCE_PREFIX = "jury:"
+
+
+def _gate_id(source: str) -> str:
+    """The gate a finding's ``source`` belongs to.
+
+    Command gates write their ``spec.id`` verbatim, and nothing forbids a colon in an
+    extension's id, so only the jury's own ``jury:`` prefix is collapsed — splitting
+    every source on ``:`` would turn an operator's ``sec:scan`` gate into ``sec``.
+    """
+    return "jury" if source.startswith(_JURY_SOURCE_PREFIX) else source
+
+
+def blocking_sources(verdict: Verdict) -> tuple[str, ...]:
+    """The distinct gates whose findings block this verdict, sorted.
+
+    Ship's verdict is built from gate outcomes, so a finding's ``source`` is the gate's
+    id, except for the jury's ``jury:<voice>`` sources, which :func:`_gate_id` folds
+    back to the one gate they belong to.
+    """
+    return tuple(
+        sorted(
+            {
+                _gate_id(finding.source)
+                for finding in verdict.findings
+                if finding.source and decision_for(finding.severity) == "block"
+            }
+        )
+    )
+
+
+def block_reason(verdict: Verdict) -> str:
+    """The reason a blocked verdict gives, naming what blocked it when it can.
+
+    "blocking findings present" is true and useless next to a reviewer verdict that says
+    "none blocking": the findings it means are the ones a failed ``on_fail: block`` gate
+    produced, and the line was the one place the operator looked that did not say which
+    gate (#1007). A verdict blocked with no attributable source keeps the old wording.
+    """
+    sources = blocking_sources(verdict)
+    if not sources:
+        return "blocking findings present"
+    return f"blocking findings from gate(s): {', '.join(sources)}"
 
 
 def decide_merge(
@@ -271,7 +554,7 @@ def decide_merge(
     ``keel merge`` will then refuse, with the operator given no reason why.
     """
     if verdict.blocked:
-        return MergeDecision("block", "blocking findings present")
+        return MergeDecision("block", block_reason(verdict))
     if unrun_blocking_gates:
         listed = ", ".join(unrun_blocking_gates)
         return MergeDecision(
@@ -375,6 +658,13 @@ class ShipAssessment:
     ci_ran: bool | None = None
     #: Declared ``knobs.ci_workflows`` that produced no check for this head.
     missing_workflows: tuple[str, ...] = ()
+    #: The resolved ``knobs.team`` assignment: who implements, gates, reviews, juries.
+    assignment: dict[str, Any] | None = None
+    #: What ``policy_pack.capture.learning.source`` retrieved for this task (#1155),
+    #: as :func:`keel.capture.learning_retrieval_as_dict` builds it. ``None`` for
+    #: every caller that measured nothing, which is not the same as a project whose
+    #: directory is empty — that one retrieves and finds no hits.
+    learnings: dict[str, Any] | None = None
 
 
 def assess(
@@ -402,6 +692,29 @@ def assess(
     jury: bool = False,
     no_jury: bool = False,
     jury_advisory: bool = False,
+    team: team_policy.TeamPolicy | None = None,
+    legacy_agents: dict[str, team_policy.Seat] | None = None,
+    role: str | None = None,
+    delegate: str | None = None,
+    review_delegates: Sequence[str] = (),
+    #: ``--team`` / ``--effort``: the bench this run is staffed from (#1017). Resolved
+    #: here as well as in ``cli._review_assignment`` because ``keel ship`` *replaces* the
+    #: planned assignment with this one once the real tier is known — dropping them here
+    #: published a ship contract whose team disagreed with the plan the operator read.
+    team_profile: str | None = None,
+    effort: str | None = None,
+    host_agent: str = team_policy.HOST_DEFAULT,
+    require_distinct_vendors: bool | None = None,
+    #: The s7 panel-availability probe (#1066), measured by
+    #: :func:`keel.providerprobe.jury_availability` and passed in for the same reason
+    #: ``team_profile``/``effort`` are: ``keel ship`` **replaces** the planned assignment
+    #: with this one once the real tier is known, so a measurement that stopped here would
+    #: publish a ship contract naming a panel the plan had already found unstaffable.
+    jury_availability: Mapping[str, Any] | None = None,
+    #: The retrieved past learnings for this task (#1155), measured in `cli` for the
+    #: same reason ``jury_availability`` is: reading a directory is I/O, and this
+    #: function is pure. ``None`` means nothing was retrieved *or attempted*.
+    learnings: Mapping[str, Any] | None = None,
 ) -> ShipAssessment:
     """The whole deterministic ship decision in one place: tier → reviewers, window,
     CI, and the final merge action. Pure — identical inputs give identical output.
@@ -432,7 +745,24 @@ def assess(
             patches=patches,
         )
     )
-    reviewers = reviewer_override if reviewer_override is not None else reviewer_count(tier)
+    check_reviewer_override(reviewer_override)
+    assignment = team_policy.resolve_assignment(
+        team if team is not None else team_policy.TeamPolicy(),
+        tier=tier,
+        role=role,
+        default_count=reviewer_count(tier),
+        reviewer_override=reviewer_override,
+        delegate=delegate,
+        review_delegates=review_delegates,
+        host_agent=host_agent,
+        legacy=legacy_agents,
+        jury_disabled=no_jury,
+        jury_advisory=jury_advisory,
+        team_profile=team_profile,
+        effort=effort,
+        jury_availability=jury_availability,
+    )
+    reviewers = assignment["reviewer_count"]
     window_open = (
         is_merge_open(timezone, merge_window, now=now) if (timezone and merge_window) else True
     )
@@ -472,6 +802,9 @@ def assess(
         jury=jury,
         no_jury=no_jury,
         jury_advisory=jury_advisory,
+        require_distinct_vendors=require_distinct_vendors,
+        assignment=assignment,
+        learnings=learnings,
     )
     return ShipAssessment(
         tier,
@@ -484,4 +817,6 @@ def assess(
         review_contract,
         ran,
         missing,
+        assignment,
+        None if learnings is None else dict(learnings),
     )

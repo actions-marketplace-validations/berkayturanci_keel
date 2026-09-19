@@ -21,7 +21,14 @@ def _config(
     if deny_patterns is not None:
         policy_pack["capture_redaction"] = {"deny_patterns": deny_patterns}
     if learning_policy is not None:
-        policy_pack["capture"] = {"learning": learning_policy}
+        # The parent pair too: `capture.enabled` is the project saying it runs a
+        # post-merge extension and `mode: extension` is the one mode with a content
+        # hook, so a learning policy without them is one nothing would honour.
+        policy_pack["capture"] = {
+            "enabled": True,
+            "mode": "extension",
+            "learning": learning_policy,
+        }
     return cfg.ProjectConfig(
         extends="keel",
         core_version="^0.7",
@@ -31,7 +38,7 @@ def _config(
     )
 
 
-def _record(*, config: cfg.ProjectConfig | None = None) -> dict:
+def _record(*, config: cfg.ProjectConfig | None = None, **extra) -> dict:
     outcome = SimpleNamespace(
         gate="build", ok=True, skipped=False, timed_out=False, error=None, findings=[]
     )
@@ -66,6 +73,7 @@ def _record(*, config: cfg.ProjectConfig | None = None) -> dict:
         implementer="codex:gpt-5",
         reviewer_agents=["reviewer-a:gpt-5", "reviewer-b:claude"],
         tester="tester:gpt-5-mini",
+        **extra,
     )
 
 
@@ -189,6 +197,36 @@ class TestLedgerRecords(unittest.TestCase):
         self.assertEqual(run_context["consent"]["status"], "approved")
         self.assertEqual(run_context["consent"]["scopes"], ["pr-merge", "label"])
 
+    def test_run_context_records_the_tdd_phases(self):
+        record = ledger.build_ship_run_record(
+            command="ship",
+            base_branch="main",
+            changed_files=["src/keel/tdd.py"],
+            outcomes=[],
+            verdict=SimpleNamespace(blocked=False, counts={}),
+            assessment=SimpleNamespace(
+                tier=2,
+                reviewers=2,
+                window_open=True,
+                ci_ok=None,
+                merge=SimpleNamespace(action="merge", reason="ok"),
+                halted=False,
+                bypassed_window=False,
+            ),
+            implement_mode="tdd",
+            implement_phases=[
+                {"phase": "tests", "commit": "a" * 40},
+                {"phase": "implementation", "commit": "b" * 40},
+            ],
+        )
+
+        run_context = record["run_context"]
+        self.assertEqual(run_context["implement_mode"], "tdd")
+        self.assertEqual(
+            [phase["phase"] for phase in run_context["implement_phases"]],
+            ["tests", "implementation"],
+        )
+
     def test_run_context_block_is_optional_and_degrades(self):
         # The default fixture passes none of the run-context inputs.
         run_context = _record()["run_context"]
@@ -196,6 +234,10 @@ class TestLedgerRecords(unittest.TestCase):
         self.assertIsNone(run_context["transport"])
         self.assertIsNone(run_context["profile"])
         self.assertIsNone(run_context["jury_mode"])
+        # A `default` run records no mode and no phases, so a record written before the
+        # knob existed reads exactly like one written by a run that did not use it.
+        self.assertIsNone(run_context["implement_mode"])
+        self.assertEqual(run_context["implement_phases"], [])
         self.assertIsNone(run_context["consent"]["status"])
         self.assertEqual(run_context["consent"]["scopes"], [])
 
@@ -684,8 +726,8 @@ class TestRecordGatesPassed(unittest.TestCase):
         self.assertFalse(ledger.record_gates_passed(malformed))
 
 
-def _marker_record(*, pr, run_id="RUN-1", marker="keel-capture:1"):
-    record = _gates_record(pr=pr, head_sha="a", run_id=run_id)
+def _marker_record(*, pr, run_id="RUN-1", marker="keel-capture:1", head_sha="a"):
+    record = _gates_record(pr=pr, head_sha=head_sha, run_id=run_id)
     if marker is not None:
         record["capture"] = {"marker": marker, "status": "applied"}
     return record
@@ -709,6 +751,89 @@ class TestExistingCaptureMarker(unittest.TestCase):
     def test_a_different_pr_is_not_a_duplicate(self):
         existing = _marker_record(pr=7)
         self.assertIsNone(ledger.existing_capture_marker([existing], _marker_record(pr=8)))
+
+    def test_a_new_head_is_not_a_duplicate(self):
+        """#1157: keyed by pull request alone, a red first run bricked the PR.
+
+        `gates_pass_for_head` asks for a passing record on the *current* head.
+        Refusing every later head's append meant no run could ever write one, so
+        a pull request whose first ship run failed became permanently unmergeable
+        — and `existing_capture_marker`'s own docstring said the only exit was
+        editing an append-only audit ledger to make a gate pass.
+        """
+        red = _marker_record(pr=7, run_id="RUN-1", head_sha="48681d19")
+        green = _marker_record(pr=7, run_id="RUN-2", head_sha="eed4f81a")
+        self.assertIsNone(ledger.existing_capture_marker([red], green))
+
+    def test_the_same_head_is_still_a_duplicate(self):
+        """The case the check exists for: the natural retry after a crash mid-s11."""
+        first = _marker_record(pr=7, run_id="RUN-1", head_sha="eed4f81a")
+        again = _marker_record(pr=7, run_id="RUN-2", head_sha="eed4f81a")
+        clash = ledger.existing_capture_marker([first], again)
+        self.assertIsNotNone(clash)
+        self.assertEqual(clash["run_id"], "RUN-1")
+
+    def test_records_naming_no_head_are_compared_to_each_other(self):
+        """The rule applied to the value they have, not an exemption from it."""
+        first = _marker_record(pr=7, run_id="RUN-1")
+        second = _marker_record(pr=7, run_id="RUN-2")
+        for record in (first, second):
+            record["git"].pop("head_sha", None)
+        self.assertIsNotNone(ledger.existing_capture_marker([first], second))
+        headed = _marker_record(pr=7, run_id="RUN-3", head_sha="eed4f81a")
+        self.assertIsNone(ledger.existing_capture_marker([first], headed))
+
+    def test_capture_health_counts_pull_requests_not_rows(self):
+        """#1157 let one pull request leave two marked records; one capture stays one.
+
+        The writer's clash is keyed by (pull request, head) now, so a superseded
+        head's marker survives beside the merged head's. Counting rows reported
+        `applied: 1, skipped: 1` for a single capture in morning, wrap and status.
+        """
+
+        def merged(head, marker, status):
+            record = _gates_record(pr=168, head_sha=head, run_id=f"RUN-{head}")
+            record["capture"] = {"marker": marker, "status": status}
+            record["assessment"] = {"merge": {"action": "merge"}}
+            return record
+
+        pair = [
+            merged("48681d19", "compound-learning: pr=168 status=skipped:no-policy", "skipped"),
+            merged("eed4f81a", "compound-learning: pr=168 status=applied", "applied"),
+        ]
+
+        summary = ledger.capture_health_summary(pair)
+
+        self.assertEqual(summary["record_count"], 1)
+        self.assertEqual(summary["counts"]["applied"], 1)
+        self.assertEqual(summary["counts"]["skipped"], 0)
+
+    def test_capture_health_keeps_records_that_name_no_pull_request(self):
+        """Deduping by pull request must not drop the rows that have none."""
+        record = _gates_record(pr=168, head_sha="a", run_id="RUN-1")
+        record["capture"] = {
+            "marker": "compound-learning: pr=168 status=applied",
+            "status": "applied",
+        }
+        record["assessment"] = {"merge": {"action": "merge"}}
+        unkeyed = {**record, "pull_request": None}
+
+        summary = ledger.capture_health_summary([record, unkeyed])
+
+        self.assertEqual(summary["record_count"], 2)
+
+    def test_the_deadlock_end_to_end(self):
+        """Writer and merge gate agree again — the whole of #1157, in one place."""
+        red = _marker_record(pr=7, run_id="RUN-1", head_sha="48681d19")
+        red["gates"] = [{"name": "jury", "ok": False, "skipped": False}]
+        green = _marker_record(pr=7, run_id="RUN-2", head_sha="eed4f81a")
+
+        self.assertIsNone(ledger.existing_capture_marker([red], green))
+        records = [red, green]
+        passed, record = ledger.gates_pass_for_head(records, 7, "eed4f81a")
+        self.assertTrue(passed)
+        self.assertEqual(record["run_id"], "RUN-2")
+        self.assertFalse(ledger.gates_pass_for_head(records, 7, "48681d19")[0])
 
     def test_a_record_carrying_no_marker_never_clashes(self):
         existing = _marker_record(pr=7)
@@ -750,6 +875,29 @@ class TestGatesPassForHead(unittest.TestCase):
         matched, record = ledger.gates_pass_for_head(records, 42, "head-new")
         self.assertTrue(matched)
         self.assertEqual(record["run_id"], "RUN-2")
+
+    def test_a_gates_pass_for_a_covered_head_counts(self):
+        # #1203: the gates ran on `reviewed`, then the learning landed on the branch.
+        records = [_gates_record(pr=42, head_sha="reviewed", run_id="RUN-7")]
+        matched, record = ledger.gates_pass_for_head(
+            records, 42, "with-lesson", covered_heads=("reviewed",)
+        )
+        self.assertTrue(matched)
+        self.assertEqual(record["run_id"], "RUN-7")
+        # And without the proof it is the stale head it always was.
+        self.assertEqual(ledger.gates_pass_for_head(records, 42, "with-lesson"), (False, None))
+
+    def test_latest_wins_across_the_whole_covered_set(self):
+        # A red record for any covered head, after a green one, is the verdict. Scanning
+        # the set for *a* green would reopen the fail-open latest-wins exists to close.
+        green = _gates_record(pr=42, head_sha="reviewed", run_id="RUN-1")
+        red = _gates_record(pr=42, head_sha="with-lesson", run_id="RUN-2")
+        red["verdict"] = {"decision": "BLOCK"}
+        red["gates"] = [{"name": "build", "status": "error"}]
+        matched, _ = ledger.gates_pass_for_head(
+            [green, red], 42, "with-lesson", covered_heads=("reviewed",)
+        )
+        self.assertFalse(matched)
 
     def test_stale_head_does_not_match(self):
         records = [_gates_record(pr=42, head_sha="head-old")]
@@ -807,3 +955,29 @@ class TestGatesPassForHead(unittest.TestCase):
         matched, record = ledger.gates_pass_for_head(records, 42, "head-new")
         self.assertTrue(matched)
         self.assertEqual(record["run_id"], "RUN-1")
+
+
+class TestImplementLoopRecord(unittest.TestCase):
+    """``run_context.implement_loop`` (#1165): the policy and one entry per iteration."""
+
+    def test_a_run_without_a_loop_records_none(self):
+        self.assertIsNone(_record()["run_context"]["implement_loop"])
+
+    def test_a_looped_run_records_the_block_as_given(self):
+        block = {
+            "enabled": True,
+            "max_iterations": 3,
+            "wraps": "implement",
+            "source": "knobs.loop",
+            "iterations": [
+                {"iteration": 1, "commit": "a" * 40, "gates_ok": False, "implementer": "claude"},
+                {"iteration": 2, "commit": "b" * 40, "gates_ok": True, "implementer": "claude"},
+            ],
+        }
+        record = _record(implement_loop=block)
+        self.assertEqual(record["run_context"]["implement_loop"], block)
+        # A copy, not the caller's object.
+        self.assertIsNot(record["run_context"]["implement_loop"], block)
+
+    def test_a_non_mapping_block_degrades_to_none(self):
+        self.assertIsNone(_record(implement_loop="loop")["run_context"]["implement_loop"])

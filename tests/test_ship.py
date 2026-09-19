@@ -2,7 +2,8 @@
 
 import unittest
 
-from keel import classify, evidence, ship
+from keel import classify, evidence, ship, tdd
+from keel import team as team_policy
 from keel.findings import Finding, summarize
 
 CLEAN = summarize([])
@@ -273,7 +274,56 @@ class TestAssess(unittest.TestCase):
             changed_files=["x.py"], gate_verdict=BLOCKED, unrun_blocking_gates=("security-review",)
         )
         self.assertEqual(blocked.merge.action, "block")
-        self.assertEqual(blocked.merge.reason, "blocking findings present")
+        self.assertEqual(blocked.merge.reason, "blocking findings from gate(s): a")
+
+    def test_the_block_reason_names_the_gates_whose_findings_block(self):
+        # "blocking findings present" next to a reviewer's "none blocking" read as a
+        # contradiction (#1007): the findings were a failed lint gate's, and the one
+        # line the operator reads did not say so.
+        verdict = summarize(
+            [
+                Finding("major", "gate 'lint' failed", "lint"),
+                Finding("critical", "gate 'build' failed", "build"),
+                Finding("major", "again", "lint"),  # deduplicated
+                Finding("minor", "style", "bandit"),  # not blocking: not named
+            ]
+        )
+        self.assertEqual(ship.blocking_sources(verdict), ("build", "lint"))
+        self.assertEqual(
+            ship.decide_merge(verdict, window_open=True).reason,
+            "blocking findings from gate(s): build, lint",
+        )
+
+    def test_jury_findings_name_the_jury_gate_once_not_each_reviewer(self):
+        # The built-in jury gate writes `jury:<reviewer>` and `jury:consensus` as the
+        # source (src/keel/jury.py). One gate with several voices must not render as
+        # three failed gates — the gate is what the operator can act on.
+        verdict = summarize(
+            [
+                Finding("major", "reviewer a: boom", "jury:reviewer-a"),
+                Finding("critical", "reviewer b: boom", "jury:reviewer-b"),
+                Finding("major", "consensus: boom", "jury:consensus"),
+                Finding("major", "gate 'lint' failed", "lint"),
+            ]
+        )
+        self.assertEqual(ship.blocking_sources(verdict), ("jury", "lint"))
+        self.assertEqual(ship.block_reason(verdict), "blocking findings from gate(s): jury, lint")
+
+    def test_a_colon_in_an_extension_gate_id_is_kept_whole(self):
+        # Nothing validates extension ids beyond non-empty, so `sec:scan` is a legal
+        # blocking gate; splitting every source on ':' would name a gate `sec` that
+        # does not exist (narrowed review of #1008).
+        verdict = summarize([Finding("major", "gate 'sec:scan' failed", "sec:scan")])
+        self.assertEqual(ship.blocking_sources(verdict), ("sec:scan",))
+
+    def test_a_blocked_verdict_with_no_attributable_source_keeps_the_old_reason(self):
+        verdict = summarize([Finding("major", "boom", "")])
+        self.assertTrue(verdict.blocked)
+        self.assertEqual(ship.blocking_sources(verdict), ())
+        self.assertEqual(ship.block_reason(verdict), "blocking findings present")
+
+    def test_a_clean_verdict_has_no_blocking_sources(self):
+        self.assertEqual(ship.blocking_sources(SOFT), ())
 
     def test_docs_only_tier1(self):
         a = ship.assess(
@@ -628,6 +678,359 @@ class TestAssessTierReadsTheDiff(unittest.TestCase):
             [self.WORKFLOW], tier3_globs=self.GLOBS, patches=patches
         )
         self.assertEqual(self._tier(patches), gate_tier)
+
+
+TEAM = team_policy.parse_team(
+    {
+        "implement": {"by_role": {"core": {"provider": "agy", "model": "gemini-3.8-flash-high"}}},
+        "gate": {"provider": "codex", "distinct_from": "implementer"},
+        "review": {
+            "by_tier": {
+                "2": [{"provider": "claude"}, {"provider": "codex"}],
+                "3": "jury",
+            }
+        },
+        "jury": {"mode": "gating", "min_vendors": 3},
+    }
+)
+
+
+class TestTeamAssignment(unittest.TestCase):
+    """The resolved `knobs.team` team and the review contract must agree (#1014)."""
+
+    def _assignment(self, tier, *, no_jury=False, jury_advisory=False, **kwargs):
+        return team_policy.resolve_assignment(
+            TEAM,
+            tier=tier,
+            default_count=ship.reviewer_count(tier),
+            jury_disabled=no_jury,
+            jury_advisory=jury_advisory,
+            **kwargs,
+        )
+
+    def test_the_contract_takes_its_bench_from_the_assignment(self):
+        assignment = self._assignment(2, role="core")
+
+        contract = ship.resolve_review_contract(tier=2, assignment=assignment)
+
+        reviewers = contract["reviewers"]
+        self.assertEqual(reviewers["count"], 2)
+        self.assertEqual(reviewers["panel"], "reviewers")
+        self.assertEqual(reviewers["source"], "team.review.by_tier.2")
+        self.assertEqual([slot["provider"] for slot in reviewers["slots"]], ["claude", "codex"])
+        self.assertEqual(
+            [slot["slot"] for slot in reviewers["slots"]],
+            [focus["slot"] for focus in reviewers["focuses"]],
+        )
+
+    def test_a_jury_tier_leaves_no_host_reviewers_and_gates_on_the_panel(self):
+        contract = ship.resolve_review_contract(tier=3, assignment=self._assignment(3))
+
+        # No host reviewer is staffed — but the panel's ballots are the required
+        # verdicts (#1015), and until the panel has declared its size the count
+        # rests on the jury's minimum vendor floor rather than on nothing.
+        self.assertEqual(contract["reviewers"]["count"], 3)
+        self.assertEqual(contract["reviewers"]["source"], "jury")
+        self.assertEqual(contract["reviewers"]["panel"], "jury")
+        self.assertEqual(contract["reviewers"]["slots"], [])
+        self.assertEqual(contract["reviewers"]["focuses"], [])
+        self.assertEqual(contract["reviewers"]["minimum_lgtm"], 3)
+        self.assertEqual(contract["jury"]["mode"], "gating")
+        self.assertTrue(contract["jury"]["enabled"])
+        self.assertEqual(contract["jury"]["reason"], "team.review panel")
+        self.assertEqual(contract["jury"]["minimum_vendors"], 3)
+
+    def test_the_panel_that_ran_sizes_the_bench_it_has_to_fill(self):
+        """A declared panel size is the required verdict count (#1015)."""
+        contract = ship.resolve_review_contract(
+            tier=3, assignment=self._assignment(3), jury_panel_size=4
+        )
+
+        self.assertEqual(contract["reviewers"]["count"], 4)
+        self.assertEqual(contract["reviewers"]["minimum_lgtm"], 4)
+        self.assertEqual(contract["reviewers"]["panel"], "jury")
+        # keel's A/B/C focus slices brief a bench keel staffs; a panel picks its own.
+        self.assertEqual(contract["reviewers"]["focuses"], [])
+
+    def test_a_panel_size_of_zero_falls_back_to_the_floor(self):
+        """Zero ballots is not zero requirements: an unmeasured panel fails closed."""
+        contract = ship.resolve_review_contract(
+            tier=3, assignment=self._assignment(3), jury_panel_size=0
+        )
+
+        self.assertEqual(contract["reviewers"]["count"], 3)
+
+    def test_the_declared_count_may_raise_the_requirement_but_never_lower_it(self):
+        """`min_vendors` is a floor, not a fallback.
+
+        Taking the declared count verbatim let a verdict *shrink* what the tier
+        owes: with a minimum of 3, `panelists: 1` asked for one ballot while the
+        unmeasured cases (absent, 0, negative) asked for three — so the one shape
+        that means "the panel came back short" was the one shape that relaxed the
+        gate. The count is read off a PR comment; it may only raise.
+        """
+        for declared, expected in ((None, 3), (0, 3), (-1, 3), (1, 3), (2, 3), (3, 3), (4, 4)):
+            with self.subTest(panelists=declared):
+                contract = ship.resolve_review_contract(
+                    tier=3, assignment=self._assignment(3), jury_panel_size=declared
+                )
+
+                self.assertEqual(contract["reviewers"]["count"], expected)
+
+    def test_the_floor_is_the_projects_own_minimum(self):
+        """A project that has not raised `min_vendors` keeps the schema floor of 2."""
+        policy = team_policy.parse_team({"review": {"by_tier": {"3": "jury"}}})
+        assignment = team_policy.resolve_assignment(policy, tier=3, default_count=3)
+
+        for declared, expected in ((1, 2), (3, 3)):
+            with self.subTest(panelists=declared):
+                contract = ship.resolve_review_contract(
+                    tier=3, assignment=assignment, jury_panel_size=declared
+                )
+
+                self.assertEqual(contract["reviewers"]["count"], expected)
+
+    def test_a_short_panel_changes_neither_the_bench_nor_the_gating(self):
+        """A vendor count below the minimum relaxes nothing on a panel tier.
+
+        Two independent claims, both asserted below. The **bench** does not move:
+        only the surfaces that can read the PR's posted jury verdict ever see a
+        vendor count, so a bench that followed it would have `keel plan` requiring
+        the panel's ballots while `evidence-verify` demanded a host bench of the
+        same PR — the contract disagreement #1014 exists to prevent, along a new
+        axis. The **verdict** does not stop gating either (`downgraded` is False),
+        because a panel tier has no bench behind it and a short panel may not
+        excuse itself from the consensus record that says it was short; the
+        sibling test below pins that rule on its own, and `panel_vendor_check` is
+        what reports the shortfall.
+        """
+        contract = ship.resolve_review_contract(
+            tier=3,
+            assignment=self._assignment(3),
+            jury_participating_vendors=1,
+            jury_panel_size=3,
+        )
+
+        self.assertFalse(contract["jury"]["downgraded"])
+        self.assertEqual(contract["jury"]["mode"], "gating")
+        self.assertEqual(contract["reviewers"]["panel"], "jury")
+        self.assertEqual(contract["reviewers"]["source"], "jury")
+        self.assertEqual(contract["reviewers"]["count"], 3)
+        self.assertEqual(contract["reviewers"]["slots"], [])
+
+    def test_a_panel_tier_never_downgrades_its_own_verdict_away(self):
+        """A short panel may not excuse itself from the verdict that says so.
+
+        #1014's round 3 guarded the *flag* route into advisory; the vendor-count
+        route was still open. On a tier whose panel is the whole review that
+        dropped `jury-verdict` from the required evidence precisely when the panel
+        came back short — the one run where the consensus record matters most.
+        The short panel is still refused, by `evidence.panel_vendor_check`; what
+        it may not do is quietly stop being required.
+        """
+        for vendors in (0, 1):
+            with self.subTest(participating_vendors=vendors):
+                contract = ship.resolve_review_contract(
+                    tier=3,
+                    assignment=self._assignment(3),
+                    jury_participating_vendors=vendors,
+                )
+
+                self.assertTrue(contract["jury"]["enabled"])
+                self.assertEqual(contract["jury"]["mode"], "gating")
+                self.assertFalse(contract["jury"]["downgraded"])
+                self.assertNotIn("downgraded", contract["jury"]["reason"])
+                required = [
+                    item.id
+                    for item in evidence.required_items(contract, phase=evidence.PHASE_PRE_MERGE)
+                ]
+                self.assertIn("jury-verdict", required)
+
+    def test_a_jury_beside_a_host_bench_still_downgrades(self):
+        """The downgrade is right where a bench reviewed the change as well."""
+        contract = ship.resolve_review_contract(tier=3, jury_participating_vendors=1)
+
+        self.assertTrue(contract["jury"]["downgraded"])
+        self.assertEqual(contract["jury"]["mode"], "advisory")
+        self.assertEqual(contract["reviewers"]["count"], 3)
+
+    def test_the_panel_enables_the_jury_below_tier_three(self):
+        policy = team_policy.parse_team({"review": {"by_tier": {"2": "jury"}}})
+        assignment = team_policy.resolve_assignment(policy, tier=2, default_count=2)
+
+        contract = ship.resolve_review_contract(tier=2, assignment=assignment)
+
+        self.assertTrue(contract["jury"]["enabled"])
+        self.assertEqual(contract["jury"]["reason"], "team.review panel")
+
+    def test_the_panel_outranks_every_per_run_jury_flag(self):
+        """At a jury tier the panel *is* the review, so no flag may remove it.
+
+        There are no host reviewer slots to fall back on, so `--no-jury` or
+        `--jury-advisory` there would leave the tier with no required review evidence at
+        all — a stricter policy producing a weaker gate. It is also the only answer the
+        six commands resolving this contract can agree on: `keel review` has no
+        `--no-jury`, and keel's CI passes it to `evidence-verify` and to nothing else.
+        """
+        for flags in (
+            {"no_jury": True},
+            {"jury_advisory": True},
+            {"no_jury": True, "jury_advisory": True},
+        ):
+            with self.subTest(**flags):
+                contract = ship.resolve_review_contract(
+                    tier=3, assignment=self._assignment(3, **flags), **flags
+                )
+
+                self.assertTrue(contract["jury"]["enabled"])
+                self.assertEqual(contract["jury"]["mode"], "gating")
+                # The panel's own ballots are the required verdicts (#1015); before a
+                # posted verdict declares the panel size that is the min_vendors floor.
+                self.assertEqual(contract["reviewers"]["count"], 3)
+                self.assertEqual(contract["reviewers"]["source"], "jury")
+                self.assertIn("does not apply", contract["jury"]["reason"])
+
+    def test_no_jury_keeps_its_meaning_below_a_panel_tier(self):
+        contract = ship.resolve_review_contract(
+            tier=3, assignment=self._assignment(3), no_jury=True
+        )
+        plain = ship.resolve_review_contract(tier=3, no_jury=True)
+
+        # The fixture's tier-3 *is* a panel, so the flag is recorded, not applied…
+        self.assertEqual(contract["jury"]["mode"], "gating")
+        # …while a project without a jury panel keeps the documented precedence.
+        self.assertFalse(plain["jury"]["enabled"])
+        self.assertEqual(plain["jury"]["mode"], "off")
+
+    def test_the_policy_can_soften_a_jury_it_did_not_make_the_panel(self):
+        policy = team_policy.parse_team({"jury": {"mode": "advisory"}})
+        assignment = team_policy.resolve_assignment(policy, tier=3, default_count=3)
+
+        contract = ship.resolve_review_contract(tier=3, assignment=assignment)
+
+        # Tier-3 auto-enables the jury; the project's own mode makes it report-only.
+        self.assertTrue(contract["jury"]["enabled"])
+        self.assertEqual(contract["jury"]["mode"], "advisory")
+        # …and the bench is untouched: there are still three host reviewers behind it.
+        self.assertEqual(contract["reviewers"]["count"], 3)
+
+    def test_a_jury_flag_never_resizes_the_panels_requirement(self):
+        """`--no-jury` / `--jury-advisory` are recorded upstream, never applied here."""
+        base = ship.resolve_review_contract(
+            tier=3, assignment=self._assignment(3), jury_panel_size=4
+        )
+
+        for flags in ({"no_jury": True}, {"jury_advisory": True}, {"jury": True}):
+            with self.subTest(flags=flags):
+                contract = ship.resolve_review_contract(
+                    tier=3, assignment=self._assignment(3), jury_panel_size=4, **flags
+                )
+                self.assertEqual(contract["reviewers"], base["reviewers"])
+
+    def test_distinct_vendors_is_off_on_every_tier_when_unset(self):
+        """Opt-in (#1065), replacing `test_distinct_vendors_defaults_on_from_tier_two`.
+
+        That test asserted the tier-derived default — `(2, True), (3, True)` — which is the
+        behaviour this change removes, so the rows had to move rather than be dropped: the
+        same four tiers are still exercised, and the expectation on each is now `False`.
+        """
+        for tier in (1, 2, 3, None):
+            with self.subTest(tier=tier):
+                contract = ship.resolve_review_contract(tier=tier)
+                self.assertIs(contract["reviewers"]["require_distinct_vendors"], False)
+
+    def test_an_explicit_setting_is_honoured_on_every_tier(self):
+        for tier in (1, 2, 3, None):
+            with self.subTest(tier=tier):
+                off = ship.resolve_review_contract(tier=tier, require_distinct_vendors=False)
+                on = ship.resolve_review_contract(tier=tier, require_distinct_vendors=True)
+                self.assertIs(off["reviewers"]["require_distinct_vendors"], False)
+                self.assertIs(on["reviewers"]["require_distinct_vendors"], True)
+
+    def test_assess_resolves_the_assignment_against_the_classified_tier(self):
+        assessment = ship.assess(
+            changed_files=["src/keel/orchestrator.py"],
+            gate_verdict=CLEAN,
+            tier3_globs=("src/keel/orchestrator.py",),
+            ci_conclusion="SUCCESS",
+            team=TEAM,
+            role="core",
+            legacy_agents={"core": team_policy.Seat(provider="subagent:backend-developer")},
+        )
+
+        self.assertEqual(assessment.tier, 3)
+        self.assertEqual(assessment.reviewers, 0)
+        self.assertEqual(assessment.assignment["review_panel"], "jury")
+        self.assertEqual(assessment.assignment["implementer"]["provider"], "agy")
+        self.assertTrue(assessment.assignment["gate"]["distinct_ok"])
+        # This fixture names no `evidence_require_distinct_vendors`, so the assertion here
+        # was `assertTrue` only because TIER-3 used to derive it (#1065). The knob is opt-in
+        # now, and an unset knob is `false` even on the tier whose panel *is* the jury —
+        # the coupled rule was considered and left to the availability probe in #1066.
+        self.assertIs(assessment.review_contract["reviewers"]["require_distinct_vendors"], False)
+
+    def test_an_out_of_range_override_raises_before_the_team_is_resolved(self):
+        """The documented ValueError, not an IndexError from inside the resolver.
+
+        `assess` resolves the assignment first, so the range guard has to run ahead of it
+        — a caller catching `ValueError` for a bad `--reviewers` was getting an
+        `IndexError` out of the slot labelling instead.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            ship.assess(changed_files=["a.py"], gate_verdict=CLEAN, reviewer_override=5, team=TEAM)
+
+        self.assertIn("must be one of 1, 2, or 3", str(ctx.exception))
+
+    def test_assess_without_a_team_keeps_the_tier_derived_bench(self):
+        assessment = ship.assess(
+            changed_files=["README.md"],
+            gate_verdict=CLEAN,
+            ci_conclusion="SUCCESS",
+            docs_globs=("*.md",),
+        )
+
+        self.assertEqual(assessment.reviewers, 1)
+        self.assertFalse(assessment.assignment["configured"])
+        self.assertEqual(assessment.assignment["implementer"]["provider"], "claude")
+
+
+class TestTddOrderBlocksTheMerge(unittest.TestCase):
+    """The `tdd-order` gate is a gate: its finding reaches the merge decision (#1020).
+
+    `implement_mode: tdd` adds one blocking gate at s8 and changes nothing else about
+    the backbone — so the assessment must treat its finding exactly as it treats a
+    failing build, and must not treat the mode itself as a reason to decide differently.
+    """
+
+    def _assess(self, verdict):
+        return ship.assess(
+            changed_files=["src/keel/tdd.py", "tests/test_tdd.py"],
+            gate_verdict=verdict,
+            ci_conclusion="success",
+        )
+
+    def test_a_failing_tdd_order_gate_blocks(self):
+        blocked = summarize(
+            [Finding("major", "the first commit touches implementation paths", tdd.GATE_ID)]
+        )
+        assessment = self._assess(blocked)
+        self.assertEqual(assessment.merge.action, "block")
+        self.assertIn(tdd.GATE_ID, ship.blocking_sources(blocked))
+
+    def test_a_passing_tdd_order_gate_leaves_the_decision_alone(self):
+        assessment = self._assess(CLEAN)
+        self.assertEqual(assessment.merge.action, "merge")
+
+    def test_an_unrun_tdd_order_gate_is_never_a_clear_merge(self):
+        # `on_fail: block`, so a run that never executed it has produced no verdict —
+        # the same fail-closed rule every other blocking gate gets.
+        assessment = ship.assess(
+            changed_files=["src/keel/tdd.py"],
+            gate_verdict=CLEAN,
+            ci_conclusion="success",
+            unrun_blocking_gates=(tdd.GATE_ID,),
+        )
+        self.assertEqual(assessment.merge.action, "block")
 
 
 if __name__ == "__main__":

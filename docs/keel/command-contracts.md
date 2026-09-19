@@ -43,6 +43,7 @@ Every contract includes:
 | `mode` / `dry_run` / `no_mutations` | Whether this record represents a non-mutating rehearsal. |
 | `project` | Resolved project config summary plus stable `config_hash`. |
 | `workflow_profile` | Command profile metadata. `ship` is `standard` by default; `keel ship --compound` (`--profile compound`) selects a first-class `compound` profile that inherits the shared ship primitives and declares step overrides. |
+| `implement_mode` | The resolved s4 profile (`mode`: `default` \| `tdd`, its `source`, `phases`, `gate`) and, beside it, the s4 iteration loop as `loop` — `{enabled, max_iterations, gate_output_max_bytes, source, wraps}`, resolved from `knobs.loop`, `--loop` and `--max-iterations` (`wraps` is `implementation` under `tdd`, else `implement`). A project with neither knob publishes `mode: default` and `loop.enabled: false`; the ledger's `run_context.implement_loop` then records `max_iterations: null`, because a policy that is off bounded nothing. |
 | `graph` | Command step graph. `ship` (both profiles) uses the fixed backbone steps; other adapters expose their command-local steps; project commands expose a single `project_command` graph entry. |
 | `backbone_plan` | Fixed keel backbone with gates, add-only extension slots, and loaded hooks slotted onto steps. |
 | `gates` | Planned gate specs, including kind, phase, failure behavior, source, and capability declarations. |
@@ -60,6 +61,7 @@ Every contract includes:
 | `closure_comment` | Present for `ship` (both profiles); the deterministic, consumer-neutral closure-comment contract describing how the s11 ship-outcome comment is rendered from the `ship_run` ledger record. |
 | `evidence` | Present for `ship` (both profiles); the pre-merge evidence contract used by `keel evidence-verify`. The gate is armed by deterministic ship provenance (ship-style branch, review marker, trusted `keel ship` assessment comment, ship-run ledger record, or the legacy `evidence_gate_label`), and only an operator waiver label disarms it. Assessment comments arm the gate but are not accepted as evidence. The contract carries an `enforced` flag and, when not enforced for a hand-authored PR, an empty `required` set. When enforced it is fail-closed. |
 | `step_verification` | Present for `ship` (both profiles); the fail-closed step completion contract that maps required public evidence onto backbone steps and defines the structured handoff object every successful step must produce. |
+| `assignment` | The reviewer bench is a pure function of config + tier + role + `--reviewers` + `--review-delegate`; the jury flags never move it, and one that is ignored on a jury-panel tier is reported in `warnings`. Present for ship-like commands (`ship`, `pr-loop`, `review-cycle`, `work-block`, `overnight`); the resolved `knobs.team` team for this run — `implementer`, `gate`, `reviewers[]` (per-slot `provider`/`model`/`effort`), `review_panel`, `jury`, `fix`, and `warnings`. Resolved once and shared with `review_merge_contract.reviewers.slots`, so the bench a host dispatches and the contract it publishes cannot disagree. `keel ship` re-resolves it against the tier classified from the real diff. Since #1017 the block also always carries five more keys, present on every resolution rather than only when staffing is configured: `lead` (the seat coordinating a batch; the host agent when `knobs.team.lead` is unset), `effort` (the implementer seat's effective reasoning effort), `difficulty` (the band this was resolved for, `null` outside a swarm plan), `team_profile` (the `--team` name, `null` when none), and `bench` (config paths of the `knobs.team` benches that applied, `[]` when none). A reader can therefore always ask "who led this, at what effort, from which bench" without testing for the keys' existence. |
 | `run_controls` | Present for agentic/looping commands (`ship`, `pr-loop`, `review-cycle`, `work-block`, `overnight`); deterministic run budgets, per-slot step caps, and oscillation hard-halt rules. |
 | `artifact_renderers` | Present for `ship` (both profiles); canonical renderer contract for PR bodies, issue updates, review verdicts, jury verdicts, and extension result output. |
 | `side_effects` | Declared possible live-run side effects and whether dry-run mutates. |
@@ -153,6 +155,11 @@ heavier follow-up and is out of scope.
 
 ## Core-owned merge execution
 
+`keel merge` and `keel verify-merge` take `--transport auto|graphql|rest` and record which
+wire answered (`transport: gh-graphql | gh-rest`). A host whose proxy blocks GitHub's
+GraphQL endpoint can still run the sanctioned path: the reads and the merge go over REST,
+and every other term of the contract is unchanged.
+
 Ship-style adapters must route s10 through `keel merge`; raw `gh pr merge` calls bypass
 deterministic enforcement and are a spec violation. The command performs the live merge in
 one fail-closed path:
@@ -165,7 +172,8 @@ one fail-closed path:
    workflow is expected to trigger); on any other PR it blocks;
 4. run `evidence-verify` for the current PR artifacts;
 5. require a SHA-stamped gates-pass: the **latest** `ship_run` ledger record for the PR
-   whose `git.head_sha` equals the PR's current head must have passed its gates — so
+   whose `git.head_sha` equals the PR's current head — or a head it covers, one it descends
+   from by `keel capture-land` commits alone (#1203) — must have passed its gates — so
    neither a stale green run from an older head nor a green run superseded by a later red
    one on the *same* head can authorize the merge. A gate flagged `not_run` (the
    command-only runner does not dispatch agentic gates) never counts as passed when the
@@ -282,14 +290,41 @@ The block records:
   candidates are suppressed by a stable fingerprint over normalized title, labels, and
   changed files. The decision is stored in the structured run ledger and mirrored in the
   closure comment's Capture line.
+- landing command, run at **s10 before the evidence gate**:
+  `keel capture-land <project.yaml> --root . --pr N --issue N --onto <branch> --write` — writes
+  the lesson from the pull request, its issue and the gates-pass recorded for its head, and
+  pushes one commit carrying exactly that artifact **onto the pull request's own branch**, so
+  the squash carries the lesson into `base_branch` with the work (#1203). It appends nothing to
+  the run ledger: s11 records the capture after the merge with
+  `keel ship --append-ledger --capture-artifact <path>`, which records a named artifact and
+  writes none. A lesson a landing already put on the pull request is reused, never written a
+  second time. Built with plumbing and
+  no checkout (s2, `overnight` and `swarm` all run inside a worktree while the primary checkout
+  holds the base). It is **not** a merge and touches none: `keel merge` remains the only path a
+  pull request takes to the base branch. The head it produces is accepted for the review
+  verdicts and gates-pass pinned to the head before it **only** when every commit in between
+  has one parent, the `keel.capture-land.v1` marker, and exactly one path inside the sink. The artifact must sit inside the
+  configured sink, not merely inside the repository. Statuses `landed`, `already-landed`,
+  `not-required`, `no-artifact` and `would-land` exit 0; only `failed` exits 1, and the
+  ship treats it as fail-soft — the landing runs before the merge, and a lesson that did not
+  land is recorded in the closure rather than allowed to hold the work back. The commit's marker line is
+  `keel.capture-land.v1: pr=<N> issue=<N> path=<path>`, so a history reader can tell a
+  capture commit from a stray push. Because the push goes to the pull request's branch,
+  base-branch protection never applies to it. Without `--onto` the push goes to the base
+  branch, where a branch that requires pull requests refuses it — reported as `failed` with
+  the server's reason and not retried.
 - session-end verifier command: `keel capture-verify`
 - post-merge recovery command: `keel capture-reconcile`
 - reconcile plan guarantees: idempotent actions only, never reopen implementation, never
   push code, and never merge PRs
 
 Core owns marker generation, validation, and offline verification. Projects own what to
-learn and where the learning goes through `policy_pack.capture` plus a `capture` or
-`post-merge` extension. `keel capture-verify <project.yaml> --root <repo> --merged-pr <N>`
+learn; where it goes depends on whether they configure a sink. With
+`policy_pack.capture.learning.sink`, **core** writes the file and fills
+`capture.artifact` — `durable_artifacts.project_destination` on the capture contract
+reads `sink`, and an adapter that writes its own artifact has it overwritten. Without
+one it reads `extension-owned` and a `capture` or `post-merge` extension owns the
+destination, which is the behaviour every project had before #1154. `keel capture-verify <project.yaml> --root <repo> --merged-pr <N>`
 reads the configured run ledger and returns `complete` only when every expected merged PR
 has exactly one valid marker. Missing, invalid, or duplicate markers make verification
 `incomplete` and exit non-zero.
@@ -304,6 +339,12 @@ capture with no durable artifact reference, recorded via `keel ship --capture-ar
 review-verdict count). The transport query and per-PR verdict fetch are fail-soft; offline runs
 use `--merged-prs-json` and `--verdict-count PR=N` fixtures. Any finding exits non-zero in
 addition to the base marker semantics.
+
+Beside the findings the reconcile reports **notes**, which never fail the command. There is
+one: `applied-elsewhere`, for an `applied` record whose `capture.artifact_scope` is `machine`.
+That project's sink writes outside the checkout, so the absence of an artifact reference is
+the sink's design rather than a lost file — `applied-without-artifact` is withheld for it and
+the note is listed instead, in the human output as well as in `--json`.
 
 `keel capture-reconcile <project.yaml> --root <repo> --merged-pr <N>` reads the same
 ledger and returns a dry-run-safe recovery plan for merged PRs whose capture bookkeeping is
@@ -329,7 +370,14 @@ The block records:
   comment so external evidence checks can distinguish the actual s11 closure comment from
   PR bodies, chat summaries, and automated assessment comments
 - `heading` (`Ship outcome`) and the ordered `sections`: implementer, reviewers, tester,
-  pull_request, changed_files, docs_touched, capture, run_id, run_context
+  fix_rounds, pull_request, changed_files, docs_touched, capture, run_id, run_context
+- a **Fix rounds** line after `tester`, listing who took each s9 fix round
+  (`round 2: opus (gate)`) from the ledger record's `actors.fixers`. It is **omitted
+  entirely** on a run that spent no fix round — most of them — so every existing line of
+  every existing closure comment stays byte-identical, and it appears exactly when the
+  implementer is no longer the whole answer: an escalated round was fixed by another seat,
+  and a closure rendered from `actors.implementer` alone would say otherwise. `keel ship`
+  populates it from `--run-events-file` through `keel.runcontrols.fix_attribution`
 - the `run_context` section renders a deterministic **Run context** block appended after
   the `run_id` line, surfacing the s0 preflight as durable PR evidence: host agent,
   transport (`gh`|`mcp`), profile (`standard`|`compound`), jury mode
@@ -395,6 +443,12 @@ Markdown verbatim when available.
   summary, next step, and evidence ids
 - `run_control_halt`: stable `keel.run-control-halt.v1` shape for budget, step-cap, or
   oscillation hard-halt reasons
+- `ship_provenance`: the `keel.ship-provenance.v1` stamp a live run posts on its own PR
+  right after creating it — run id, issue, head, and the implementer's attribution labels
+  as `keel.agents.attribution()` produced them. `keel.evidence.gate_decision()` arms the
+  evidence gate on this marker **ahead of** the legacy branch-name regex, so a ship run is
+  gated regardless of what its branch is called (see [evidence.md](evidence.md)). Post it
+  with `keel post-comment --artifact ship-provenance`.
 
 Project customization changes the content supplied to these renderers through config,
 policy, and extension results; it does not change the artifact shape. PR bodies remain
@@ -428,6 +482,74 @@ parsing prose.
 `keel runcontrols` is the CLI enforcement surface for this block. It appends/evaluates the
 run-events JSON file and exits non-zero on hard halt; `keel ship --run-events-file` stamps
 the evaluated round counts and cap outcome into the `ship_run` ledger record.
+
+The same events carry **who ran them**. An event may name a `provider`, the `attribution`
+label `keel delegate run` computed for it, the fix-ladder `stage`, and its `round`;
+`keel.runcontrols.fix_attribution` reads them back as `keel.fix-attribution.v1` — the
+implementation actor, one record per fix round, and the deterministic `sentence` the s11
+closure comment embeds ("implemented by agy, fixed by opus in round 2"). An escalated fix
+round has a different actor from the implementer, and the closure has to be able to say so.
+
+## Loop block
+
+`keel loop brief` publishes `keel.loop.v1`: the pure-core answer to *is this s4 iteration
+done, and if not, what does the next one read?*
+
+- the **decision** — `done`, `continue` or `budget-exhausted`, a pure function of the
+  iteration number, the gate outcomes and the policy. The loop judges the gates it can make
+  green — the guard- and test-phase gates the command runner executed (`judged_phases`) — and
+  `done` needs every blocking one of them green; a soft gate that failed does not hold the
+  loop open; an agentic gate nobody ran, the jury under `--defer-jury` and a `pre-merge` gate
+  are **deferred** (named in `decision.deferred`, never counted green, never holding the loop
+  open — the phase that runs them decides); an empty report is refused; a judged blocking
+  gate still red at `max_iterations` is `budget-exhausted`, which exits non-zero and blocks
+  the issue rather than ending the loop as a pass. The gate run is the judge, never the
+  implementer's text.
+- the **brief** — the base brief verbatim plus one appended section carrying the gate output
+  as quoted data (blockquoted, a leading `#` or `>` escaped, the comment delimiters
+  defanged, trailer keys inline-coded, each gate's output capped at `gate_output_max_bytes`),
+  then the iteration's rules; the title is rendered as one backtick-free line, and a base
+  that already carries the marker is refused. Deterministic: identical inputs render
+  byte-identical text.
+- the **policy** — `knobs.loop` and `--loop`, resolved as `keel ship` resolves them so the
+  published `source` is the truth, or an explicit `--max-iterations` (1..10); a loop that is
+  off is a refusal (`off`), as an unreadable config is (`no-config`), because a loop whose
+  budget came from nowhere is a loop nobody bounded.
+- the **record** — `run_context.implement_loop` on the ship ledger record: the policy and one
+  entry per `--loop-iteration` (commit, `gates_ok`, implementer), `null` for a run that
+  neither configured nor recorded a loop. Emit-only, like `implement_phases` — but checked:
+  a SHA is 7–40 hex characters (recorded in lowercase), and a number recorded twice, or
+  past the budget while the loop is on, is refused.
+
+## Fix-loop block
+
+`keel fixloop brief` publishes `keel.fixloop.v1`: the pure-core answer to *who fixes this
+review finding, and with what words*.
+
+- the **brief** — findings grouped by severity with `file:line` anchors, each reviewer's
+  reproduction, the round and its budget, and the narrowed-re-review instruction the next
+  reviewer is held to. Deterministic: identical findings render byte-identical text.
+- the **escalation ladder** `implementer → gate → host`, a pure function of the round, the
+  named unavailable providers, and the budget. Round 1 is `assignment.fix` (by default the
+  alias `implementer`, resolved to the seat that implemented); a failed round escalates one
+  rung; an unavailable rung is skipped; a repeated rung is dropped; a round past the last
+  rung stays with the last usable fixer.
+- the **budget**, unchanged at three review-fix rounds. Past it there is no fixer:
+  `status: budget-exhausted`, and the command exits non-zero, which is the blocked-issue
+  path. Every rung unavailable is `status: no-fixer`, the same fail-closed exit.
+- the **dispatch** — the `keel delegate run --role fix` argv for the resolved seat, or
+  `null` for a `kind: subagent` seat the host runs itself.
+- **reviewer text is quoted data.** The brief becomes the fixer's prompt and findings are
+  the one part of it keel did not write, so every reviewer-supplied string is rendered as a
+  blockquote — one `> ` per line, the HTML-comment opener defanged, a leading `#` escaped, a
+  line reading as one of the brief's trailer keys rendered as inline code, and the field
+  capped. A finding cannot contribute a heading, a second brief marker or a forged trailer.
+- a fourth status, `no-config`: `knobs.team.fix` decides whether the round goes back to the
+  delegate or to the host, so an unreadable project config is a **refusal** (non-zero), not
+  a silent fallback to the host. `--no-project` is the deliberate opt-out.
+
+Severity semantics are `keel.findings`': `critical`/`major` block, `minor` is a gated
+suggestion, `nit` is advisory. The fix loop has no severity vocabulary of its own.
 
 ## Work Creation Policy
 
@@ -492,6 +614,42 @@ The block records:
 - statuses: `granted`, `denied`, `released`, `missing`, and `not-owner`
 - `merge_lock_consumer: true`
 
+`deny_mode: structured-feedback` covers **contention**, not I/O: a resource someone else
+holds comes back as a `denied` result, while a filesystem failure taking or releasing a
+claim raises, so `denied` keeps meaning "held by another owner" for callers that back off
+and retry on it. A failure *after* the claim directory is created — an unwritable `.keel`,
+a full disk — unwinds the half-built claim before the error propagates, because a claim
+directory with no `owner.json` reads as held by `<unknown>`, denies every later claim, and
+nothing releases it (#1077).
+
+That unwind removes **only the directory the failing call itself created**. It cannot go by
+the owner name — an owner is a name, not a claim id, so a claim taken behind us can carry
+the same one — nor by "the claim is ownerless", which is also how another caller's claim
+reads between its `mkdir` and its finished `owner.json`. The claim directory's identity
+(`st_dev`, `st_ino`, and the birth time where the platform reports one) is recorded right
+after the `mkdir` and re-checked before anything is removed, with the directory held open
+meanwhile so its inode cannot be recycled; a claim that by then names a different owner is
+left alone as well. The owner file is unlinked through that open descriptor, so it is bound
+to the recorded inode; a directory has no by-descriptor removal in POSIX, so the `rmdir` is
+by name with the identity re-read right before it — what that last instant can still take is
+another caller's *empty* claim directory created between the two calls, since `rmdir` refuses
+a non-empty one. The same floor applies between the `mkdir` and the pin: anything already in
+the directory the pin latched is treated as contention (`denied`, nothing unwound), and only an
+empty stranger's directory taken in that instant cannot be told from ours. The owner file itself is created exclusively through that descriptor, so a claim taken
+underneath while the directory is being initialised is never overwritten: the create fails and
+the caller sees contention (a file already there) or the original I/O failure (our directory
+gone). A directory that cannot be listed is an I/O failure too, not an empty one. On Windows,
+where a directory cannot be held open, the check rests on `stat` alone, the create is by name
+but still exclusive, and the unwind removes no file — only an empty directory — so a torn owner
+file of our own stays as the documented leak. This is a single-host primitive, not a distributed lock.
+
+The unwind is best-effort, so a claim can still be left held by `<unknown>`: an unmaskable
+kill (`SIGKILL`, container teardown, power loss) where no handler runs, a cleanup that
+cannot finish (the directory unwritable, a stray file the failed step left behind), or one
+the handler declines because the path no longer answers with the identity it recorded.
+Clearing whatever is left is the caller-owned stale recovery — `keel release <resource>`
+with no `--owner` is the deliberate any-owner escape, in all three cases.
+
 The existing merge lock keeps its previous public behavior: it still raises `LockError`
 when the merge resource is already held, while internally using the same claim/release
 primitive. Stale recovery remains caller-owned because keel does not assume a distributed
@@ -511,9 +669,63 @@ The block records:
 - `schema_version: keel.step-verification.v1`
 - `fail_closed: true`
 - `no_premature_termination: true`
-- `handoff_schema`: required handoff fields, renderer, and marker
+- `handoff_schema`: the required handoff fields with their JSON types, the renderer, the
+  marker, and the two rules that go past the field list —
+  `rendered_body_matches_fields` and `completed_step_claims_required_evidence`
 - `steps`: every `s0`–`s12` backbone step with the evidence ids that must be `ok`
   before that step can transition as successful
+
+### The handoff schema is checked whole
+
+`handoff_schema.required_fields` and `handoff_schema.fields` are rendered from
+`keel.stepverifier.HANDOFF_FIELDS`, the single declaration
+`keel.stepverifier.build_handoff` builds the document from. Producer, published contract,
+and verifier read one list, so the verifier cannot fall behind the schema — it once checked
+`schema_version` and `step_id` while the renderer emitted ten fields, which let a handoff
+carrying nothing but a constant and a step id pass (#1101).
+
+| field | type | null allowed | notes |
+| --- | --- | --- | --- |
+| `schema_version` | string | no | must equal `keel.step-handoff.v1` |
+| `step_id` | string | no | must equal the step being verified |
+| `step_name` | string | no | must equal the backbone's own name for that step |
+| `status` | string | no | a step transitions as success only on `complete` |
+| `summary` | string | no | non-blank |
+| `evidence_ids` | array | no | every entry a non-blank string; see below |
+| `next_step` | string | yes | |
+| `producer` | string | yes | when named, must equal `provenance.source.agent_id` |
+| `provenance` | object | no | a canonical `keel.agent-output-provenance.v1` tag |
+| `rendered` | string | no | see below |
+
+A missing, null, wrongly-typed, or blank field is refused **by name**
+(`handoff field missing: summary`), so the refusal says what to fix.
+
+Three checks go past presence:
+
+- **`rendered` must be the canonical rendering of the handoff's own fields.** The marker is
+  a substring an agent can type; the rendering of *these* fields is not. `keel step-verify`
+  re-renders the handoff through `keel.artifacts.render_step_handoff` and compares, which
+  refuses a body pasted from another step, or one whose prose disagrees with the structured
+  fields.
+- **`provenance` must be a canonical untrusted-output tag bound to this step** — the
+  `keel.agent-output-provenance.v1` schema, the untrusted role,
+  `trusted_as_instructions: false`, `can_expand_capabilities: false`, and `source.step_id`
+  equal to the step. `source.agent_id` must name someone — a non-blank string — whether or
+  not the handoff sets `producer`, and must equal `producer` when it does. **Canonical
+  means the whole shape `keel.provenance.source_tag` emits**, so the tag also carries
+  `source.vendor` and `source.model` (a string or `null`) and
+  `capability_scope.allowed_capabilities` and `.unknown_capabilities` (lists, possibly
+  empty); a tag missing any of them is refused by name. Values beyond those types are not
+  checked, and *extra* members are allowed through — a tag carrying a key this version has
+  not heard of is a newer producer, not a forgery. A producer written in another language
+  can build the tag from this paragraph alone. The evidence chain downstream reads it; an
+  arbitrary object under `provenance` answers "who says so?" with nothing.
+- **A `complete` handoff must claim every evidence id its step requires.** The
+  required-evidence check reads a separately supplied report; this one binds the handoff to
+  it, so a step cannot report finished work while naming no evidence for it. Each unclaimed
+  id is named (`handoff claims no evidence id: review-verdict-2`). A step the contract
+  requires no public evidence from — every backbone step except `s7`, `s8` and `s12` —
+  legitimately carries an empty list, and the canonical renderer emits one.
 
 The required evidence ids are derived from the same `review_merge_contract` and public
 evidence contract used by `keel evidence-verify`. Review verdict evidence is attached to
@@ -525,8 +737,9 @@ handoff, so a generated command cannot silently terminate a step *it claims to h
 canonical handoff JSON and run the verifier before advancing each backbone transition.
 
 **What the verifier does and does not prove.** It is **per-step and stateless across
-steps**: it validates the handoff it is given — schema, status, markers — plus mapped
-public evidence for `s7`/`s8`/`s12`. It does **not** check that earlier steps happened.
+steps**: it validates the handoff it is given — every field of the schema above, its
+status, its rendering, and its provenance — plus mapped public evidence for
+`s7`/`s8`/`s12`. It does **not** check that earlier steps happened.
 `keel step-verify --step s10` returns `pass` against a well-formed s10 handoff with **no
 s7 or s8 handoff in existence**, and the handoff is written by the same agent invoking the
 check. So *ordering* — "s10 cannot be reached without s7 and s8" — is enforced by adapter
@@ -563,8 +776,9 @@ The block records:
 - `required`: stable ids such as `closure-comment-pr`, `closure-comment-issue`,
   `review-verdict-1`, `review-verdict-2`, and `jury-verdict` when jury is gating
 - `dry_run_disables_gating: true` and `fail_closed: true`
-- `require_distinct_vendors`: reflects the `evidence_require_distinct_vendors` knob /
-  `--require-distinct-vendors` flag (default `false`). When `true`, each required review
+- `require_distinct_vendors`: reflects the effective `evidence_require_distinct_vendors` —
+  the knob when set, otherwise `false` on every tier, because the knob is opt-in (#1065) —
+  or the `--require-distinct-vendors` flag. When `true`, each required review
   verdict must carry `vendor:` provenance and no two may share a vendor; a missing or
   duplicate vendor yields a blocking `review-vendor-distinctness` finding. The check is
   jury-agnostic — it reads only the verdict provenance fields and imports no review vendor.
@@ -588,6 +802,40 @@ only to infer a linked `Closes #N` issue; the body itself never satisfies eviden
 Explicit operator deferrals must be passed as
 `--deferral <id|kind|all>` and should be recorded in the PR/issue conversation before
 branch protection is bypassed.
+
+## Panel-sourced review evidence
+
+The evidence block above describes the same required *shapes* whether a tier's reviewers
+are host seats or the cross-vendor panel — what changes is who produces them, and that is
+a config decision, not a contract one.
+
+A project sets `knobs.team.review.by_tier."<tier>": jury` (the string `jury` in place of a
+seat list) to make the panel that tier's whole review. `assignment.review_panel` then reads
+`jury` instead of `reviewers`, and `keel review --from-jury <report.json>` is the command
+that turns an ai-jury JSON report (`jury --format json`, report schema 1.1+) into the
+contract's artifacts: one head-pinned `keel.review-verdict.v1` per panelist ballot that
+counts as a review (ai-jury `is_review`) — carrying the `vendor:` and `model:` that
+produced that ballot — plus the panel's own `keel.jury-verdict.v1` consensus record,
+posted in the same call so both bind to the same
+head SHA. `--reviews` and `--from-jury` are mutually exclusive: the bundle is the host's or
+the panel's. The `--json` result adds a `panel` block (`ballots`, `size`, `vendors`, and
+the **verified** consensus `findings` in keel's severity vocabulary), which is the
+[fix-loop block](#fix-loop-block) input — it is already the `{"findings": […]}` envelope
+`keel fixloop brief --findings` reads.
+
+The evidence set reflects the choice in its item descriptions rather than its ids. Measured
+on a tier-3 PR: a panel tier requires `review-verdict-N` items described as *"Distinct
+posted ai-jury panelist verdict for the current PR"* plus a required `jury-verdict`; a tier
+staffed with named seats requires `review-verdict-N` items described as *"Distinct posted
+s7 reviewer verdict for the current PR"*. Where the panel is the review its declared size
+is the required verdict count, and the per-run jury flags cannot take it away —
+`--no-jury` / `--jury-advisory` land in `assignment.warnings` unapplied, because a tier
+whose only review is the panel would otherwise require no review evidence at all.
+
+**keel's own project config does not use this.** `projects/keel.yaml` staffs tier 3 with
+three named seats (`claude`, `agy`, `subagent:opus-reviewer`) and `jury.mode: advisory`,
+and records in the file why the switch is deliberate and still pending. The paragraphs
+above describe a mechanism available to consumers, not keel's current posture.
 
 ## Branch-scope verification
 
@@ -739,8 +987,20 @@ Adapters should pass the selected issue title, body, and labels into `keel plan`
 - `needs-input` — missing or ambiguous scope; adapters must ask the generated questions
   and must not mutate code for that issue.
 - `blocked` — a dependency or waiting condition is present; adapters must not mutate code.
-- `out-of-scope` — the issue is marked not planned or outside scope; adapters must not
-  mutate code.
+- `out-of-scope` — an out-of-scope label; a **title** opening with `Out of scope`,
+  `Not planned`, `Wontfix` or `Not in scope`; or a sentence anywhere in the body
+  naming the issue itself — `this issue is out of scope`. The short form is the
+  title's alone: in a body it cannot be told from a boundary (`Out of scope for v1:
+  the Android client.`) or a carve-out (`Not in scope for Windows.`). The body requires the issue to be
+  named, because `Out of scope: mobile UI` and `Out of scope: closing` are the same
+  string and only one of them is a verdict. A section whose heading *starts with*
+  `Out of scope`, `Non-goals`, `Not in scope` or `Not in this change` has its own prose
+  dropped, because it bounds the change; a nested heading under it is read on its own
+  merits, which is safe because a bullet there naming no issue matches nothing. Everything
+  else is read,
+  heading text included, so `## Decision — this issue is out of scope` is a verdict. A
+  close-reason heading (`## Not planned`, `## Status`, `## Decision`) is **not** an
+  exclusion. Adapters must not mutate code.
 
 The block records `objective`, `deliverable`, `acceptance_criteria`, `risk_tier_inputs`,
 `required_docs_tests`, `missing_info`, `blockers`, `questions`, and a compact

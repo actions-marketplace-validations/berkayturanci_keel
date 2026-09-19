@@ -1,8 +1,9 @@
 """Unit tests for agent dispatch + attribution."""
 
 import unittest
+import unittest.mock as mock
 
-from keel import agents
+from keel import agents, contracts, swarm, team
 from keel import config as cfg
 
 CONFIG = cfg.parse_config(
@@ -61,18 +62,103 @@ class TestSplitDelegate(unittest.TestCase):
         self.assertEqual(agents.split_delegate("ollama:"), ("ollama", None))
 
 
-class TestResolveAgent(unittest.TestCase):
-    def test_delegate_wins(self):
-        self.assertEqual(agents.resolve_agent(CONFIG, role="mobile", delegate="codex"), "codex")
+#: `CONFIG`'s routing, said in the vocabulary that replaced `knobs.implementer_agents`.
+#: A deprecated value is a bare subagent name; `keel.team.legacy_seats` is what gives it
+#: the explicit `subagent:` prefix a migrated config writes out.
+MIGRATED_CONFIG = cfg.parse_config(
+    {
+        "extends": "keel",
+        "core_version": "^0.1",
+        "base_branch": "main",
+        "knobs": {
+            "build_gate_cmd": "make test",
+            "team": {
+                "implement": {
+                    "by_role": {
+                        "mobile": {"provider": "subagent:flutter-developer"},
+                        "backend": {"provider": "subagent:supabase-developer"},
+                    }
+                }
+            },
+        },
+    }
+)
 
-    def test_role_mapping(self):
-        self.assertEqual(agents.resolve_agent(CONFIG, role="mobile"), "flutter-developer")
 
-    def test_unknown_role_falls_back_to_host(self):
-        self.assertEqual(agents.resolve_agent(CONFIG, role="desktop", host_agent="agy"), "agy")
+class TestOneImplementerResolver(unittest.TestCase):
+    """The implementer rule lives in :mod:`keel.team`, and only there (#1099).
 
-    def test_default_host(self):
-        self.assertEqual(agents.resolve_agent(CONFIG), "claude")
+    ``agents.resolve_agent`` used to answer "who implements this role?" from
+    ``knobs.implementer_agents`` alone — the spelling the schema deprecates — so a project
+    that had migrated to ``knobs.team.implement.by_role`` got a different answer from the
+    published helper than from every path that actually ships. It is retired rather than
+    repaired: the rule resolves a :class:`keel.team.Seat` *and* the config path it came
+    from, and a helper flattening that back to a bare string would have been a second,
+    lossier statement of the same precedence — two rules again, which is the defect.
+    Nothing but this test ever called it.
+    """
+
+    def implementer(self, config, **kwargs):
+        """The seat :func:`keel.team.resolve_assignment` staffs, as a record."""
+        assignment = team.resolve_assignment(
+            config.knobs.team, legacy=agents.legacy_team_seats(config), **kwargs
+        )
+        return assignment["implementer"]
+
+    def test_agents_publishes_no_second_implementer_resolver(self):
+        self.assertNotIn("resolve_agent", agents.__all__)
+        self.assertFalse(hasattr(agents, "resolve_agent"))
+
+    def test_both_role_spellings_resolve_to_the_same_seat(self):
+        deprecated = self.implementer(CONFIG, role="mobile")
+        current = self.implementer(MIGRATED_CONFIG, role="mobile")
+
+        self.assertEqual(current["name"], "flutter-developer")
+        self.assertEqual(current["kind"], "subagent")
+        for field in ("provider", "name", "kind", "model", "effort"):
+            with self.subTest(field=field):
+                self.assertEqual(deprecated[field], current[field])
+
+    def test_the_resolver_still_says_which_spelling_answered(self):
+        # Same seat, different provenance: a deprecation is only reportable while the
+        # resolver keeps naming the key it read.
+        self.assertEqual(
+            self.implementer(CONFIG, role="mobile")["source"],
+            "knobs.implementer_agents.mobile (deprecated)",
+        )
+        self.assertEqual(
+            self.implementer(MIGRATED_CONFIG, role="mobile")["source"],
+            "team.implement.by_role.mobile",
+        )
+
+    def test_an_unknown_role_falls_back_to_the_host_agent(self):
+        for config in (CONFIG, MIGRATED_CONFIG):
+            with self.subTest(config=config):
+                seat = self.implementer(config, role="desktop", host_agent="agy")
+                self.assertEqual(seat["provider"], "agy")
+                self.assertEqual(seat["source"], "host")
+
+    def test_an_explicit_delegate_still_wins(self):
+        for config in (CONFIG, MIGRATED_CONFIG):
+            with self.subTest(config=config):
+                seat = self.implementer(config, role="mobile", delegate="codex")
+                self.assertEqual(seat["provider"], "codex")
+                self.assertEqual(seat["source"], "flag:--delegate")
+
+    def test_every_legacy_delegate_token_still_passes_through_unchanged(self):
+        # What `test_resolve_agent_is_unchanged` guarded, asked of the resolver that
+        # survived: `--delegate` is the caller's word and keel does not reinterpret it.
+        for value, (vendor, model) in LEGACY_DELEGATES:
+            with self.subTest(delegate=value):
+                seat = self.implementer(PROFILE_CONFIG, role="mobile", delegate=value)
+                self.assertEqual(seat["provider"], vendor)
+                self.assertEqual(seat["model"], model)
+                self.assertEqual(seat["name"], vendor)
+
+    def test_a_profile_name_is_just_a_delegate_token(self):
+        seat = self.implementer(PROFILE_CONFIG, role="mobile", delegate="cursor")
+        self.assertEqual(seat["provider"], "cursor")
+        self.assertEqual(seat["source"], "flag:--delegate")
 
 
 class TestModelBase(unittest.TestCase):
@@ -117,6 +203,71 @@ class TestAttribution(unittest.TestCase):
         self.assertEqual(a["agent_label"], "agent:ollama")
         self.assertEqual(a["model_label"], "model:qwen")
         self.assertEqual(a["system"], "ollama:qwen2.5")
+
+
+class TestLiveRunVocabulary(unittest.TestCase):
+    """The exact pair a live run got wrong (#1013).
+
+    A host derived the labels itself and wrote ``agent:gemini`` / ``model:gemini``
+    for a run keel calls ``agent:agy`` / ``model:gemini-3``. Pinning the pair here
+    means the CLI, the provenance artifact and the evidence check all have one
+    answer to agree with.
+    """
+
+    def test_agy_gemini_three_eight(self):
+        a = agents.attribution("agy", "gemini-3.8-flash-high")
+        self.assertEqual(a["agent_label"], "agent:agy")
+        self.assertEqual(a["model_label"], "model:gemini-3")
+        self.assertEqual(a["system"], "agy:gemini-3.8-flash-high")
+
+    def test_the_hand_written_labels_are_not_what_keel_produces(self):
+        a = agents.attribution("agy", "gemini-3.8-flash-high")
+        self.assertNotEqual(a["agent_label"], "agent:gemini")
+        self.assertNotEqual(a["model_label"], "model:gemini")
+
+
+class TestAttributionFromImplementer(unittest.TestCase):
+    def test_vendor_and_model(self):
+        self.assertEqual(
+            agents.attribution_from_implementer("agy:gemini-3.8-flash-high"),
+            {
+                "agent_label": "agent:agy",
+                "model_label": "model:gemini-3",
+                "system": "agy:gemini-3.8-flash-high",
+            },
+        )
+
+    def test_vendor_only(self):
+        record = agents.attribution_from_implementer("codex")
+        self.assertEqual(record["agent_label"], "agent:codex")
+        self.assertIsNone(record["model_label"])
+
+    def test_vendor_is_lowercased(self):
+        record = agents.attribution_from_implementer("  AGY:Gemini-3.8  ")
+        self.assertEqual(record["agent_label"], "agent:agy")
+
+    def test_unset_reads_as_none(self):
+        for value in (None, "", "   ", 17, ":qwen"):
+            with self.subTest(value=value):
+                self.assertIsNone(agents.attribution_from_implementer(value))
+
+
+class TestKnownVendors(unittest.TestCase):
+    def test_builtins_and_profile_vendors_without_config(self):
+        known = agents.known_vendors()
+        for vendor in agents.BUILTIN_DELEGATE_VENDORS:
+            self.assertIn(vendor, known)
+        self.assertIn("cli", known)
+        self.assertIn("openai-compatible", known)
+        self.assertIn(agents.HOST_DEFAULT, known)
+
+    def test_configured_profile_names_are_known(self):
+        known = agents.known_vendors(PROFILE_CONFIG)
+        self.assertIn("cursor", known)
+        self.assertIn("gemini-cli", known)
+
+    def test_a_vendor_keel_never_produces_is_not_known(self):
+        self.assertNotIn("gemini", agents.known_vendors(PROFILE_CONFIG))
 
 
 class TestApiDelegate(unittest.TestCase):
@@ -196,12 +347,6 @@ class TestResolveDelegateProfile(unittest.TestCase):
         self.assertTrue(agents.is_profile_delegate(PROFILE_CONFIG, "gemini-cli"))
         self.assertFalse(agents.is_profile_delegate(PROFILE_CONFIG, "codex"))
         self.assertFalse(agents.is_profile_delegate(PROFILE_CONFIG, "aider"))
-
-    def test_profile_name_passes_through_resolve_agent(self):
-        # A profile name is just a delegate token; precedence is unchanged.
-        self.assertEqual(
-            agents.resolve_agent(PROFILE_CONFIG, role="mobile", delegate="cursor"), "cursor"
-        )
 
 
 class TestProfileAttribution(unittest.TestCase):
@@ -322,12 +467,153 @@ class TestExistingDelegateFormsUnchanged(unittest.TestCase):
                 self.assertEqual(a["system"], value)
                 self.assertNotIn("profile", a)  # only profile runs carry that key
 
-    def test_resolve_agent_is_unchanged(self):
-        for value, _ in LEGACY_DELEGATES:
-            with self.subTest(delegate=value):
-                self.assertEqual(
-                    agents.resolve_agent(PROFILE_CONFIG, role="mobile", delegate=value), value
-                )
+
+class TestAttributionLabels(unittest.TestCase):
+    """Every ``agent:*``/``model:*`` label keel can write, for doctor's label check."""
+
+    def test_the_configuration_free_vocabulary(self):
+        labels = agents.attribution_labels()
+        self.assertEqual(
+            labels,
+            (
+                "agent:agy",
+                "agent:anthropic-api",
+                "agent:claude",
+                "agent:codex",
+                "agent:google-api",
+                "agent:ollama",
+                "agent:openai-api",
+            ),
+        )
+
+    def test_every_builtin_vendor_and_the_host_default_are_covered(self):
+        labels = set(agents.attribution_labels(CONFIG))
+        for vendor in (*agents.BUILTIN_DELEGATE_VENDORS, agents.HOST_DEFAULT):
+            self.assertIn(f"agent:{vendor}", labels)
+
+    def test_a_profile_contributes_its_vendor_and_its_pinned_model(self):
+        labels = agents.attribution_labels(PROFILE_CONFIG)
+        # `agent:cli` is the label profile_attribution writes — never the profile name.
+        self.assertIn("agent:cli", labels)
+        self.assertNotIn("agent:cursor", labels)
+        self.assertIn("model:composer-1", labels)
+
+    def test_a_profile_without_a_model_adds_no_model_label(self):
+        config = cfg.parse_config(
+            {
+                "extends": "keel",
+                "core_version": "^0.1",
+                "base_branch": "main",
+                "knobs": {
+                    "build_gate_cmd": "make test",
+                    "delegate_profiles": {"local": {"vendor": "cli", "command": "aider"}},
+                },
+            }
+        )
+        self.assertEqual(
+            [label for label in agents.attribution_labels(config) if label.startswith("model:")],
+            [],
+        )
+
+    def test_a_model_with_no_base_contributes_no_label(self):
+        config = cfg.parse_config(
+            {
+                "extends": "keel",
+                "core_version": "^0.1",
+                "base_branch": "main",
+                "knobs": {
+                    "build_gate_cmd": "make test",
+                    "delegate_profiles": {
+                        "local": {"vendor": "cli", "command": "aider", "model": "4.5"}
+                    },
+                },
+            }
+        )
+        self.assertEqual(
+            [label for label in agents.attribution_labels(config) if label.startswith("model:")],
+            [],
+        )
+
+
+class TestOneRoleVocabulary(unittest.TestCase):
+    """#1107 — *which spellings name a role* is stated once, in ``agents.known_roles``."""
+
+    #: A role in each vocabulary, plus ``core`` in both, so the union has to deduplicate.
+    BOTH = cfg.parse_config(
+        {
+            "extends": "keel",
+            "core_version": "^0.1",
+            "base_branch": "main",
+            "knobs": {
+                "build_gate_cmd": "make test",
+                "implementer_agents": {"backend": "codex", "core": "claude"},
+                "team": {
+                    "implement": {
+                        "by_role": {"core": {"provider": "agy"}, "docs": {"provider": "codex"}}
+                    }
+                },
+            },
+        }
+    )
+
+    TEAM_ONLY = cfg.parse_config(
+        {
+            "extends": "keel",
+            "core_version": "^0.1",
+            "base_branch": "main",
+            "knobs": {
+                "build_gate_cmd": "make test",
+                "team": {"implement": {"by_role": {"cli": {"provider": "codex"}}}},
+            },
+        }
+    )
+
+    def test_the_union_is_both_vocabularies_deduplicated(self):
+        self.assertEqual(agents.known_roles(self.BOTH), frozenset({"backend", "core", "docs"}))
+
+    def test_either_vocabulary_alone_still_names_its_own_roles(self):
+        self.assertEqual(agents.known_roles(CONFIG), frozenset({"backend", "mobile"}))
+        self.assertEqual(agents.known_roles(self.TEAM_ONLY), frozenset({"cli"}))
+
+    def test_a_project_that_routes_no_role_names_none(self):
+        self.assertEqual(agents.known_roles(PROFILE_CONFIG), frozenset())
+
+    def test_both_call_sites_read_the_one_helper(self):
+        # Patching the *rule* rather than the config is what makes this a single-source
+        # test: two call sites that each spelled the union out again would be unmoved by
+        # it, and would keep answering with ``CONFIG``'s own roles. The controls below
+        # pin that unpatched answer, so the patched run cannot pass by coincidence.
+        control_record = contracts.standalone_result_as_dict(
+            command="implement", config=CONFIG, target="issue #7"
+        )
+        control_scope = swarm.extract_issue_scope(
+            7, title="Some work", labels=["role:mole"], config=CONFIG
+        )
+        self.assertEqual(control_record["implementer"]["routing_keys"], ["backend", "mobile"])
+        self.assertEqual(control_scope.role, "mole")
+
+        with mock.patch.object(
+            agents, "known_roles", return_value=frozenset({"core", "zebra"})
+        ) as rule:
+            record = contracts.standalone_result_as_dict(
+                command="implement", config=CONFIG, target="issue #7"
+            )
+            scope = swarm.extract_issue_scope(
+                7, title="Some work", labels=["role:mole"], config=CONFIG
+            )
+
+        self.assertEqual(record["implementer"]["routing_keys"], ["core", "zebra"])
+        self.assertEqual(scope.role, "core")
+        self.assertEqual(rule.call_args_list, [mock.call(CONFIG), mock.call(CONFIG)])
+
+    def test_the_contract_sorts_what_the_rule_returns(self):
+        # ``sorted()`` stays at the contract's call site: the contract's ordering is the
+        # contract's business, not the rule's.
+        with mock.patch.object(agents, "known_roles", return_value=("zebra", "core", "aardvark")):
+            record = contracts.standalone_result_as_dict(
+                command="implement", config=CONFIG, target="issue #7"
+            )
+        self.assertEqual(record["implementer"]["routing_keys"], ["aardvark", "core", "zebra"])
 
 
 if __name__ == "__main__":

@@ -2,48 +2,102 @@
 
 The backbone dispatches agentic steps (implement / review / extensions) to a
 configured agent: the **host agent** by default, a per-run **delegate** override,
-or a per-role agent from ``knobs.implementer_agents``. A delegate is either a
-built-in vendor (:data:`BUILTIN_DELEGATE_VENDORS`) or the name of a generic
-``knobs.delegate_profiles`` entry — built-ins always win. Attribution records the
-*effective* implementer as labels (``agent:<vendor>`` + a versionless
-``model:<base>``), reusing the ship #2036 stripping algorithm.
+or a per-role seat from ``knobs.team.implement.by_role``. *Which* seat that is, is
+:func:`keel.team.resolve_assignment`'s single answer — this module owns the delegate
+vocabulary that feeds it and the attribution written afterwards, not a second copy of
+the precedence rule (#1099). :func:`legacy_team_seats` is the bridge: it reads the
+deprecated ``knobs.implementer_agents`` as ``by_role`` seats so the one resolver can
+fall back to it. A delegate is either a built-in vendor
+(:data:`BUILTIN_DELEGATE_VENDORS`) or the name of a generic ``knobs.delegate_profiles``
+entry — built-ins always win. Attribution records the *effective* implementer as labels
+(``agent:<vendor>`` + a versionless ``model:<base>``), reusing the ship #2036 stripping
+algorithm.
 
 All functions here are pure and deterministic — no subprocess, no network.
 """
 
 from __future__ import annotations
 
-from .config import DelegateProfile, ProjectConfig
+from . import team
+from .config import DELEGATE_PROFILE_VENDORS, DelegateProfile, ProjectConfig
+
+# The vendor vocabulary itself lives in the leaf :mod:`keel.vocab`, so the *validating*
+# half of keel (``keel.team``, ``keel.config``) can read it without importing dispatch
+# (#1050). Re-exported here under the original names: ``agents.CLI_VENDORS`` and friends
+# are what the rest of the package, the docs and the tests have always read.
+from .vocab import API_VENDORS as API_VENDORS
+from .vocab import BUILTIN_DELEGATE_VENDORS as BUILTIN_DELEGATE_VENDORS
+from .vocab import CLI_VENDORS as CLI_VENDORS
+from .vocab import LOCAL_VENDORS as LOCAL_VENDORS
+
+#: The module's public surface, in definition order (#1070). It is declared because the
+#: ``X as X`` re-exports above are read from *other* modules — a use CodeQL's
+#: ``py/unused-import`` cannot see, since it counts same-module uses only. A name listed
+#: in ``__all__`` is used by definition, so the declaration answers the scanner with the
+#: language's own statement of intent rather than with a dismissal. Being a real
+#: declaration it has to be the *whole* surface, not the re-exports alone;
+#: ``tests/test_reexport_surface.py`` holds it to that in both directions.
+__all__ = [
+    "API_VENDORS",
+    "BUILTIN_DELEGATE_VENDORS",
+    "CLI_VENDORS",
+    "LOCAL_VENDORS",
+    "HOST_DEFAULT",
+    "split_delegate",
+    "known_vendors",
+    "is_api_delegate",
+    "resolve_delegate_profile",
+    "is_profile_delegate",
+    "provider_names",
+    "legacy_team_seats",
+    "known_roles",
+    "LOCAL_TRANSPORTS",
+    "strip_transport",
+    "model_base",
+    "agent_label",
+    "model_label",
+    "attribution_labels",
+    "attribution",
+    "attribution_from_implementer",
+    "profile_attribution",
+    "is_safe_model_token",
+]
 
 #: Default host agent when nothing else is resolved.
 HOST_DEFAULT = "claude"
-
-#: Hosted-API delegate vendors (#548, ``google-api`` added in #666): the vendor's
-#: real API keyed by an env token, no agent CLI installed. Same no-tools contract
-#: as ``ollama:`` — the
-#: orchestrator owns every git/PR step and delegates only code generation. The
-#: vendor names match ai-jury's hosted-adapter vocabulary so the value fits the
-#: existing first-colon ``vendor:model`` split unchanged.
-API_VENDORS = ("anthropic-api", "openai-api", "google-api")
-
-#: Agent-CLI delegate vendors keel drives as a subprocess. Hardcoded on purpose — not
-#: to be confused with the generic ``cli`` *profile* vendor (issue #659), which is the
-#: operator-configured escape hatch for every CLI that is not one of these three.
-CLI_VENDORS = ("claude", "codex", "agy")
-
-#: Local-model delegate vendors: no agent CLI, no hosted key, and no tools.
-LOCAL_VENDORS = ("ollama",)
-
-#: Every delegate name keel understands with no configuration at all. Name resolution
-#: is **fail-closed**: a ``knobs.delegate_profiles`` entry may not shadow one of these,
-#: and the attempt is a config error rather than a silent override (issue #659).
-BUILTIN_DELEGATE_VENDORS = CLI_VENDORS + LOCAL_VENDORS + API_VENDORS
 
 
 def split_delegate(value: str) -> tuple[str, str | None]:
     """Split ``ollama:qwen2.5`` -> ``("ollama", "qwen2.5")``; ``codex`` -> ``("codex", None)``."""
     vendor, sep, model = value.partition(":")
     return vendor, (model if (sep and model) else None)
+
+
+def known_vendors(config: ProjectConfig | None = None) -> frozenset[str]:
+    """Every vendor slug keel's attribution vocabulary can legitimately produce.
+
+    The built-in vendors, the host default, the profile vendors a
+    ``knobs.delegate_profiles`` entry may declare (``cli`` /
+    ``openai-compatible``), and — when a config is supplied — the configured
+    profile *names*, because ``--delegate <name>`` is spelled with the name.
+
+    It must also contain each profile's :meth:`~keel.config.DelegateProfile.label_vendor`,
+    which is the vendor attribution actually **produces** for that entry (#1129). Adding
+    the field without adding it here split the vocabulary from the labels: `keel doctor`
+    demanded ``agent:xai`` while ``keel attribution --vendor xai`` answered *unknown
+    vendor*, and ``ship --live --append-ledger`` warned that the implementer it had just
+    recorded was not one of keel's delegate vendors. Both gate seats found it.
+
+    Callers use this to refuse a vendor keel could never have produced. Without
+    a config the set is the configuration-free vocabulary, which is why the
+    ledger-writing check only warns: a record may predate the current config.
+    """
+    names = {*BUILTIN_DELEGATE_VENDORS, *DELEGATE_PROFILE_VENDORS, HOST_DEFAULT}
+    if config is not None:
+        names.update(config.knobs.delegate_profiles)
+        names.update(profile.label_vendor() for profile in config.knobs.delegate_profiles.values())
+        names.update(profile.vendor for profile in config.knobs.delegate_profiles.values())
+    return frozenset(names)
 
 
 def is_api_delegate(vendor: str) -> bool:
@@ -69,23 +123,44 @@ def is_profile_delegate(config: ProjectConfig, name: str) -> bool:
     return resolve_delegate_profile(config, name) is not None
 
 
-def resolve_agent(
-    config: ProjectConfig,
-    *,
-    role: str | None = None,
-    delegate: str | None = None,
-    host_agent: str = HOST_DEFAULT,
-) -> str:
-    """Resolve which agent runs a step.
+def provider_names(config: ProjectConfig) -> frozenset[str]:
+    """Every provider name this project can select without a machine-level registry."""
+    return frozenset({*BUILTIN_DELEGATE_VENDORS, *config.knobs.delegate_profiles})
 
-    Precedence: explicit ``delegate`` > per-role ``implementer_agents`` mapping >
-    ``host_agent`` default.
+
+def legacy_team_seats(config: ProjectConfig) -> dict[str, team.Seat]:
+    """``knobs.implementer_agents`` read as ``team.implement.by_role`` seats (#1014).
+
+    The deprecated knob stays accepted; this is where its values acquire the meaning the
+    schema never stated. A value that names a provider this project can select is that
+    provider; anything else is the Claude subagent ``ship.md`` s4 always treated it as,
+    and gets the explicit ``subagent:`` prefix.
     """
-    if delegate:
-        return delegate
-    if role and role in config.knobs.implementer_agents:
-        return config.knobs.implementer_agents[role]
-    return host_agent
+    return team.legacy_seats(config.knobs.implementer_agents, provider_names=provider_names(config))
+
+
+def known_roles(config: ProjectConfig) -> frozenset[str]:
+    """Every role name this project's routing can be keyed on, in **either** vocabulary.
+
+    ``team.implement.by_role`` (#1014) is where a role lives now, and the deprecated
+    ``knobs.implementer_agents`` still routes for a project that has not migrated — so a
+    role may be spelled in either, and the set of role names is the union of both key
+    sets. Reading only the old one silently stopped narrowing the role for any project
+    that had adopted ``team``, including keel itself; #1014 had to correct that in two
+    files at once, and this is the one place it is now stated, so a third vocabulary — or
+    the day the deprecated knob is finally dropped — is one edit and not a search (#1107).
+
+    It sits beside :func:`legacy_team_seats`, the other bridge from the deprecated knob
+    into the current vocabulary, because :mod:`keel.team` — where the rest of the team
+    policy lives — takes exactly one keel import (the leaf :mod:`keel.vocab`) and cannot
+    read a :class:`~keel.config.ProjectConfig` without :mod:`keel.config` importing it
+    back (#1050).
+
+    The rule is *which spellings name a role*, and only that: a caller that needs an
+    order imposes its own. The ``implement`` contract sorts the result for its
+    ``routing_keys`` because the contract's ordering is the contract's business.
+    """
+    return frozenset({*config.knobs.implementer_agents, *config.knobs.team.implement_by_role})
 
 
 #: Transports that run a model on the operator's own hardware. Named separately
@@ -153,6 +228,44 @@ def model_label(model: str) -> str | None:
     return f"model:{base}" if base else None
 
 
+def attribution_labels(config: ProjectConfig | None = None) -> tuple[str, ...]:
+    """Every ``agent:*`` / ``model:*`` label keel's attribution vocabulary can write.
+
+    Sorted and deduplicated, for ``keel doctor``'s ``policy_labels`` check (#1021): a
+    label keel applies must already exist on the repository or GitHub rejects the call,
+    and the attribution pair is applied by name just like the policy pack's own
+    vocabularies.
+
+    The set is the built-in vendors plus the host default and — when a config is given —
+    each ``knobs.delegate_profiles`` entry's **label vendor** (its ``vendor_label`` when
+    set, else the generic ``cli``; the label :func:`profile_attribution` writes — the
+    profile *name* goes in ``delegate_profile``, never in a label) and the model that
+    entry pins.
+
+    A machine-level ``~/.keel/providers.yaml`` entry's ``vendor_label`` is **not**
+    enumerable here and never will be: this check exists so ``keel doctor`` can tell an
+    operator that a label keel may apply is missing from the repository, and the registry
+    lives outside the repository, on one machine, unread by the project config. An
+    operator who labels a registry entry has to create ``agent:<label>`` themselves —
+    which is the same trade the registry already makes everywhere else, and is documented
+    beside the field.
+
+    ``model:*`` is only enumerable that far. The effective model can arrive from
+    ``--delegate <vendor>:<model>`` or a ``delegate-model:`` issue label, so the labels
+    minted from those are unbounded and no check can list them ahead of time.
+    """
+    vendors = {*BUILTIN_DELEGATE_VENDORS, HOST_DEFAULT}
+    models: set[str] = set()
+    if config is not None:
+        for profile in config.knobs.delegate_profiles.values():
+            vendors.add(profile.label_vendor())
+            if profile.model:
+                models.add(profile.model)
+    labels = {agent_label(vendor) for vendor in vendors}
+    labels.update(label for label in map(model_label, models) if label)
+    return tuple(sorted(labels))
+
+
 def attribution(vendor: str, model: str | None = None) -> dict[str, str | None]:
     """Resolve the effective attribution for an implementer/reviewer.
 
@@ -165,6 +278,24 @@ def attribution(vendor: str, model: str | None = None) -> dict[str, str | None]:
         "model_label": model_label(model) if model else None,
         "system": system,
     }
+
+
+def attribution_from_implementer(implementer: str | None) -> dict[str, str | None] | None:
+    """Attribution for a ledger ``actors.implementer`` value, or ``None`` when unset.
+
+    The ledger records the effective implementer as ``vendor`` or ``vendor:model``
+    (issue #1013 — never the delegate-profile name, which goes in
+    ``delegate_profile``). Splitting it here rather than at each call site is what
+    keeps the PR labels, the provenance comment and the evidence cross-check reading
+    the *same* vocabulary from the *same* string instead of three hand-written ones.
+    """
+    if not isinstance(implementer, str) or not implementer.strip():
+        return None
+    vendor, model = split_delegate(implementer.strip())
+    vendor = vendor.strip().lower()
+    if not vendor:
+        return None
+    return attribution(vendor, model)
 
 
 def profile_attribution(
@@ -188,7 +319,7 @@ def profile_attribution(
     rule that attribution records the *effective* implementer whenever an operator
     picked a model per run.
     """
-    record = attribution(profile.vendor, model or profile.model)
+    record = attribution(profile.label_vendor(), model or profile.model)
     record["delegate_profile"] = name
     return record
 

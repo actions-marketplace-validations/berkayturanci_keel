@@ -12,13 +12,21 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import socket
 from dataclasses import dataclass, field
+from datetime import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import jsonschema_min
+# capture does not import this module — even under TYPE_CHECKING — so this
+# edge is one-way. A reverse import is the py/cyclic-import CodeQL reports.
+from . import capture, jsonschema_min
+from . import tdd as tdd_mode
+from . import team as team_policy
 from . import yaml_helper as yaml
 from .capabilities import validate_names
 
@@ -27,6 +35,8 @@ from .capabilities import validate_names
 # cycle (gates names config in its TYPE_CHECKING imports). SLOTS: source of truth for
 # the named slots; DEFAULT_GATE_TIMEOUT_S: shared with the gate planner and runner.
 from .model import DEFAULT_GATE_TIMEOUT_S, DEFAULT_JURY_TIMEOUT_S, SLOTS
+from .vocab import BUILTIN_DELEGATE_VENDORS
+from .window import parse_window
 
 SCHEMA_PATH = Path(__file__).parent / "schema" / "project.schema.json"
 
@@ -36,6 +46,12 @@ DEFAULT_EXTENSIONS_DIR = ".keel/extensions"
 #: coding-agent CLI (#659); ``openai-compatible`` reaches any OpenAI-shaped hosted API
 #: — OpenRouter, Groq, DeepSeek, Together, LiteLLM, vLLM — from config (#666).
 DELEGATE_PROFILE_VENDORS = ("cli", "openai-compatible")
+
+#: Characters a ``vendor_label`` may contain (#1129). It becomes the GitHub label
+#: ``agent:<value>``, which ``attribution_check`` reads back and compares, so the set is
+#: the one every built-in vendor token already uses: lowercase, digits, ``.``, ``-``,
+#: ``_``. A ``:`` is excluded because it would split the label into a third segment.
+_VENDOR_LABEL_OK = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-_")
 
 #: Vendors whose profile must name an executable.
 _COMMAND_VENDORS = ("cli",)
@@ -145,6 +161,7 @@ __all__ = [
     "load_schema",
     "config_hash",
     "delegate_profiles_dict",
+    "vendor_label_errors",
 ]
 
 
@@ -205,6 +222,17 @@ class DelegateProfile:
     #: Never the key. Profile config is serialised into the command contract and
     #: hashed into ``config_hash``, so a value here would be published.
     api_key_env: str | None = None
+    #: What ``agent:<vendor>`` should say for this entry, when ``vendor`` — which the
+    #: schema restricts to ``cli``/``openai-compatible`` — is the transport rather than
+    #: the model's maker (#1129). Two ``cli`` profiles driving Grok and GPT through the
+    #: same binary are otherwise the same ``agent:cli``, and
+    #: ``review-vendor-distinctness`` cannot tell them apart. Unset means unchanged:
+    #: the label stays ``agent:<vendor>``.
+    vendor_label: str | None = None
+
+    def label_vendor(self) -> str:
+        """The vendor this entry's attribution names: ``vendor_label`` when set."""
+        return self.vendor_label or self.vendor
 
     def role_args(self, *, review: bool = False) -> tuple[str, ...]:
         """Flags for this role: ``review_args`` for a reviewer when set, else ``args``."""
@@ -219,7 +247,11 @@ class Knobs:
 
     build_gate_cmd: str
     lint_cmd: str | None = None
+    #: **Deprecated** by ``team.implement.by_role`` (#1014); still accepted and mapped
+    #: onto it by :func:`keel.team.legacy_seats`.
     implementer_agents: dict[str, str] = field(default_factory=dict)
+    #: Who implements, who gates, who reviews, and when the jury is the panel.
+    team: team_policy.TeamPolicy = field(default_factory=team_policy.TeamPolicy)
     #: Profile name -> generic delegate vendor config. Never shadows a built-in vendor
     #: (``claude``/``codex``/``agy``/``ollama``/``*-api``); that is a validation error.
     delegate_profiles: dict[str, DelegateProfile] = field(default_factory=dict)
@@ -231,12 +263,24 @@ class Knobs:
     required_capabilities: tuple[str, ...] = ()
     optional_capabilities: tuple[str, ...] = ()
     evidence_gate_label: str = "keel:ship"
-    evidence_require_distinct_vendors: bool = False
+    #: Tri-state on purpose, but **opt-in**: ``None`` is *unset* and resolves to ``False``
+    #: on every tier (:func:`keel.team.require_distinct_vendors`, #1065). The tri-state is
+    #: kept so an explicit ``false`` stays distinguishable from silence for the wizard and
+    #: for anything that reports what a project actually said.
+    evidence_require_distinct_vendors: bool | None = None
     #: Swarm landings enforce the same per-PR review-evidence contract as ship
     #: s10. Turning this off is the explicit, logged opt-out #828 requires: the
     #: exception lives in config where a reviewer can see it, never in a
     #: driver's judgement call under time pressure.
     swarm_review_evidence: bool = True
+    #: The s4 implement profile: ``default`` (one pass) or ``tdd`` (test-first, two
+    #: phases, with the pure ``tdd-order`` gate at s8). See :mod:`keel.tdd`.
+    implement_mode: str = tdd_mode.DEFAULT_MODE
+    #: The s4 iteration policy (#1165): ``None`` when the project never wrote a ``loop``
+    #: block. Kept as the mapping the project wrote — the schema owns its shape and
+    #: :func:`keel.loop.resolve` reads it — so an added optional knob cannot rotate
+    #: ``config_hash`` for a project that never set it.
+    loop: dict | None = None
     #: Wall-clock seconds a command gate may run before it is killed. Raise this on a
     #: slow host; a single slower gate can override it with ``timeout:`` frontmatter.
     gate_timeout_s: int = DEFAULT_GATE_TIMEOUT_S
@@ -281,12 +325,159 @@ class ProjectConfig:
         return self.extensions.get(name, ())
 
 
+def timezone_issue(timezone: str) -> str | None:
+    """Why ``timezone`` cannot be evaluated on this machine, or ``None`` if it can.
+
+    The sentence carries no ``$.`` path so that both callers can frame it themselves:
+    :func:`_merge_window_issues` prefixes ``$.timezone`` for the :class:`ConfigError`,
+    and ``keel init --wizard`` prints it as-is before asking the question again (#1082).
+    One wording in one place is the point — a wizard that phrased the rule in its own
+    words would drift away from the validator that actually decides.
+    """
+    try:
+        ZoneInfo(timezone)
+    except (ValueError, ZoneInfoNotFoundError):
+        return (
+            f"{timezone!r} is not a zone this machine can resolve; give an "
+            "IANA name such as 'Europe/Istanbul' or 'Etc/GMT-3'"
+        )
+    return None
+
+
+@lru_cache(maxsize=1)
+def merge_window_pattern() -> re.Pattern[str]:
+    """The bundled schema's own ``merge_window`` ``pattern``, compiled.
+
+    Read out of ``project.schema.json`` instead of restated here, because a second
+    spelling of the same rule is a second rule waiting to disagree with the first: the
+    schema said two-digit hours while :func:`keel.window.parse_window` happily read
+    ``9:00-18:00``, so ``keel init --wizard`` accepted a value ``keel validate``
+    immediately refused (#1082). Cached because the answer is package data that cannot
+    change inside a run, and :func:`merge_window_issue` is asked once per config load.
+    """
+    return re.compile(load_schema()["properties"]["merge_window"]["pattern"])
+
+
+def merge_window_issue(merge_window: str) -> str | None:
+    """Why ``merge_window`` is not a window keel accepts, or ``None`` if it is.
+
+    Unprefixed for the same reason as :func:`timezone_issue`. Three rules, all of which
+    ``keel validate`` applies to a hand-written config, so every caller — the wizard
+    included — accepts exactly what the validator accepts:
+
+    * the **shape**, :func:`merge_window_pattern`, taken from the schema itself;
+    * the **meaning**, :func:`keel.window.parse_window` — the function evaluation time
+      asks. Today the pattern is the stricter of the two and subsumes it; the call
+      stays because the schema is a contract that may be relaxed, and the day it is,
+      a window that will raise mid-ship must still be refused here rather than written.
+    * the **span**: the two ends must differ. :func:`keel.window.is_merge_open` answers
+      ``opens <= now < closes`` for a forward window, an interval that is empty when the
+      two are equal — so ``09:00-09:00`` passed both rules above, ``keel validate``
+      printed ``OK``, and every ``keel ship`` then deferred at the merge gate at every
+      instant of every day, silently and for ever (#1091).
+
+    The span rule is the one a ``pattern`` cannot state — a regex relates no capture to
+    another — which is why the schema cannot own it and this function must. Only the
+    degenerate equal case is refused: a **wrap-around** window is untouched, so
+    ``22:00-06:00`` stays the all-night window it reads as, and ``09:00-09:01`` stays a
+    one-minute window somebody may well have meant.
+
+    Normalising ``9:00`` to ``09:00`` was the alternative and was rejected: it would
+    quietly rewrite the operator's answer, and it would leave the wizard and
+    ``keel validate`` still disagreeing about what a valid window *is*.
+    """
+    times = _parsed(merge_window)
+    if merge_window_pattern().fullmatch(merge_window) is None or times is None:
+        return (
+            f"{merge_window!r} is not a valid window; give "
+            "'HH:MM-HH:MM' with two-digit hours 00-23 and minutes 00-59 "
+            "(it may wrap midnight)"
+        )
+    opens, closes = times
+    if opens == closes:
+        return (
+            f"{merge_window!r} opens and closes at the same minute, so it is never open "
+            "and every merge would defer as outside the merge window, for ever; give a "
+            "range instead — a window may wrap midnight, so '09:00-08:59' is every "
+            "minute but that one — or drop 'merge_window' and 'timezone' to configure "
+            "no window at all"
+        )
+    return None
+
+
+def _parsed(merge_window: str) -> tuple[time, time] | None:
+    """The ``(opens, closes)`` pair :func:`keel.window.parse_window` reads, or ``None``.
+
+    ``None`` is "``parse_window`` cannot read this", which is what the shape rule needs;
+    the pair is what the span rule needs. One call answers both, so the two rules cannot
+    end up reading a different window from the same string.
+    """
+    try:
+        return parse_window(merge_window)
+    except ValueError:
+        return None
+
+
+def _merge_window_issues(data: dict) -> list[str]:
+    """Semantic errors for the ``timezone`` + ``merge_window`` pair (empty == valid).
+
+    The schema owns the *shape* of each key on its own; this owns the *meaning* of the
+    two together, which is the part that decides whether the ``window_gate`` invariant
+    can be evaluated at all (#1076):
+
+    * They are **all-or-nothing.** Both absent is a project that has not asked for a
+      window. Exactly one present is a project that asked and will not get one:
+      :func:`keel.ship.assess` and ``keel window`` both read a missing half as "no
+      window configured" and report the window *open*, so a config declaring
+      ``merge_window`` and forgetting ``timezone`` merged straight through the night
+      it meant to block, silently and with no warning anywhere.
+    * Each half must **actually evaluate.** ``29:00-01:00`` and ``Definitely/Nowhere``
+      both survived to :func:`keel.window.is_merge_open`, where they raised
+      ``ValueError`` / ``ZoneInfoNotFoundError`` out of the middle of a ship run
+      instead of the :class:`ConfigError` every other malformed knob produces.
+    * The window must **have a span.** ``09:00-09:00`` evaluates perfectly well and
+      answers *closed* at every instant there is, so it validated and then deferred
+      every merge for ever (#1091). See :func:`merge_window_issue`.
+
+    Neither check restates a rule of its own: the timezone one asks ``ZoneInfo``, and
+    the window one asks the schema's own ``pattern`` and then ``parse_window``
+    (:func:`merge_window_issue`), so the contract consumers read and the validator that
+    decides cannot drift apart — which they had, over the single-digit hour in
+    ``9:00-18:00``: ``parse_window`` read it, the schema refused it, and the wizard
+    believed ``parse_window`` (#1082).
+    """
+    errors: list[str] = []
+    timezone = data.get("timezone")
+    merge_window = data.get("merge_window")
+    if isinstance(merge_window, str) and timezone is None:
+        errors.append(
+            f"$.merge_window: {merge_window!r} is set but 'timezone' is not; the merge "
+            "window is evaluated in the project timezone, and with none configured every "
+            "hour reads as open — add an IANA 'timezone' or drop 'merge_window'"
+        )
+    if isinstance(timezone, str) and merge_window is None:
+        errors.append(
+            f"$.timezone: {timezone!r} is set but 'merge_window' is not; a timezone on its "
+            "own gates nothing — add 'merge_window: HH:MM-HH:MM' or drop 'timezone'"
+        )
+    if isinstance(timezone, str):
+        issue = timezone_issue(timezone)
+        if issue is not None:
+            errors.append(f"$.timezone: {issue}")
+    if isinstance(merge_window, str):
+        issue = merge_window_issue(merge_window)
+        if issue is not None:
+            errors.append(f"$.merge_window: {issue}")
+    return errors
+
+
 def _build(data: dict) -> ProjectConfig:
     k = data["knobs"]
     knobs = Knobs(
         build_gate_cmd=k["build_gate_cmd"],
         lint_cmd=k.get("lint_cmd"),
         implementer_agents=dict(k.get("implementer_agents", {})),
+        team=team_policy.parse_team(k.get("team")),
         delegate_profiles={
             name: DelegateProfile(
                 vendor=profile["vendor"],
@@ -304,6 +495,7 @@ def _build(data: dict) -> ProjectConfig:
                 model_arg=profile.get("model_arg") or DEFAULT_MODEL_ARG,
                 endpoint=profile.get("endpoint"),
                 api_key_env=profile.get("api_key_env"),
+                vendor_label=profile.get("vendor_label"),
             )
             for name, profile in k.get("delegate_profiles", {}).items()
         },
@@ -315,7 +507,13 @@ def _build(data: dict) -> ProjectConfig:
         required_capabilities=tuple(k.get("required_capabilities", [])),
         optional_capabilities=tuple(k.get("optional_capabilities", [])),
         evidence_gate_label=k.get("evidence_gate_label", "keel:ship"),
-        evidence_require_distinct_vendors=bool(k.get("evidence_require_distinct_vendors", False)),
+        evidence_require_distinct_vendors=(
+            None
+            if k.get("evidence_require_distinct_vendors") is None
+            else bool(k["evidence_require_distinct_vendors"])
+        ),
+        implement_mode=k.get("implement_mode", tdd_mode.DEFAULT_MODE),
+        loop=dict(k["loop"]) if isinstance(k.get("loop"), dict) else None,
         swarm_review_evidence=bool(k.get("swarm_review_evidence", True)),
         gate_timeout_s=int(k.get("gate_timeout_s", DEFAULT_GATE_TIMEOUT_S)),
         jury_timeout_s=int(k.get("jury_timeout_s", DEFAULT_JURY_TIMEOUT_S)),
@@ -351,6 +549,7 @@ def parse_config(data: Any, *, source: str = "<dict>", schema: dict | None = Non
     if not isinstance(data, dict):
         raise ConfigError(source, [f"$: expected an object (got {type(data).__name__})"])
     errors = validate_data(data, schema)
+    errors.extend(_merge_window_issues(data))
     if isinstance(data, dict) and isinstance(data.get("knobs"), dict):
         knobs = data["knobs"]
         errors.extend(
@@ -371,9 +570,21 @@ def parse_config(data: Any, *, source: str = "<dict>", schema: dict | None = Non
                 source=f"{source}: knobs.delegate_profiles",
             )
         )
+        errors.extend(
+            team_policy.team_issues(
+                knobs.get("team"),
+                source=f"{source}: knobs.team",
+                profiles=_profile_vendors(knobs.get("delegate_profiles", {})),
+                implementer_agents=_role_agents(knobs.get("implementer_agents", {})),
+            )
+        )
     if isinstance(data, dict) and isinstance(data.get("policy_pack"), dict):
         for path, names in _policy_capability_fields(data["policy_pack"]):
             errors.extend(validate_names(tuple(names), source=f"{source}: {path}"))
+        # Validated here rather than where the file is written: a template naming
+        # `{repoo}` is a typo whose only symptom would otherwise be a directory by
+        # that name, created successfully, on a machine nobody is watching.
+        errors.extend(f"{source}: {issue}" for issue in _learning_sink_issues(data["policy_pack"]))
     if errors:
         raise ConfigError(source, errors)
     return _build(data)
@@ -565,6 +776,35 @@ def endpoint_issues(endpoint: Any, *, where: str, env=None) -> list[str]:
     return []
 
 
+def _role_agents(role_agents: Any) -> dict[str, str]:
+    """``knobs.implementer_agents`` reduced to its well-formed ``str -> str`` entries."""
+    if not isinstance(role_agents, dict):
+        return {}
+    return {
+        role: agent
+        for role, agent in role_agents.items()
+        if isinstance(role, str) and isinstance(agent, str)
+    }
+
+
+def _profile_vendors(profiles: Any) -> dict[str, str]:
+    """``{profile name: vendor}`` for the well-formed entries of ``delegate_profiles``.
+
+    Deliberately forgiving: a malformed profile is already reported by
+    :func:`_validate_delegate_profiles`, and ``knobs.team`` must not add a second,
+    confusing "unknown provider" error for the same typo.
+    """
+    if not isinstance(profiles, dict):
+        return {}
+    return {
+        name: profile["vendor"]
+        for name, profile in profiles.items()
+        if isinstance(name, str)
+        and isinstance(profile, dict)
+        and isinstance(profile.get("vendor"), str)
+    }
+
+
 def _validate_delegate_profiles(profiles: Any, *, source: str) -> list[str]:
     """Return semantic errors for ``knobs.delegate_profiles`` (empty == valid).
 
@@ -572,12 +812,6 @@ def _validate_delegate_profiles(profiles: Any, *, source: str) -> list[str]:
     this owns the *meaning*: which vendors exist, what each vendor requires, and the
     fail-closed rule that a profile may never shadow a built-in delegate vendor.
     """
-    # Local import on purpose: ``agents`` imports this module for ``ProjectConfig``, so
-    # naming it at module scope would close a real config <-> agents cycle. The vendor
-    # vocabulary belongs next to the dispatch logic in ``agents``, so the import moves
-    # instead of the constant (same pattern as ``runtime._api_token_capability``).
-    from .agents import BUILTIN_DELEGATE_VENDORS
-
     errors: list[str] = []
     if not isinstance(profiles, dict):
         return errors  # the schema already reported the wrong shape
@@ -693,7 +927,64 @@ def _validate_delegate_profiles(profiles: Any, *, source: str) -> list[str]:
                 f"{where}: invalid prompt_mode {prompt_mode!r}; "
                 f"valid: {', '.join(DELEGATE_PROMPT_MODES)}"
             )
+        errors.extend(vendor_label_errors(profile.get("vendor_label"), where=where))
     return errors
+
+
+def vendor_label_errors(label: Any, *, where: str) -> list[str]:
+    """Rules for a ``vendor_label`` — shared by project profiles and the registry (#1129).
+
+    The value becomes ``agent:<label>``, a GitHub label keel *applies* and
+    ``attribution_check`` later reads back. So the rules are about what may be written
+    into that vocabulary, not about the value's spelling for its own sake:
+
+    * it may not shadow a built-in delegate vendor, because the built-in writes the same
+      label from a different provider — which is the ambiguity #1129 is about, inverted;
+    * it may not restate the generic vendor it exists to replace (``cli``), because that
+      is the label the entry already gets and setting it reads as an intent that has no
+      effect;
+    * and it is restricted to the characters every existing vendor token uses, so the
+      label keel writes is the label ``attribution_check`` can match.
+    """
+    if label is None:
+        return []
+    if not isinstance(label, str) or not label.strip():
+        return [
+            f"{where}: vendor_label must be a non-empty string — the vendor name that "
+            "goes in the agent:<vendor> label, e.g. 'xai'"
+        ]
+    if label in BUILTIN_DELEGATE_VENDORS:
+        return [
+            f"{where}: vendor_label {label!r} is a built-in delegate vendor, which writes "
+            f"agent:{label} from a different provider — two providers sharing one label is "
+            "the ambiguity this field exists to remove. Name the model's maker, e.g. 'xai'"
+        ]
+    if label in DELEGATE_PROFILE_VENDORS:
+        return [
+            f"{where}: vendor_label {label!r} is what the label already says; leave it "
+            "unset, or name the model's maker (e.g. 'xai') so agent:<vendor> distinguishes "
+            "this entry from another entry with the same transport"
+        ]
+    if not _VENDOR_LABEL_OK.issuperset(label):
+        bad = "".join(sorted(set(label) - _VENDOR_LABEL_OK))
+        return [
+            f"{where}: vendor_label {label!r} contains {bad!r}; it becomes the GitHub "
+            "label agent:<vendor>, so use lowercase letters, digits, '.', '-' or '_'"
+        ]
+    return []
+
+
+def _learning_sink_issues(policy_pack: dict[str, Any]) -> list[str]:
+    """Problems in `policy_pack.capture.learning`'s write and read paths, or `[]`."""
+    capture_policy = policy_pack.get("capture")
+    if not isinstance(capture_policy, dict):
+        return []
+    learning = capture_policy.get("learning")
+    if not isinstance(learning, dict):
+        return []
+    return capture.learning_sink_errors(learning.get("sink")) + capture.learning_source_errors(
+        learning.get("source")
+    )
 
 
 def _policy_capability_fields(value: Any, path: str = "policy_pack") -> list[tuple[str, list]]:
@@ -738,6 +1029,10 @@ def delegate_profiles_dict(config: ProjectConfig) -> dict:
                 "model_arg": profile.model_arg,
                 "endpoint": profile.endpoint,
                 "api_key_env": profile.api_key_env,
+                # Emitted only when set: this dict is hashed into `config_hash`, and an
+                # added optional field must not rotate the hash for a project that never
+                # used it. Same rule as `delegate_profiles` itself being omitted when empty.
+                **({"vendor_label": profile.vendor_label} if profile.vendor_label else {}),
             }
             for name, profile in sorted(profiles.items())
         }
@@ -770,8 +1065,10 @@ def _canonical(config: ProjectConfig) -> dict:
             "implementer_agents": dict(sorted(config.knobs.implementer_agents.items())),
             # Omitted entirely when empty: emitting "delegate_profiles": {} would rotate
             # config_hash for every project that has never configured one, which is the
-            # normal treatment for an added optional field.
+            # normal treatment for an added optional field. `team` is omitted on the same
+            # rule, which is what makes "config_hash changes iff team changes" true.
             **delegate_profiles_dict(config),
+            **team_policy.canonical(config.knobs.team),
             "tier3_globs": list(config.knobs.tier3_globs),
             "ci_workflows": dict(sorted(config.knobs.ci_workflows.items())),
             "docs_gate_paths": list(config.knobs.docs_gate_paths),
@@ -780,7 +1077,21 @@ def _canonical(config: ProjectConfig) -> dict:
             "required_capabilities": list(config.knobs.required_capabilities),
             "optional_capabilities": list(config.knobs.optional_capabilities),
             "evidence_gate_label": config.knobs.evidence_gate_label,
-            "evidence_require_distinct_vendors": config.knobs.evidence_require_distinct_vendors,
+            # bool(), not the tri-state: an unset knob has always hashed as False, and
+            # adding the "unset" spelling must not rotate config_hash for every project.
+            "evidence_require_distinct_vendors": bool(
+                config.knobs.evidence_require_distinct_vendors
+            ),
+            # Omitted while it is the default, on the `delegate_profiles` / `team` rule:
+            # an added optional knob must not rotate config_hash for the projects that
+            # never set it — and config_hash changes whenever implement_mode does.
+            **(
+                {"implement_mode": config.knobs.implement_mode}
+                if config.knobs.implement_mode != tdd_mode.DEFAULT_MODE
+                else {}
+            ),
+            # Same rule (#1165): present only when the project wrote it.
+            **({"loop": dict(config.knobs.loop)} if config.knobs.loop is not None else {}),
             "swarm_review_evidence": config.knobs.swarm_review_evidence,
             "gate_timeout_s": config.knobs.gate_timeout_s,
             "jury_timeout_s": config.knobs.jury_timeout_s,

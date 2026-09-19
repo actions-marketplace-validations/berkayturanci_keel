@@ -1,11 +1,16 @@
 """Unit tests for keel project-config loading + validation."""
 
 import copy
+import re
 import unittest
+import unittest.mock as mock
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfoNotFoundError
 
 from keel import config as cfg
-from keel import contracts
+from keel import contracts, findings, ship, window
+from keel import team as team_policy
 
 PROJECTS_DIR = Path(__file__).resolve().parent.parent / "projects"
 DOGFOOD_CONFIG = Path(__file__).resolve().parent.parent / ".keel/project.yaml"
@@ -32,6 +37,190 @@ class TestMergeWindowMode(unittest.TestCase):
         data["merge_window_mode"] = "nope"
         with self.assertRaises(cfg.ConfigError):
             cfg.parse_config(data)
+
+
+class TestMergeWindowIsEvaluable(unittest.TestCase):
+    """`timezone` + `merge_window` must be a pair `is_merge_open` can answer *usefully*.
+
+    Three shapes used to pass `keel validate` and then fail somewhere worse (#1076): the
+    half-configured pair silently opened the window, and the two unevaluable values raised
+    out of the middle of a ship run. A fourth evaluates fine and answers uselessly (#1091):
+    a zero-length window is closed at every instant there is.
+    """
+
+    @staticmethod
+    def _config(**overrides):
+        data = copy.deepcopy(VALID)
+        data.update(overrides)
+        return data
+
+    def test_both_absent_is_a_project_that_asked_for_no_window(self):
+        config = cfg.parse_config(self._config())
+        self.assertIsNone(config.timezone)
+        self.assertIsNone(config.merge_window)
+
+    def test_both_present_and_evaluable_parses(self):
+        config = cfg.parse_config(
+            self._config(timezone="Europe/Istanbul", merge_window="07:00-01:30")
+        )
+        self.assertEqual(config.timezone, "Europe/Istanbul")
+        self.assertEqual(config.merge_window, "07:00-01:30")
+
+    def test_merge_window_without_timezone_is_rejected(self):
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(self._config(merge_window="00:00-00:01"))
+        message = str(ctx.exception)
+        self.assertIn("$.merge_window", message)
+        self.assertIn("'timezone' is not", message)
+
+    def test_timezone_without_merge_window_is_rejected(self):
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(self._config(timezone="Europe/Istanbul"))
+        message = str(ctx.exception)
+        self.assertIn("$.timezone", message)
+        self.assertIn("'merge_window' is not", message)
+
+    def test_the_hours_the_old_pattern_let_through_are_rejected(self):
+        # `^[0-2][0-9]:...` accepted 20-29; `is_merge_open` then raised
+        # "hour must be in 0..23" from inside the pipeline.
+        for spec in ("24:00-01:00", "29:00-01:00", "07:00-24:00"):
+            with self.subTest(window=spec):
+                with self.assertRaises(cfg.ConfigError) as ctx:
+                    cfg.parse_config(self._config(timezone="Europe/Istanbul", merge_window=spec))
+                self.assertIn("merge_window", str(ctx.exception))
+
+    def test_out_of_range_minutes_are_rejected(self):
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(self._config(timezone="Europe/Istanbul", merge_window="07:60-01:30"))
+        self.assertIn("merge_window", str(ctx.exception))
+
+    def test_an_unknown_timezone_is_rejected(self):
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(
+                self._config(timezone="Definitely/Nowhere", merge_window="07:00-01:30")
+            )
+        message = str(ctx.exception)
+        self.assertIn("$.timezone", message)
+        self.assertIn("Definitely/Nowhere", message)
+
+    def test_a_timezone_that_is_not_even_a_zone_key_is_rejected(self):
+        # ZoneInfo raises ValueError, not ZoneInfoNotFoundError, for a key it refuses
+        # to look up at all (absolute paths, `..` components).
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(self._config(timezone="/etc/localtime", merge_window="07:00-01:30"))
+        self.assertIn("$.timezone", str(ctx.exception))
+
+    def test_the_schema_pattern_rejects_the_out_of_range_hours_on_its_own(self):
+        # The semantic check is defence in depth; the published contract consumers read
+        # has to refuse these too, and it is what a caller passing its own `schema=` gets.
+        self.assertEqual(cfg.validate_data({**VALID, "merge_window": "07:00-01:30"}), [])
+        for spec in ("24:00-01:00", "29:00-01:00", "07:00-29:00", "07:60-01:30"):
+            with self.subTest(window=spec):
+                errors = cfg.validate_data({**VALID, "merge_window": spec})
+                self.assertTrue(any("merge_window" in e for e in errors), errors)
+
+    def test_merge_window_issue_takes_its_shape_rule_from_the_schema_pattern(self):
+        # #1082: the helper asked `parse_window` alone, which reads the single-digit hour
+        # in '9:00-18:00' that the schema pattern refuses — so `keel init --wizard`
+        # accepted a value the next `keel validate` rejected. One question, one answer.
+        # The span rule below is the one place the two deliberately diverge (#1091).
+        pattern = cfg.merge_window_pattern()
+        self.assertEqual(
+            pattern.pattern, cfg.load_schema()["properties"]["merge_window"]["pattern"]
+        )
+        for spec in ("9:00-18:00", "24:00-01:00", "07:60-01:30", "07:00-01:30"):
+            with self.subTest(window=spec):
+                accepted_by_pattern = pattern.fullmatch(spec) is not None
+                self.assertEqual(cfg.merge_window_issue(spec) is None, accepted_by_pattern)
+                self.assertEqual(
+                    cfg.validate_data({**VALID, "merge_window": spec}) == [], accepted_by_pattern
+                )
+
+    def test_a_zero_length_window_is_rejected(self):
+        # #1091: '09:00-09:00' cleared the pattern, `parse_window` and the pair rule, so
+        # `keel validate` printed OK — and `is_merge_open` then answered False at every
+        # instant, deferring every `keel ship` at the merge gate for ever.
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(self._config(timezone="Etc/UTC", merge_window="09:00-09:00"))
+        message = str(ctx.exception)
+        self.assertIn("$.merge_window", message)
+        self.assertIn("09:00-09:00", message)
+        # The message says what the window would have *done*, not merely that it is refused.
+        self.assertIn("never open", message)
+
+    def test_a_zero_length_window_is_closed_at_every_instant_and_the_pattern_cannot_say_so(self):
+        # The repro from the issue, kept as the reason the rule exists.
+        self.assertFalse(
+            any(
+                window.is_merge_open("Etc/UTC", "09:00-09:00", now=datetime(2026, 1, 1, hh, mm))
+                for hh in range(24)
+                for mm in (0, 30)
+            )
+        )
+        # A regex relates no capture to another, so the published contract takes the shape
+        # on its own: comparing the two ends is something only the semantic layer can do,
+        # which is why this rule sits beside the all-or-nothing one rather than in the schema.
+        self.assertIsNotNone(cfg.merge_window_pattern().fullmatch("09:00-09:00"))
+        self.assertEqual(cfg.validate_data({**VALID, "merge_window": "09:00-09:00"}), [])
+        for spec in ("00:00-00:00", "09:00-09:00", "23:59-23:59"):
+            with self.subTest(window=spec):
+                self.assertIn(spec, cfg.merge_window_issue(spec))
+
+    def test_a_one_minute_window_and_a_wrap_around_window_stay_valid(self):
+        # Only the degenerate equal case is refused. Both of these are open *somewhere*
+        # in the day, which is the property the span rule is really asking about.
+        for spec in ("09:00-09:01", "22:00-06:00"):
+            with self.subTest(window=spec):
+                self.assertIsNone(cfg.merge_window_issue(spec))
+                config = cfg.parse_config(self._config(timezone="Etc/UTC", merge_window=spec))
+                self.assertEqual(config.merge_window, spec)
+                self.assertTrue(
+                    any(
+                        window.is_merge_open("Etc/UTC", spec, now=datetime(2026, 1, 1, hh, mm))
+                        for hh in range(24)
+                        for mm in (0, 1, 30)
+                    )
+                )
+
+    def test_a_relaxed_pattern_would_still_not_get_an_unevaluable_window_through(self):
+        # The pattern subsumes `parse_window` today, so the second check only earns its
+        # keep the day the schema — a contract, and therefore relaxable — stops being the
+        # stricter of the two. With an all-permitting pattern the hour `is_merge_open`
+        # raises on is still refused here, before it can be written to a project.yaml.
+        with mock.patch.object(cfg, "merge_window_pattern", lambda: re.compile(r".*")):
+            self.assertIsNone(cfg.merge_window_issue("07:00-01:30"))
+            self.assertIn("29:00-01:00", cfg.merge_window_issue("29:00-01:00"))
+
+    def test_no_config_can_carry_these_shapes_into_the_window_evaluator(self):
+        """The three downstream outcomes the guard exists to make unreachable."""
+        # 1. The silent one: `assess` reads a missing half as "no window configured"
+        #    and reports the window *open* at every hour, with no bypass recorded.
+        vacuous = ship.assess(
+            changed_files=["README.md"],
+            gate_verdict=findings.summarize([]),
+            timezone=None,
+            merge_window="00:00-00:01",
+        )
+        self.assertTrue(vacuous.window_open)
+        self.assertFalse(vacuous.bypassed_window)
+        # 2. + 3. The loud ones: an out-of-range hour and an unknown zone raise out of
+        #    the middle of a ship run rather than at config time.
+        with self.assertRaises(ValueError):
+            window.is_merge_open("Europe/Istanbul", "29:00-01:00")
+        with self.assertRaises(ZoneInfoNotFoundError):
+            window.is_merge_open("Definitely/Nowhere", "07:00-01:30")
+        # None of the three is reachable from a config any more: every shape that
+        # produced them is refused before a `ProjectConfig` exists.
+        for shape in (
+            {"merge_window": "00:00-00:01"},
+            {"timezone": "Europe/Istanbul"},
+            {"timezone": "Europe/Istanbul", "merge_window": "29:00-01:00"},
+            {"timezone": "Europe/Istanbul", "merge_window": "9:00-18:00"},
+            {"timezone": "Definitely/Nowhere", "merge_window": "07:00-01:30"},
+        ):
+            with self.subTest(shape=shape):
+                with self.assertRaises(cfg.ConfigError):
+                    cfg.parse_config(self._config(**shape))
 
 
 class TestEvidenceGateLabel(unittest.TestCase):
@@ -319,6 +508,42 @@ class TestParse(unittest.TestCase):
         with self.assertRaises(cfg.ConfigError):
             cfg.parse_config(bad)
 
+    def test_implement_mode_defaults_to_the_single_pass_profile(self):
+        self.assertEqual(cfg.parse_config(copy.deepcopy(VALID)).knobs.implement_mode, "default")
+
+        data = copy.deepcopy(VALID)
+        data["knobs"]["implement_mode"] = "tdd"
+        self.assertEqual(cfg.parse_config(data).knobs.implement_mode, "tdd")
+
+    def test_implement_mode_changes_config_hash_only_when_it_is_set(self):
+        base = cfg.parse_config(copy.deepcopy(VALID))
+        explicit_default = copy.deepcopy(VALID)
+        explicit_default["knobs"]["implement_mode"] = "default"
+        # An added optional knob must not rotate config_hash for the projects that never
+        # set it — nor for one that spells out the default it already had.
+        self.assertEqual(cfg.config_hash(base), cfg.config_hash(cfg.parse_config(explicit_default)))
+
+        data = copy.deepcopy(VALID)
+        data["knobs"]["implement_mode"] = "tdd"
+        self.assertNotEqual(cfg.config_hash(base), cfg.config_hash(cfg.parse_config(data)))
+
+    def test_implement_mode_rejects_a_profile_keel_cannot_run(self):
+        bad = copy.deepcopy(VALID)
+        bad["knobs"]["implement_mode"] = "test-first"
+        with self.assertRaises(cfg.ConfigError):
+            cfg.parse_config(bad)
+
+    def test_test_groups_accept_declared_test_paths(self):
+        data = copy.deepcopy(VALID)
+        data["policy_pack"] = {
+            "name": "p",
+            "test_groups": {
+                "unit": {"command": "make test", "paths": ["src/**"], "test_paths": ["tests/**"]}
+            },
+        }
+        config = cfg.parse_config(data)
+        self.assertEqual(config.policy_pack["test_groups"]["unit"]["test_paths"], ["tests/**"])
+
     def test_gate_timeout_defaults_to_600_and_parses(self):
         config = cfg.parse_config(copy.deepcopy(VALID))
         self.assertEqual(config.knobs.gate_timeout_s, 600)  # today's behaviour preserved
@@ -418,6 +643,7 @@ class TestParse(unittest.TestCase):
 
     def test_bad_merge_window_pattern(self):
         bad = copy.deepcopy(VALID)
+        bad["timezone"] = "Europe/Istanbul"
         bad["merge_window"] = "7-1"
         with self.assertRaises(cfg.ConfigError) as ctx:
             cfg.parse_config(bad)
@@ -1166,15 +1392,11 @@ class TestSwarmReviewEvidenceKnob(unittest.TestCase):
     """#828: the swarm review gate defaults on; the opt-out is explicit config."""
 
     def test_defaults_on(self):
-        from keel import config as cfg
-
         knobs = cfg.Knobs(build_gate_cmd="true")
         self.assertTrue(knobs.swarm_review_evidence)
 
     def test_yaml_opt_out_parses(self):
         import tempfile
-
-        from keel import config as cfg
 
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tf:
             tf.write(
@@ -1209,6 +1431,300 @@ class TestSwarmReviewEvidenceKnob(unittest.TestCase):
             import os
 
             os.unlink(path)
+
+
+class TestTeamKnob(unittest.TestCase):
+    """`knobs.team` — schema shape, semantic validation, and hash behaviour (#1014)."""
+
+    TEAM = {
+        "implement": {
+            "default": {"provider": "claude"},
+            "by_role": {
+                "core": {"provider": "agy", "model": "gemini-3.8-flash-high", "effort": "high"}
+            },
+        },
+        "gate": {"provider": "codex", "distinct_from": "implementer"},
+        "review": {
+            "by_tier": {
+                "1": [{"provider": "claude"}],
+                "2": [{"provider": "claude"}, {"provider": "codex"}],
+                "3": "jury",
+            }
+        },
+        "jury": {"mode": "gating", "min_vendors": 2},
+        "fix": {"provider": "implementer"},
+    }
+
+    def _with_team(self, team, knobs=None):
+        data = copy.deepcopy(VALID)
+        data["knobs"].update(knobs or {})
+        data["knobs"]["team"] = team
+        return data
+
+    def test_the_deliverable_shape_parses_into_typed_seats(self):
+        config = cfg.parse_config(self._with_team(self.TEAM))
+
+        team = config.knobs.team
+        self.assertTrue(team.configured)
+        self.assertEqual(team.implement_by_role["core"].model, "gemini-3.8-flash-high")
+        self.assertEqual(team.gate.provider, "codex")
+        self.assertEqual(team.review_by_tier["3"], "jury")
+        self.assertEqual(team.jury_mode, "gating")
+
+    def test_a_profile_name_is_a_provider_a_seat_may_use(self):
+        profiles = {
+            "grok-via-openai-compatible": {
+                "vendor": "openai-compatible",
+                "endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+                "api_key_env": "OPENAI_API_KEY",
+            }
+        }
+        team = {
+            "review": {
+                "by_tier": {
+                    "2": [
+                        {"provider": "claude"},
+                        {"provider": "grok-via-openai-compatible", "effort": "high"},
+                    ]
+                }
+            }
+        }
+
+        config = cfg.parse_config(self._with_team(team, {"delegate_profiles": profiles}))
+
+        self.assertEqual(len(config.knobs.team.review_by_tier["2"]), 2)
+
+    def test_a_malformed_profile_does_not_also_read_as_an_unknown_provider(self):
+        profiles = {"cursor": {"vendor": "cli"}}  # missing `command`
+        team = {"implement": {"default": {"provider": "cursor"}}}
+
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(self._with_team(team, {"delegate_profiles": profiles}))
+
+        self.assertTrue(any("requires a non-empty 'command'" in e for e in ctx.exception.errors))
+        self.assertFalse(any("unknown provider" in e for e in ctx.exception.errors))
+
+    def test_validation_rejects_an_unknown_provider(self):
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(self._with_team({"implement": {"default": {"provider": "nope"}}}))
+
+        self.assertTrue(any("unknown provider 'nope'" in e for e in ctx.exception.errors))
+
+    def test_validation_rejects_a_gate_that_is_the_implementer(self):
+        team = {
+            "implement": {"default": {"provider": "claude"}},
+            "gate": {"provider": "claude", "distinct_from": "implementer"},
+        }
+
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(self._with_team(team))
+
+        self.assertTrue(any("is not a second opinion" in e for e in ctx.exception.errors))
+
+    def test_validation_rejects_an_effort_a_provider_cannot_honour(self):
+        team = {"implement": {"default": {"provider": "ollama", "effort": "high"}}}
+
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(self._with_team(team))
+
+        self.assertTrue(any("no spelling for reasoning effort" in e for e in ctx.exception.errors))
+
+    def test_the_schema_owns_the_shape(self):
+        for team, expected in (
+            ({"implementer": {}}, "unknown property 'implementer'"),
+            ({"gate": {"model": "opus"}}, "missing required property 'provider'"),
+            ({"gate": {"provider": "codex", "distinct_from": "reviewer"}}, "must be one of"),
+            ({"fix": {"provider": "codex", "effort": "maximum"}}, "must be one of"),
+            ({"review": {"by_tier": {"4": "jury"}}}, "unknown property '4'"),
+            ({"jury": {"min_vendors": 1}}, "less than minimum 2"),
+        ):
+            with self.subTest(team=team):
+                errors = cfg.validate_data(self._with_team(team))
+                self.assertTrue(any(expected in e for e in errors), errors)
+
+    def test_an_absent_team_does_not_rotate_config_hash(self):
+        """An added optional field must not move the hash for a project that never
+        used it — the same rule `delegate_profiles` follows.
+
+        The body used to hash `VALID` twice and assert the two agreed, which is a
+        property of `config_hash` being a function and says nothing about `team`.
+        What carries the guarantee is that an absent `team` is a *different thing*
+        from one declared empty: `TeamPolicy` records that as `configured`, and a
+        version that dropped the distinction would hash both the same. So that is
+        what is asserted.
+        """
+        base = cfg.parse_config(copy.deepcopy(VALID))
+        self.assertFalse(base.knobs.team.configured)
+
+        declared_empty = copy.deepcopy(VALID)
+        declared_empty["knobs"]["team"] = {}
+        parsed = cfg.parse_config(declared_empty)
+        self.assertTrue(parsed.knobs.team.configured)
+        self.assertNotEqual(
+            cfg.config_hash(base),
+            cfg.config_hash(parsed),
+            "a project that never wrote `team:` must not hash like one that wrote it empty",
+        )
+
+    def test_config_hash_changes_when_and_only_when_team_changes(self):
+        base = cfg.config_hash(cfg.parse_config(copy.deepcopy(VALID)))
+        with_team = cfg.config_hash(cfg.parse_config(self._with_team(self.TEAM)))
+        changed = copy.deepcopy(self.TEAM)
+        changed["gate"]["provider"] = "anthropic-api"
+        with_changed = cfg.config_hash(cfg.parse_config(self._with_team(changed)))
+
+        self.assertNotEqual(base, with_team)
+        self.assertNotEqual(with_team, with_changed)
+        self.assertEqual(with_team, cfg.config_hash(cfg.parse_config(self._with_team(self.TEAM))))
+
+    def test_the_team_reaches_the_published_contract(self):
+        config = cfg.parse_config(self._with_team(self.TEAM))
+
+        knobs = contracts.project_as_dict(config)["knobs"]
+
+        self.assertEqual(knobs["team"]["review"]["by_tier"]["3"], "jury")
+        self.assertNotIn("team", contracts.project_as_dict(cfg.parse_config(VALID))["knobs"])
+
+    def test_distinct_vendors_is_tri_state(self):
+        unset = cfg.parse_config(copy.deepcopy(VALID))
+        explicit = copy.deepcopy(VALID)
+        explicit["knobs"]["evidence_require_distinct_vendors"] = False
+
+        self.assertIsNone(unset.knobs.evidence_require_distinct_vendors)
+        self.assertIs(cfg.parse_config(explicit).knobs.evidence_require_distinct_vendors, False)
+        # Unset has always hashed as False; adding the "unset" spelling must not rotate
+        # config_hash for every project that never set the knob.
+        self.assertEqual(cfg.config_hash(unset), cfg.config_hash(cfg.parse_config(explicit)))
+        # …and since #1065 the two also *resolve* the same, which is what makes the hash
+        # honest: the tier was never an input to the hash, so making the effective value
+        # tier-independent moved no project's config_hash either.
+        self.assertIs(
+            team_policy.require_distinct_vendors(unset.knobs.evidence_require_distinct_vendors),
+            team_policy.require_distinct_vendors(False),
+        )
+
+    def test_keels_own_configs_describe_the_team_that_reviews_keel_today(self):
+        """Both dogfood configs, and they must match — `make validate` checks both.
+
+        The policy here is not the reference example: it is who actually reviews keel,
+        so it must not gate a merge on a seat or a verdict that does not exist yet. The
+        `"3": jury` shape stays documented in `configuration.md#team` as the intended
+        future (#1015 wires the jury into s7), not as keel's live config.
+        """
+        for path in (DOGFOOD_CONFIG, PROJECTS_DIR / "keel.yaml"):
+            with self.subTest(config=path.name):
+                config = cfg.load_config(path)
+
+                team = config.knobs.team
+                self.assertTrue(team.configured)
+                self.assertEqual(team.implement_by_role["core"].kind, "subagent")
+                self.assertEqual(team.gate.provider, "agy")
+                self.assertEqual(team.gate.distinct_from, "implementer")
+                self.assertEqual(
+                    [seat.provider for seat in team.review_by_tier["2"]], ["claude", "agy"]
+                )
+                self.assertEqual(
+                    [seat.provider for seat in team.review_by_tier["3"]],
+                    ["claude", "agy", "subagent:opus-reviewer"],
+                )
+                # Advisory until the jury actually runs from s7: keel does not get to
+                # make its own merge wait on a panel nobody dispatches.
+                self.assertEqual(team.jury_mode, "advisory")
+                # Explicitly off, not unset. Since #1065 that is the same answer the
+                # default gives, and the line stays deliberately: the check would demand
+                # three pairwise-distinct vendors from a panel that is anthropic + google
+                # + anthropic, and a project that has decided something should say so.
+                self.assertIs(config.knobs.evidence_require_distinct_vendors, False)
+
+    def test_a_malformed_implementer_agents_entry_does_not_break_gate_validation(self):
+        # A YAML mapping key is not necessarily a string; the gate rule reads this knob
+        # now, so it has to survive one. The schema reports the shape separately.
+        data = self._with_team(
+            {"gate": {"provider": "codex", "distinct_from": "implementer"}},
+            {"implementer_agents": {"core": "claude", 7: "codex", "docs": None}},
+        )
+
+        errors = [error for error in cfg.validate_data(data) if "knobs.team" in error]
+
+        self.assertEqual(errors, [])
+        with self.assertRaises(cfg.ConfigError):
+            cfg.parse_config(data)  # the schema still refuses the malformed keys
+
+    def test_a_non_object_implementer_agents_is_left_to_the_schema(self):
+        # The gate rule reads this knob, so `knobs.team` validation must not add a second
+        # error (or a TypeError) on top of the schema's "expected type object".
+        data = self._with_team({"gate": {"provider": "codex"}}, {"implementer_agents": "codex"})
+
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            cfg.parse_config(data)
+
+        self.assertTrue(any("implementer_agents" in error for error in ctx.exception.errors))
+        self.assertFalse(any("knobs.team" in error for error in ctx.exception.errors))
+
+    def test_the_two_dogfood_configs_are_the_same_file(self):
+        self.assertEqual(
+            DOGFOOD_CONFIG.read_text(encoding="utf-8"),
+            (PROJECTS_DIR / "keel.yaml").read_text(encoding="utf-8"),
+        )
+
+
+class TestLoopKnob(unittest.TestCase):
+    """``knobs.loop`` (#1165): parsed as written, refused when malformed, hash-neutral unset."""
+
+    def test_unset_is_none_and_does_not_rotate_config_hash(self):
+        """Both halves of the name, because only one of them was ever checked.
+
+        The guarantee is that adding this knob left `config_hash` alone for every
+        project that never set it — stated in the #1165 changelog entry, in
+        `docs/keel/configuration.md`, and in #1165's own acceptance. It rests on
+        one guard in `config.py`, which omits the key entirely when the knob is
+        unset rather than hashing an empty mapping.
+
+        Asserting only that *setting* the knob rotates the hash cannot see that
+        guard: a version that always hashes `{"loop": {}}` rotates on a set knob
+        too, and passed the whole suite. What separates the two is the **empty
+        declaration** — `loop: {}` is a declaration keel keeps (see the test
+        below), so it must hash differently from never having written the key.
+        Fold the guard away and those two collide, which is the assertion that
+        was missing.
+        """
+        base = cfg.parse_config(copy.deepcopy(VALID))
+        self.assertIsNone(base.knobs.loop)
+
+        declared_empty = copy.deepcopy(VALID)
+        declared_empty["knobs"]["loop"] = {}
+        self.assertNotEqual(
+            cfg.config_hash(base),
+            cfg.config_hash(cfg.parse_config(declared_empty)),
+            "an unset knob must not hash like one declared empty",
+        )
+
+        data = copy.deepcopy(VALID)
+        data["knobs"]["loop"] = {"max_iterations": 2}
+        parsed = cfg.parse_config(data)
+        self.assertEqual(parsed.knobs.loop, {"max_iterations": 2})
+        self.assertNotEqual(cfg.config_hash(base), cfg.config_hash(parsed))
+
+    def test_an_empty_block_is_kept_as_a_declaration(self):
+        data = copy.deepcopy(VALID)
+        data["knobs"]["loop"] = {}
+        self.assertEqual(cfg.parse_config(data).knobs.loop, {})
+
+    def test_malformed_values_are_refused_where_the_config_is_read(self):
+        for bad_loop in (
+            {"max_iterations": 0},
+            {"max_iterations": 11},
+            {"max_iterations": "3"},
+            {"gate_output_max_bytes": 1},
+            {"enabled": "yes"},
+            {"nope": 1},
+            "loop",
+        ):
+            with self.subTest(loop=bad_loop):
+                bad = copy.deepcopy(VALID)
+                bad["knobs"]["loop"] = bad_loop
+                with self.assertRaises(cfg.ConfigError):
+                    cfg.parse_config(bad)
 
 
 if __name__ == "__main__":

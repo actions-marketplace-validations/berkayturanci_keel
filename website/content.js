@@ -12,10 +12,10 @@ window.KEEL = {
     tagline: "Turn coding agents into work owners.",
     blurb:
       "A project-neutral, multi-agent workflow backbone that drives a GitHub issue from intake to done — projects set values and snap in their own Lego.",
-    version: "v1.19.2",
+    version: "v1.23.1",
     installBrew: "brew tap berkayturanci/keel && brew install keel",
     install: "pip install keel-workflow",
-    installAlt: "pip install \"git+https://github.com/berkayturanci/keel@v1.19.2\"",
+    installAlt: "pip install \"git+https://github.com/berkayturanci/keel@v1.23.1\"",
     pluginAdd: "/plugin marketplace add berkayturanci/keel",
     pluginInstall: "/plugin install keel",
     repo: "https://github.com/berkayturanci/keel",
@@ -33,10 +33,10 @@ window.KEEL = {
     { id: "s1",  name: "select",    blurb: "Pick the unit of work — a GitHub issue — from the backlog.", slots: ["before:select", "select", "after:select"] },
     { id: "s2",  name: "branch",    blurb: "Cut a work branch off the project's base branch.", slots: ["before:branch", "after:branch"] },
     { id: "s3",  name: "guard",     blurb: "Enforce preflight rules before any code is written.", slots: ["guard"], slot: true, block: true },
-    { id: "s4",  name: "implement", blurb: "The coding agent writes the change.", slots: ["before:implement", "after-implement"], agent: true, slot: true },
+    { id: "s4",  name: "implement", blurb: "The coding agent writes the change — in one pass, or test-first under <code>implement_mode: tdd</code>.", slots: ["before:implement", "after-implement"], agent: true, slot: true },
     { id: "s5",  name: "classify",  blurb: "Classify risk tier from the touched paths.", slots: ["classify", "after:classify"], agent: true },
     { id: "s6",  name: "ci",        blurb: "Wait on the project's CI workflows.", slots: ["before:ci", "after:ci"] },
-    { id: "s7",  name: "review",    blurb: "Parallel reviewers — plus the opt-in <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>jury</a> gate.", slots: ["reviewers", "after:review"], agent: true, slot: true },
+    { id: "s7",  name: "review",    blurb: "Parallel reviewers — plus the opt-in <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>jury</a> gate, or the panel <i>as</i> the review.", slots: ["reviewers", "after:review"], agent: true, slot: true },
     { id: "s8",  name: "test",      blurb: "Run the build / lint / test gates.", slots: ["tester", "test", "after:test"], slot: true, block: true },
     { id: "s9",  name: "fixloop",   blurb: "Bounded rounds of fixes until gates pass.", slots: ["before:fixloop", "fixloop", "after:fixloop"] },
     { id: "s10", name: "merge",     blurb: "Merge — inside the window, behind the lock, after pre-merge gates.", slots: ["pre-merge", "after:merge"], slot: true, block: true },
@@ -59,7 +59,7 @@ window.KEEL = {
       cmd: "keel:ship",
       one: "Drive a GitHub issue end-to-end through the whole backbone.",
       detail:
-        "Select → branch → implement → CI → review → test → merge → close → capture. The full flow: per-round review, inline file:line comments, --delegate / --review-delegate (incl. hosted-API anthropic-api:MODEL / openai-api:MODEL / google-api:MODEL — no agent CLI, just an API key; plus generic OpenAI-compatible and CLI profiles), --reviewers N, the <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>ai-jury</a> gate, the timezone-aware merge window + mkdir merge lock, and vendor+model attribution. <b>--compound</b> selects the compound-engineering profile — same backbone and safety primitives, with implement / review / fixloop / capture (s4·s7·s9·s11) as compound step overrides.",
+        "Select → branch → implement → CI → review → test → merge → close → capture. The full flow: per-round review, inline file:line comments, --delegate / --review-delegate (incl. hosted-API anthropic-api:MODEL / openai-api:MODEL / google-api:MODEL — no agent CLI, just an API key; plus generic OpenAI-compatible and CLI profiles), --reviewers N, the <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>ai-jury</a> gate, the timezone-aware merge window + mkdir merge lock, and vendor+model attribution. <b>--compound</b> selects the compound-engineering profile — same backbone and safety primitives, with implement / review / fixloop / capture (s4·s7·s9·s11) as compound step overrides. <b>--tdd</b> (<code>knobs.implement_mode: tdd</code>) selects the test-first s4 profile: a test-only commit carrying the issue's acceptance criteria, then the implementation, verified at s8 by the blocking <code>tdd-order</code> gate. <b>--loop</b> (<code>knobs.loop</code>) iterates s4 with the gates as the judge, up to <code>max_iterations</code>. <b>--team</b> and <b>--effort</b> staff the run from a named <code>knobs.team</code> bench.",
     },
     {
       slug: "swarm", name: "/keel:swarm", group: "Flagship", flagship: true, featured: true, scene: "swarm",
@@ -163,7 +163,7 @@ window.KEEL = {
   /* ---- example invocation per command (illustrative) ------------- */
   cmdExample: {
     "ship": "/keel:ship --issue 128 --reviewers 3",
-    "swarm": "/keel:swarm 714 715 716 717 --rebalance",
+    "swarm": "/keel:swarm 714 715 716 717 --tree",
     "implement": "/keel:implement --issue 128",
     "review-cycle": "/keel:review-cycle --pr 214 --comments inline",
     "pr-loop": "/keel:pr-loop --pr 214",
@@ -196,12 +196,16 @@ window.KEEL = {
     ["keel run-gates <cfg>", "run the project's build / lint / command gates"],
     ["keel window <cfg>", "is the merge window open right now?"],
     ["keel ship <cfg>", "full dry assessment: tier, window, gates, decision"],
-    ["keel merge <cfg> --pr N", "fail-closed core-owned merge: lock → window re-check → CI rollup → evidence → gh merge"],
+    ["keel merge <cfg> --pr N", "fail-closed core-owned merge: lock → window re-check → CI rollup → evidence → gh merge (over REST when GraphQL is blocked)"],
+    ["keel review <cfg> --pr N --reviews FILE", "render, post and re-verify a review evidence bundle in one idempotent step"],
+    ["keel review <cfg> --pr N --from-jury REPORT", "the ai-jury panel IS the review: one head-pinned verdict per ballot, with its vendor + model, plus the panel's consensus record"],
+    ["keel fixloop brief --findings FILE", "s9: render the round's fix brief and name its fixer, walking the implementer → gate → host ladder"],
     ["keel evidence-verify <cfg> --pr N", "verify the PR carries the required public evidence (closure markers, reviewer verdicts, jury)"],
     ["keel status [--json]", "progress snapshot for long work blocks (checkpoint + run ledger)"],
     ["keel checkpoint / keel resume", "write the safe resume point at step boundaries; render a dry-run resume plan after interruption"],
     ["keel ledger <cfg> [--limit N]", "read the structured run ledger offline (with capture health)"],
     ["keel capture-verify --merged-pr N", "assert exactly one valid capture marker per merged PR"],
+    ["keel capture-land <cfg> --pr N --onto BRANCH --write", "s10: write this run's lesson and commit it onto the pull request (in-repo sink, create-learning), so it merges with the work"],
     ["keel claim / keel release", "single-host resource claims — the mkdir lock primitive keel merge uses"],
     ["keel post-comment --artifact …", "the sanctioned write path for evidence artifacts — marker-validated, idempotent per run-id"],
     ["keel runcontrols <events>", "deterministic work caps: run budget, per-slot caps, oscillation detection — hard halts fail closed"],
@@ -226,6 +230,9 @@ window.KEEL = {
     ["timezone · merge_window", "Timezone-aware HH:MM–HH:MM window; merges only happen inside it."],
     ["gates", "Built-in build / lint / test gates run at the s8 test step."],
     ["knobs", "Runnable commands, risk globs, docs paths, CI workflow mapping, local agent roles, runtime capabilities."],
+    ["knobs.team", "The whole team as values: who implements (per issue role, model and reasoning effort), the mandatory gate reviewer from a different vendor, the reviewer seats per risk tier — or <code>jury</code>, when the cross-vendor panel <b>is</b> the review — who applies the findings, and named benches selected with <code>--team</code>."],
+    ["knobs.implement_mode", "<code>default</code> or <code>tdd</code>. Test-first splits s4 into a test-only commit and the implementation, and adds the blocking <code>tdd-order</code> gate at s8."],
+    ["knobs.loop", "A bounded, gate-verified s4 loop: up to <code>max_iterations</code> implement passes, each judged by the command gates, ending at the first green run; a budget spent while still red blocks the issue. With <code>tdd</code> it wraps the implementation phase only. <code>--loop</code> turns it on for one run."],
     ["extensions", "Add-only hooks — your Lego — snapped into named backbone slots."],
     ["policy_pack", "Durable project data: labels, lifecycle, risk rules, test groups, docs policy, health providers, review rubric."],
   ],
@@ -252,6 +259,9 @@ window.KEEL = {
     ["Do projects ever fork the backbone?", "No — that's the whole point. The ordered step machine and its invariants live in keel-core, which is installed and pinned, never copied. Projects only ever touch Layer 2 (values in project.yaml) and Layer 3 (add-only extensions). Changing the backbone is a keel-core change."],
     ["What does a command actually read?", "Every command is project-neutral. It never hardcodes a branch, build/lint command, agent, glob, timezone or window — it references the knob by name and asks the keel CLI for the value, so the same /keel:ship behaves differently in each repo purely from that repo's .keel/project.yaml."],
     ["What's the jury gate?", "An opt-in review gate that runs the <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>ai-jury</a> multi-agent reviewer on the diff when it's installed, and is a fail-soft no-op otherwise. It snaps into the s7 review step."],
+    ["Who implements, reviews and fixes — and can I change it?", "<code>knobs.team</code> states the whole team as values: the implementer per issue role (with model and reasoning effort), one mandatory gate reviewer from a <i>different</i> vendor, the reviewer seats for each risk tier, and the seat that applies the findings in the s9 fix loop. <code>keel plan</code> / <code>keel ship --json</code> render it as one resolved <code>assignment</code>, so every host runs the same team, and <code>keel validate</code> refuses a policy keel cannot execute — an unknown provider, a reasoning effort a vendor has no spelling for, or a gate reviewer that is the implementer. <code>--team &lt;profile&gt;</code> and <code>--effort</code> pick a named bench for one run."],
+    ["Can the jury panel be the review itself, not an extra gate?", "Yes — set a tier's seats to the string <code>jury</code> (<code>knobs.team.review.by_tier.\"3\": jury</code>) and s7 dispatches the <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>ai-jury</a> panel <b>once</b> instead of running host readers beside it. <code>keel review --from-jury &lt;report.json&gt;</code> then turns the panel's report into the run's public evidence: one head-pinned review verdict per panelist ballot, carrying the vendor and model that produced it, plus the panel's consensus record — in one call, so everything is pinned to the same head SHA. The panel's <i>verified</i> findings are what the fix loop receives. Adopt it deliberately: on a panel tier no per-run flag can take the panel back off."],
+    ["Can keel write the tests first?", "Yes. <code>knobs.implement_mode: tdd</code> (or <code>--tdd</code> for one run) splits s4 into two phases — a test-only commit carrying the issue's acceptance criteria, then the implementation — and s8 gains the pure, blocking <code>tdd-order</code> gate, which checks that commit order against the project's <code>test_groups</code> paths. So “tests first” is verified, not asserted."],
     ["Does keel use itself?", "Yes. keel drives itself: its config is .keel/project.yaml (Python, make test + make lint gates) and CI runs keel on keel-core on every push. If a gate fails, keel blocks its own merge — the same backbone every consumer gets."],
     ["What do I need installed?", "Python 3.11+ and PyYAML — that's the one runtime dependency (on Windows, also tzdata for the timezone database). It runs on Linux, macOS, and Windows. The pure core is stdlib-first. Adapters install the /keel:&lt;command&gt; workflows into the surfaces your agents already read."],
   ],
@@ -327,9 +337,9 @@ window.KEEL = {
     },
     {
       group: "Reference", title: "Commands", slug: "commands",
-      summary: "All 16 /keel:&lt;command&gt; agentic workflows, each project-neutral, grouped by purpose.",
+      summary: "All 17 /keel:&lt;command&gt; agentic workflows, each project-neutral, grouped by purpose.",
       body:
-        "<p>keel ships <b>16</b> agentic workflow commands with the package. Install them with <code>keel install-adapter claude</code> (native Claude slash commands), <code>skills</code> (one shared skill set every other agent reads), or <code>all</code>. The <code>keel</code> CLI does the deterministic work; these commands are the agentic flows.</p>" +
+        "<p>keel ships <b>17</b> agentic workflow commands with the package. Install them with <code>keel install-adapter claude</code> (native Claude slash commands), <code>skills</code> (one shared skill set every other agent reads), or <code>all</code>. The <code>keel</code> CLI does the deterministic work; these commands are the agentic flows.</p>" +
         "<p>Every command step is an <b>evidence-bearing contract</b>: a generated adapter must complete the step, record the requested evidence, or explicitly mark it <code>N/A — &lt;reason&gt;</code>. Public side effects (PR bodies, review summaries, verdicts, issues, reports) must go through the selected transport — chat-only notes don't count.</p>",
       render: "commands",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/commands.md",
@@ -345,16 +355,25 @@ window.KEEL = {
     },
     {
       group: "Reference", title: "Parameter reference", slug: "parameter-reference",
-      summary: "The exhaustive per-flag reference: every flag's type, default, the contract fields it changes, precedence rules, and exit codes.",
+      summary: "Per-flag depth for the /keel:ship grammar and the subcommands a ship run drives: type, default, the contract fields each flag changes, precedence rules, and exit codes.",
       body:
-        "<p>One level deeper than the CLI quick reference: every flag's type and allowed values, its default, the exact contract fields and gates it changes, precedence and interaction rules (e.g. <code>--no-jury</code> &gt; <code>--jury</code> &gt; tier-3 auto-on), and what makes a command exit non-zero. Covers the shared flag families — <code>--root</code>, <code>--json</code>, <code>--live</code> / <code>--dry-run</code>, the consent flags, issue-intake flags, and the review / jury family — plus every subcommand from <code>keel setup</code> to <code>keel resume</code>. Every claim is grounded in <code>src/keel/cli.py</code> and the pure modules it calls.</p>",
+        "<p>One level deeper than the CLI quick reference: every flag's type and allowed values, its default, the exact contract fields and gates it changes, precedence and interaction rules (e.g. <code>--no-jury</code> &gt; <code>--jury</code> &gt; tier-3 auto-on), and what makes a command exit non-zero. Covers the shared flag families — <code>--root</code>, <code>--json</code>, <code>--live</code> / <code>--dry-run</code>, the consent flags, issue-intake flags, and the review / jury family — plus the subcommands a ship run drives, including <code>keel review</code> (with <code>--from-jury</code>) and <code>keel fixloop brief</code>. It is not yet a per-flag reference for the whole CLI: eighteen subcommands are covered in the CLI reference only, and the page names them. Every claim is grounded in <code>src/keel/cli.py</code> and the pure modules it calls.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/parameter-reference.md",
     },
     {
       group: "Reference", title: "Configuration", slug: "configuration",
       summary: "project.yaml fields: core, base_branch, timezone/merge_window, gates, knobs, extensions, policy_pack.",
       body:
-        "<p>A keel consumer is configured with <b>values, not copied command bodies</b>. Top-level fields choose the core version, repository, base branch, timezone, merge window, built-in gates, extension directory and add-only hooks. <code>knobs</code> declares runnable commands, risk globs, docs paths, CI workflow mapping, local agent roles and runtime capabilities. <code>policy_pack</code> is durable project-owned data. Unknown keys are rejected by the bundled schema, so the reference is intentionally strict.</p>",
+        "<p>A keel consumer is configured with <b>values, not copied command bodies</b>. Top-level fields choose the core version, repository, base branch, timezone, merge window, built-in gates, extension directory and add-only hooks. <code>knobs</code> declares runnable commands, risk globs, docs paths, CI workflow mapping, local agent roles and runtime capabilities. <code>policy_pack</code> is durable project-owned data. Unknown keys are rejected by the bundled schema, so the reference is intentionally strict.</p>" +
+        "<p><b><code>knobs.team</code> is the whole team as values.</b> Who implements (per issue role, with model and reasoning effort), the one mandatory gate reviewer from a <i>different</i> vendor, the reviewer seats per risk tier — or the string <code>jury</code>, when the cross-vendor panel <b>is</b> that tier's review — who applies the findings in the s9 fix loop, and named benches an operator selects with <code>--team &lt;profile&gt;</code>. It resolves into a single <code>assignment</code> that <code>keel plan</code> and <code>keel ship --json</code> publish, so every host runs the same team, and <code>keel validate</code> refuses a policy keel cannot execute.</p>" +
+        "<p><b><code>knobs.implement_mode</code></b> chooses the s4 profile: <code>default</code> (one pass) or <code>tdd</code> (test-first — a test-only commit carrying the issue's acceptance criteria, then the implementation, with the blocking <code>tdd-order</code> gate added at s8). <code>--tdd</code> is the per-run spelling.</p>" +
+        "<p><b><code>knobs.loop</code></b> makes s4 a bounded, gate-verified loop: after each iteration the command gates run; green ends it, red starts the next iteration with the same brief plus the gate output, up to <code>max_iterations</code>. The judge is the gate run, never the implementer's own \"done\"; every iteration is one commit the ledger names, and the loop composes with <code>tdd</code> by wrapping its implementation phase. <code>--loop</code> is the per-run spelling.</p>" +
+        "<p><b>Test-first, in one config.</b> <code>tdd</code> needs the test paths the order is checked against, declared once in <code>policy_pack.test_groups</code>:</p>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Test-first configuration'><code>knobs:\n  build_gate_cmd: \"make test\"\n  implement_mode: tdd\n\npolicy_pack:\n  name: my-project\n  test_groups:\n    unit:\n      command: \"make test\"\n      paths: [\"src/**\", \"tests/**\"]   <span class='cm'># what makes the group relevant</span>\n      test_paths: [\"tests/**\"]        <span class='cm'># where the tests actually live</span></code></pre>" +
+        "<p>s4 then runs two phases against the same provider, one commit each: first the failing tests the issue's acceptance criteria call for — test paths only, expected red — then the change that turns them green without weakening a test. At s8 the blocking <code>tdd-order</code> gate reads the branch history and checks the order: the first commit touches test paths only and adds or modifies a test, no later commit removes one, a later commit changes the code, and the rest of the gate run is green. For one run: <code>/keel:ship 42 --tdd</code>.</p>" +
+        "<p><b>The loop: the Ralph loop's shape, with the gates as its judge.</b></p>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Loop configuration'><code>knobs:\n  build_gate_cmd: \"make test\"\n  loop:\n    max_iterations: 3              <span class='cm'># 1–10; 1 is the single pass</span>\n    gate_output_max_bytes: 16384   <span class='cm'># gate output quoted into the next brief</span></code></pre>" +
+        "<p>Iteration 1 is the ordinary implement pass. After each one the command gates run: green ends the loop; red starts the next iteration with the <b>same brief</b> plus the gate output from the one before, up to <code>max_iterations</code>. A budget spent with the gates still red blocks the issue. As in the Ralph loop, the prompt stays fixed while the code and the test output change. Unlike it, the gate run decides when the work is done, not the agent's own completion promise. And each iteration is one commit — <code>loop(k/N): &lt;issue title&gt;</code> — that the ledger and the closure comment can point at. For one run: <code>/keel:ship 42 --loop</code>; with <code>--tdd</code> as well, the loop wraps the implementation phase.</p>",
       render: "config",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/configuration.md",
     },
@@ -362,14 +381,15 @@ window.KEEL = {
       group: "Architecture", title: "Evidence chain & auditability", slug: "evidence",
       summary: "How keel guarantees commit-SHA-bound review provenance, model attribution, and auditable exceptions.",
       body:
-        "<p>Every PR merged through Keel carries an unbroken, tamper-evident record of reviewer verdicts, test results, and agent attribution. Approvals are cryptographically locked to the exact <code>HEAD_SHA</code> commit to prevent approval drift across subsequent pushes, with fully audited exception tracking via <code>--deferral</code>.</p>",
+        "<p>Every PR merged through Keel carries an unbroken, tamper-evident record of reviewer verdicts, test results, and agent attribution. Approvals are pinned to the exact <code>HEAD_SHA</code> commit to prevent approval drift across subsequent pushes — a lesson <code>keel capture-land</code> lands is the one commit they survive — with fully audited exception tracking via <code>--deferral</code>.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/evidence.md",
     },
     {
       group: "Architecture", title: "Supported AI models & providers", slug: "models",
       summary: "How to use any AI model: hosted APIs (Claude, OpenAI, Gemini), OpenAI-compatible gateways (OpenRouter, Groq, DeepSeek), local Ollama/vLLM, and agent CLIs.",
       body:
-        "<p>Keel is model-neutral. Drive implementations (<code>s4</code>) or reviews (<code>s7</code>) using direct hosted APIs (<code>anthropic-api:</code>, <code>openai-api:</code>, <code>google-api:</code>), OpenAI-compatible profiles for OpenRouter, DeepSeek, Groq, Together AI and local vLLM, local offline Ollama models, or official agent CLIs (Claude, Codex, Antigravity).</p>",
+        "<p>Keel is model-neutral. Drive implementations (<code>s4</code>) or reviews (<code>s7</code>) using direct hosted APIs (<code>anthropic-api:</code>, <code>openai-api:</code>, <code>google-api:</code>), OpenAI-compatible profiles for OpenRouter, DeepSeek, Groq, Together AI and local vLLM, local offline Ollama models, or official agent CLIs (Claude, Codex, Antigravity).</p>" +
+        "<p>A project states its seats in <code>knobs.team</code> — or hands a whole tier to the panel with <code>knobs.team.review.by_tier.\"3\": jury</code>, after which <code>keel review --from-jury &lt;report.json&gt;</code> maps each panelist's ballot onto a head-pinned review verdict carrying the vendor and model that produced it, alongside the panel's consensus record. Adopt it deliberately: a panel tier has no host seats to fall back on, and no per-run flag can take the panel away.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md",
     },
     {
@@ -380,7 +400,7 @@ window.KEEL = {
         "<h3>1. Static Dependency DAG & Wave Partitioning</h3>" +
         "<p>Swarm computes file-overlap conflict graphs and explicit issue dependencies (<code>blocks #N</code> / <code>depends on #N</code>) without executing code. Orthogonal clusters are scheduled in parallel in <b>Wave 1</b>, while dependent or overlapping clusters are sequenced into subsequent waves (<code>Wave 2</code>, <code>Wave 3</code>).</p>" +
         "<h3>2. Cross-Model Routing & Unified AI Jury Panel</h3>" +
-        "<p>Different clusters can be assigned to different models and agent vendors concurrently via <code>knobs.implementer_agents</code> and <code>knobs.delegate_profiles</code>:</p>" +
+        "<p>Different clusters can be assigned to different models and agent vendors concurrently via <code>knobs.team.implement.by_role</code> and <code>knobs.delegate_profiles</code>:</p>" +
         "<ul>" +
         "<li><b>Core / Architecture</b>: Claude 3.7 Sonnet / Claude Code (<code>claude</code>)</li>" +
         "<li><b>Frontend / Visual</b>: Google Gemini 2.5 Flash / Antigravity (<code>agy</code> / <code>google-api:</code>)</li>" +
@@ -400,9 +420,9 @@ window.KEEL = {
     },
     {
       group: "Architecture", title: "Security & policy presets", slug: "security",
-      summary: "Declarative security presets (Bandit, Gitleaks, Semgrep, Trivy), ReDoS-safe redaction, and concurrent gates.",
+      summary: "Declarative security presets (Bandit, Gitleaks, Semgrep, Trivy) and ReDoS-safe redaction.",
       body:
-        "<p>Keel provides built-in declarative security presets (<code>policy_pack.presets: ['bandit', 'gitleaks', 'semgrep', 'trivy']</code>) that automatically slot static analysis and secret scanning into the backbone. Combined with ReDoS-resilient capture redaction, least-privilege CI actions, and concurrent gate execution (<code>--concurrency</code>), projects achieve robust security auditing with zero custom scripts.</p>",
+        "<p>Keel provides built-in declarative security presets (<code>policy_pack.presets: ['bandit', 'gitleaks', 'semgrep', 'trivy']</code>) that automatically slot static analysis and secret scanning into the backbone. Combined with ReDoS-resilient capture redaction and least-privilege CI actions, projects achieve robust security auditing with zero custom scripts.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/configuration.md#policy_packpresets",
     },
     {
@@ -439,7 +459,8 @@ window.KEEL = {
       group: "Reference", title: "GitHub transport", slug: "github-transport",
       summary: "How keel selects a GitHub transport (gh CLI, API, …) and normalizes operations across them.",
       body:
-        "<p>Issue, PR, review and comment operations go through a selected <b>transport</b> with normalized capabilities \u2014 so the same command works whether the session has the <code>gh</code> CLI, direct API access, or a restricted runner. Public side effects must go through the transport; chat-only notes never satisfy a step.</p>",
+        "<p>Issue, PR, review and comment operations go through a selected <b>transport</b> with normalized capabilities \u2014 so the same command works whether the session has the <code>gh</code> CLI, direct API access, or a restricted runner. Public side effects must go through the transport; chat-only notes never satisfy a step.</p>" +
+        "<p><b>The merge path runs where GraphQL is blocked.</b> <code>keel merge</code> takes <code>--transport auto|graphql|rest</code>: <code>auto</code> tries GraphQL and switches to REST only when a probe finds that endpoint blocked. The claim, window, rollup, evidence and SHA-pinned gates-pass are the same objects on either wire, and the merge payload records which one answered. Its read-only drift check, <code>keel verify-merge</code>, takes the same flag.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/github-transport.md",
     },
     {
@@ -511,11 +532,13 @@ window.KEEL = {
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/onboarding.md",
     },
     {
-      group: "Start here", title: "Claude Code plugin", slug: "plugin",
-      summary: "Add keel's /keel:&lt;command&gt; workflows in Claude Code with no pip install — this repo is its own plugin marketplace.",
+      group: "Start here", title: "Agent plugin", slug: "plugin",
+      summary: "Add keel's /keel:&lt;command&gt; workflows to Claude Code, Codex, Antigravity or Cursor with no install-adapter step — this repo is its own plugin marketplace. The CLI is still required.",
       body:
-        "<p>The same <code>/keel:&lt;command&gt;</code> flows are packaged as a <b>Claude Code plugin</b>, so you can add them to a session without <code>pip install</code> — straight from this repo's built-in marketplace:</p>" +
-        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Claude Code plugin commands'><code>/plugin marketplace add berkayturanci/keel   <span class='cm'># register the keel marketplace</span>\n/plugin install keel                          <span class='cm'># install → /keel:ship, /keel:regression, …</span></code></pre>" +
+        "<p>The same <code>/keel:&lt;command&gt;</code> flows are packaged as an <b>agent plugin</b>, so an agent gets them straight from this repo's built-in marketplace with no <code>keel install-adapter</code> step. It does not replace the CLI — the command bodies shell out to <code>keel</code>. In Claude Code:</p>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Claude Code plugin install commands'><code>/plugin marketplace add berkayturanci/keel   <span class='cm'># register the keel marketplace</span>\n/plugin install keel                          <span class='cm'># install → /keel:ship, /keel:regression, …</span></code></pre>" +
+        "<pre class='doc-pre' tabindex='0' role='region' aria-label='Codex, Antigravity and Cursor plugin commands'><code>codex plugin marketplace add https://github.com/berkayturanci/keel\ncodex plugin add keel@keel\n\nagy plugin install https://github.com/berkayturanci/keel\nagy plugin enable keel\n\ncursor-agent plugin marketplace add https://github.com/berkayturanci/keel   <span class='cm'># then install it from Cursor's /plugins screen</span></code></pre>" +
+        "<p><b>Each has its own <i>update</i> path, and they are not the same shape</b>: for Antigravity, re-running the install <i>is</i> the update; for Codex it is <code>plugin marketplace upgrade</code> then <code>plugin add</code>; and in Claude Code <code>/plugin install</code> is a no-op on an installed plugin, so the command is <code>plugin update keel@keel</code>. All four, with what each route registers, are in <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/install.md'>docs/keel/install.md</a>.</p>" +
         "<p>The plugin ships the <b>same</b> project-neutral command bodies as <code>keel install-adapter</code> — they read every value from <code>.keel/project.yaml</code>, so a project still needs <code>keel setup</code> for the flows to act. The two distribution paths are additive.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/plugin.md",
     },
@@ -525,14 +548,17 @@ window.KEEL = {
       body:
         "<p>keel is an <b>agentic work-ownership backbone</b>. Its job is not to be another isolated coding command, review bot, or merge queue — it is to make an agent <b>accountable for the whole path</b> a strong software teammate would normally own.</p>" +
         "<p>That path starts before code is written: read the issue, decide whether the scope is ready, ask for clarification when it is not, cut an isolated branch, implement, keep CI and tests green, get reviewed, fix feedback, merge inside policy, close the loop, and record what should be remembered next time.</p>" +
-        "<p><b>v1 — one-agent work ownership.</b> Hand keel one issue (or a bounded work block) and get the same quality loop every time: readiness before mutation, isolated worktree, deterministic gates + capability checks, independent review and optional jury, merge-window + merge-lock safety, structured ledger, closeout + capture hooks, and morning/wrap visibility. The point isn't autonomy for its own sake — it's work that is observable, recoverable, reviewable, and governed by policy while the agent owns the execution details.</p>",
-      source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/vision.md",
+        "<p><b>One issue, a work block, or a backlog.</b> Hand keel one issue, a bounded work block, or — with <code>swarm</code> — a backlog split into dependency waves that run in parallel worktrees, and get the same quality loop every time: readiness before mutation, isolated worktree, deterministic gates + capability checks, independent review and optional jury, merge-window + merge-lock safety, structured ledger, closeout + capture hooks, and morning/wrap visibility. The point isn't autonomy for its own sake — it's work that is observable, recoverable, reviewable, and governed by policy while the agent owns the execution details.</p>",
+      source: "https://github.com/berkayturanci/keel/blob/main/README.md#the-vision-to-production-gap-in-agentic-ai",
     },
     {
       group: "Operating", title: "Capture & learning", slug: "capture-learning",
-      summary: "Post-merge capture has a stable marker contract: sanitized by default, fail-soft, deduped by fingerprint, verifiable offline.",
+      summary: "A stable, verifiable capture marker on every merge — and, with learning enabled in create-learning mode and a sink, a lesson: landed on the pull request at s10 when the sink is in the repository, written at s11 when it is not, read back into later briefs.",
       body:
         "<p>The <code>s11 capture</code> step owns a stable marker contract — <code>compound-learning: pr=&lt;N&gt; status=&lt;applied|deferred|skipped:reason&gt;</code> — exposed in <code>keel plan --json</code>. The allowed skip reasons are closed, capture is <b>fail-soft</b> after a successful merge, and <code>keel capture-verify</code> checks the run ledger offline at session end.</p>" +
+        "<p><b>The lesson rides the pull request.</b> With <code>policy_pack.capture.learning.sink</code> set, an applied <code>create-learning</code> capture writes one Markdown learning — the issue, the gate results on the head it merges, and a link to every file it changed, so a knowledge-graph builder gets the edges. With an in-repo sink, <code>/keel:ship</code> writes and lands it at <b>s10, before the evidence gate</b>: <code>keel capture-land --write --onto \"$BRANCH\"</code> commits it onto the pull request's own branch, so the same squash carries it into the base branch. A protected base never sees a direct push, and there is no second pull request to forget. A sink outside the checkout is written at s11, after the merge, and needs no landing.</p>" +
+        "<p><b>The review still holds.</b> The landing moves the head every verdict and the gates-pass are pinned to, so the evidence gate accepts a pin across a commit with one parent, the <code>keel.capture-land.v1</code> marker and exactly one added or modified file inside the sink — and across nothing else. The capture is recorded at s11, after the merge, so a merge that fails leaves no <code>applied</code> claim behind, and a retried s10 reuses the lesson already on the pull request.</p>" +
+        "<p><b>The next run reads it.</b> <code>keel plan</code> and <code>keel ship</code> retrieve matching lessons from <code>policy_pack.capture.learning.source</code> — the sink, by default — into the implement and review briefs. Declared labels and paths outrank prose, at most five reach a brief, and the run ledger records which were shown.</p>" +
         "<p>Capture artifacts are <b>sanitized by default</b> before they become durable: generic secret redaction plus project-owned <code>policy_pack.capture_redaction.deny_patterns</code>, storing only an audit of rule ids and counts. Durable learning is optional — policy can choose <code>create-learning</code>, <code>marker-only</code>, or <code>defer</code> — and duplicate candidates are suppressed by stable fingerprints so routine merges don't flood the learning surface.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/commands.md",
     },
@@ -563,9 +589,9 @@ window.KEEL = {
     },
     {
       group: "Visualize", title: "Every command", slug: "visual-commands",
-      summary: "All 16 /keel:<command> workflows render their own flow \u2014 keel-visual reads each command's phases from keel.flows, not just ship.",
+      summary: "All 17 /keel:<command> workflows render their own flow \u2014 keel-visual reads each command's phases from keel.flows, not just ship.",
       body:
-        "<p>keel-visual is not ship-only. Every one of the <b>16</b> commands has its own ordered phases in <code>keel.flows</code>, and the visualizer draws each one \u2014 in the terminal (<code>keel-visual play --command &lt;name&gt;</code>) or the web page. Below, each command at a mid-run frame:</p>" +
+        "<p>keel-visual is not ship-only. Every one of the <b>17</b> commands has its own ordered phases in <code>keel.flows</code>, and the visualizer draws each one \u2014 in the terminal (<code>keel-visual play --command &lt;name&gt;</code>) or the web page. Below, sixteen of them at a mid-run frame \u2014 <code>/keel:swarm</code> renders too, but its still image is not captured yet:</p>" +
         "<div class='vz-grid'><figure class='vz-card'><img src='assets/visual/cmd-ship.png' alt='/keel:ship rendered in keel-visual' loading='lazy'><figcaption>/keel:ship</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-implement.png' alt='/keel:implement rendered in keel-visual' loading='lazy'><figcaption>/keel:implement</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-review-cycle.png' alt='/keel:review-cycle rendered in keel-visual' loading='lazy'><figcaption>/keel:review-cycle</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-pr-loop.png' alt='/keel:pr-loop rendered in keel-visual' loading='lazy'><figcaption>/keel:pr-loop</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-review-all-day.png' alt='/keel:review-all-day rendered in keel-visual' loading='lazy'><figcaption>/keel:review-all-day</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-regression.png' alt='/keel:regression rendered in keel-visual' loading='lazy'><figcaption>/keel:regression</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-triage.png' alt='/keel:triage rendered in keel-visual' loading='lazy'><figcaption>/keel:triage</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-morning.png' alt='/keel:morning rendered in keel-visual' loading='lazy'><figcaption>/keel:morning</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-work-block.png' alt='/keel:work-block rendered in keel-visual' loading='lazy'><figcaption>/keel:work-block</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-overnight.png' alt='/keel:overnight rendered in keel-visual' loading='lazy'><figcaption>/keel:overnight</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-wrap.png' alt='/keel:wrap rendered in keel-visual' loading='lazy'><figcaption>/keel:wrap</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-ci-check.png' alt='/keel:ci-check rendered in keel-visual' loading='lazy'><figcaption>/keel:ci-check</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-coverage.png' alt='/keel:coverage rendered in keel-visual' loading='lazy'><figcaption>/keel:coverage</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-deps-audit.png' alt='/keel:deps-audit rendered in keel-visual' loading='lazy'><figcaption>/keel:deps-audit</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-flake-audit.png' alt='/keel:flake-audit rendered in keel-visual' loading='lazy'><figcaption>/keel:flake-audit</figcaption></figure><figure class='vz-card'><img src='assets/visual/cmd-stale-prs.png' alt='/keel:stale-prs rendered in keel-visual' loading='lazy'><figcaption>/keel:stale-prs</figcaption></figure></div>",
       source: "https://github.com/berkayturanci/keel/blob/main/keel-visual/README.md",
     },

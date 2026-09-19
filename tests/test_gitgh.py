@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from keel import git, github
+from keel import git, github, tdd
 
 #: Realistic object names — the wrappers validate a parsed SHA's shape, so a
 #: placeholder no longer passes for one.
@@ -32,11 +32,194 @@ class _Proc:
         self.stderr = err
 
 
+class TestGitLandingPlumbing(unittest.TestCase):
+    """The plumbing `keel capture-land` builds its commit from (#1163).
+
+    Every one of these runs without a checkout of the base branch, which is the
+    property the command exists for: keel ships from a worktree while the primary
+    checkout holds the base branch, so no recipe may check it out again.
+    """
+
+    def test_hash_object_writes_and_parses(self):
+        rec = _Recorder(out=SHA_A + "\n")
+        self.assertEqual(git.hash_object(".keel/learning/a.md", _run=rec), SHA_A)
+        self.assertEqual(rec.calls[0], ["git", "hash-object", "-w", "--", ".keel/learning/a.md"])
+
+    def test_hash_object_rejects_a_non_sha(self):
+        self.assertIsNone(git.hash_object("a.md", _run=_Recorder(out="not-a-sha\n")))
+
+    def test_hash_object_fail_soft(self):
+        self.assertIsNone(git.hash_object("a.md", _run=_Recorder(code=1, out=SHA_A)))
+
+    def test_ls_tree_returns_stdout(self):
+        listing = f"100644 blob {SHA_A}\ta.md\n"
+        rec = _Recorder(out=listing)
+        self.assertEqual(git.ls_tree(f"{SHA_B}:.keel", _run=rec), listing)
+        # `-z`: entries come back NUL-terminated and raw, never C-quoted, so a name
+        # cannot be re-encoded on the round trip back through `mktree`.
+        self.assertEqual(rec.calls[0], ["git", "ls-tree", "-z", f"{SHA_B}:.keel"])
+
+    def test_ls_tree_missing_directory_is_none_not_empty(self):
+        # The first lesson ever landed: `.keel/learning` does not exist on the base
+        # branch, which must read as "compose a new directory", not as an error.
+        self.assertIsNone(git.ls_tree(f"{SHA_B}:.keel", _run=_Recorder(code=128)))
+
+    def test_mktree_sends_the_listing_on_stdin(self):
+        listing = f"100644 blob {SHA_A}\ta.md\x00"
+        captured = {}
+
+        def _run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["stdin"] = kwargs.get("input")
+            return _Proc(0, SHA_B + "\n", "")
+
+        self.assertEqual(git.mktree(listing, _run=_run), SHA_B)
+        # `-z`, because a text-mode pipe rewrites every `\n` as CRLF on Windows and
+        # `mktree` accepts the corrupted listing silently, writing `<name>\r`.
+        self.assertEqual(captured["argv"], ["git", "mktree", "-z"])
+        # Never an argv: the listing carries object and file names, and an argv is
+        # world-readable in `ps` for the life of the process.
+        self.assertEqual(captured["stdin"], listing)
+
+    def test_mktree_fail_soft(self):
+        self.assertIsNone(git.mktree("garbage\x00", _run=_Recorder(code=128)))
+        self.assertIsNone(git.mktree("", _run=_Recorder(out="nope")))
+
+    def test_commit_tree_puts_the_message_in_the_argv(self):
+        rec = _Recorder(out=SHA_A + "\n")
+        message = "chore(learning): record the lesson from PR #7\n\nkeel.capture-land.v1: pr=7\n"
+        self.assertEqual(git.commit_tree(SHA_B, parent=SHA_A, message=message, _run=rec), SHA_A)
+        # Not stdin: a text-mode pipe turns every `\n` into CRLF on Windows, and this
+        # message is *content* that lands on the base branch - it has to stay
+        # byte-identical across platforms. Unlike a tree listing it is safe in an
+        # argv: a fixed subject plus the artifact path, both about to be published.
+        self.assertEqual(rec.calls[0], ["git", "commit-tree", SHA_B, "-p", SHA_A, "-m", message])
+
+    def test_commit_tree_fail_soft(self):
+        self.assertIsNone(git.commit_tree(SHA_B, parent=SHA_A, message="m", _run=_Recorder(code=1)))
+        self.assertIsNone(
+            git.commit_tree(SHA_B, parent=SHA_A, message="m", _run=_Recorder(out="huh"))
+        )
+
+    def test_push_commit_is_never_forced(self):
+        rec = _Recorder()
+        result = git.push_commit("origin", SHA_A, "refs/heads/main", _run=rec)
+        self.assertEqual(rec.calls[0], ["git", "push", "origin", f"{SHA_A}:refs/heads/main"])
+        self.assertTrue(result.ok)
+        # A rejected push is the concurrency signal the landing retries on. Forcing
+        # would discard the ship that got there first, on the shared base branch.
+        self.assertNotIn("--force", rec.calls[0])
+        self.assertNotIn("--force-with-lease", rec.calls[0])
+
+    def test_push_commit_reports_rejection(self):
+        rec = _Recorder(code=1, err="! [rejected] (fetch first)")
+        self.assertFalse(git.push_commit("origin", SHA_A, "refs/heads/main", _run=rec).ok)
+
+    def test_diff_names_is_two_dot(self):
+        rec = _Recorder(out=".keel/learning/a.md\x00")
+        self.assertEqual(git.diff_names(SHA_A, SHA_B, _run=rec), [".keel/learning/a.md"])
+        # Two-dot, not `a...b`: the landing compares a commit against the parent it
+        # was just built on, which is a plain tree difference, not a merge-base one.
+        self.assertEqual(
+            rec.calls[0],
+            [
+                "git",
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                SHA_A,
+                SHA_B,
+            ],
+        )
+
+    def test_diff_names_lists_both_sides_of_a_rename(self):
+        """A deletion must not hide inside a rename into the lesson's path.
+
+        With rename detection on, a commit that removed a file and added the lesson with
+        the same bytes printed one name — the lesson's — and passed the landing's "exactly
+        one path" check. `--no-renames` lists the path it left as well.
+        """
+        rec = _Recorder(out="src/app.py\x00.keel/learning/a.md\x00")
+        self.assertEqual(
+            git.diff_names(SHA_A, SHA_B, _run=rec), ["src/app.py", ".keel/learning/a.md"]
+        )
+        self.assertIn("--no-renames", rec.calls[0])
+
+    def test_diff_names_keeps_a_whitespace_name(self):
+        # Only the empty record after the final NUL is dropped; " " is a legal filename.
+        rec = _Recorder(out=".keel/learning/a.md\x00 \x00")
+        self.assertEqual(git.diff_names(SHA_A, SHA_B, _run=rec), [".keel/learning/a.md", " "])
+
+    def test_diff_names_does_not_c_quote_a_non_ascii_path(self):
+        """The safety check compares these names against the path it planned.
+
+        Under git's default `core.quotePath=true` a non-ASCII name comes back as a
+        C-quoted escape — `".keel/learning/caf\\303\\251.md"` — which can never equal
+        the raw path, so the landing refused that artifact *permanently* and blamed the
+        commit for changing a file nobody had asked for. Reachable through a configured
+        `sink.filename`, not through the default ASCII slug.
+        """
+        rec = _Recorder(out=".keel/learning/caf\u00e9.md\x00")
+        self.assertEqual(git.diff_names(SHA_A, SHA_B, _run=rec), [".keel/learning/caf\u00e9.md"])
+        self.assertIn("core.quotePath=false", rec.calls[0])
+        # `-z` goes with it: without NUL records the same name would arrive split on
+        # whatever the escape contained.
+        self.assertIn("-z", rec.calls[0])
+
+    def test_diff_names_unreadable_is_none_not_empty(self):
+        # The landing fails closed on this: `[]` would read as "this commit changes
+        # nothing", and the safety check would compare it against the one path.
+        self.assertIsNone(git.diff_names(SHA_A, SHA_B, _run=_Recorder(code=128)))
+
+    def test_diff_names_skips_empty_records(self):
+        # `-z` terminates every record, so a well-formed stream ends with an empty one.
+        # Dropping it is not cosmetic: an empty string here would be compared against
+        # the planned path and refuse the push.
+        rec = _Recorder(out="a.md\x00b.md\x00")
+        self.assertEqual(git.diff_names(SHA_A, SHA_B, _run=rec), ["a.md", "b.md"])
+
+
 class TestGit(unittest.TestCase):
     def test_fetch_argv(self):
         rec = _Recorder()
         git.fetch("origin", "main", _run=rec)
-        self.assertEqual(rec.calls[0], ["git", "fetch", "origin", "main", "--quiet"])
+        # Fully qualified, so a value that begins with `-` can never be read as an option,
+        # and into the remote-tracking ref by name, so the ref the landing resolves next is
+        # the one this fetch wrote whatever the remote's configured refspec says.
+        self.assertEqual(
+            rec.calls[0],
+            ["git", "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+        )
+
+    def test_resolve_ref_asks_for_the_exact_ref(self):
+        # `show-ref --verify` looks nowhere but the named ref; `rev-parse` would fall back
+        # through refs/tags/<ref> and refs/heads/<ref> when it is missing (#1223).
+        rec = _Recorder(out=SHA_A + "\n")
+        self.assertEqual(git.resolve_ref("refs/remotes/origin/main", _run=rec), SHA_A)
+        self.assertEqual(
+            rec.calls[0], ["git", "show-ref", "--verify", "--hash", "refs/remotes/origin/main"]
+        )
+        self.assertIsNone(git.resolve_ref("refs/remotes/origin/main", _run=_Recorder(code=128)))
+        self.assertIsNone(git.resolve_ref("refs/heads/main", _run=_Recorder(out="garbage\n")))
+
+    def test_remote_url_reads_the_configured_remote_only(self):
+        rec = _Recorder(out="git@github.com:o/r.git\n")
+        self.assertEqual(git.remote_url("origin", _run=rec), "git@github.com:o/r.git")
+        self.assertEqual(rec.calls[0], ["git", "config", "--get", "remote.origin.url"])
+        # Unconfigured: git exits 1 with nothing — not a path to read a repository from.
+        self.assertIsNone(git.remote_url("origin", _run=_Recorder(code=1)))
+        self.assertIsNone(git.remote_url("origin", _run=_Recorder(out="\n")))
+
+    def test_remote_tracking_ref_is_spelled_in_full(self):
+        # `origin/main` resolves `refs/tags/origin/main` and `refs/heads/origin/main` first.
+        self.assertEqual(git.remote_tracking_ref("origin", "main"), "refs/remotes/origin/main")
+        self.assertEqual(
+            git.remote_tracking_ref("upstream", "feature/issue-7"),
+            "refs/remotes/upstream/feature/issue-7",
+        )
 
     def test_worktree_add_argv(self):
         rec = _Recorder()
@@ -81,6 +264,39 @@ class TestGit(unittest.TestCase):
         # None, not "": an unreadable diff must not read as an empty one, or the
         # review gate passes on a change nobody reviewed (#628).
         self.assertIsNone(git.diff("a", "b", _run=_Recorder(code=1)))
+
+    def test_commit_log_argv_asks_for_the_branch_side_only(self):
+        rec = _Recorder(out="log")
+        self.assertEqual(git.commit_log("origin/main", "HEAD", _run=rec), "log")
+        self.assertEqual(
+            rec.calls[0],
+            [
+                "git",
+                "log",
+                # Ancestry, not commit date: once a branch integrates its base, a base
+                # commit dated before the tests commit would otherwise sort first and be
+                # judged as this implementer's first commit.
+                "--topo-order",
+                # …and the commits that base merge brought in are not on this branch's
+                # own line at all.
+                "--first-parent",
+                "--reverse",
+                "--no-color",
+                f"--format={tdd.LOG_FORMAT}",
+                # Not --name-only: a name cannot tell an addition from a deletion, and
+                # the gate has to separate writing the tests from `git rm`-ing them.
+                "--name-status",
+                # Two dots, not three: the tdd-order gate asks in which order *this
+                # branch's* commits were written, and the symmetric range would also
+                # list the base's side of the fork.
+                "origin/main..HEAD",
+            ],
+        )
+
+    def test_commit_log_failsoft_is_none_not_empty(self):
+        # None is "we could not read the history"; "" is "the range is empty". The
+        # tdd-order gate blocks on the first and must not read it as the second.
+        self.assertIsNone(git.commit_log("a", "b", _run=_Recorder(code=128)))
 
     def test_rev_parse_resolves_sha(self):
         rec = _Recorder(out=SHA_A + "\n")

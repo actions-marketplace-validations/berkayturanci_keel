@@ -8,11 +8,13 @@ same command graph without re-deriving keel behavior from prose.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from . import (
+    agents,
     artifacts,
     capture,
     checkpoint,
@@ -25,12 +27,15 @@ from . import (
     intake,
     ledger,
     lock,
+    loop,
     model,
     orchestrator,
     provenance,
     runcontrols,
     runtime,
     stepverifier,
+    tdd,
+    team,
     workblock,
     workcreation,
 )
@@ -230,9 +235,41 @@ def build_command_contract(
     jury_advisory: bool = False,
     issue_title: str | None = None,
     issue_body: str | None = None,
+    #: The retrieved past learnings for this task (#1155), measured by the caller
+    #: because reading a directory is I/O. The **plan** contract carries it as well
+    #: as ship's: s4 composes the implement brief from what `keel plan` printed,
+    #: long before s5 runs `keel ship`, so wiring it into ship alone meant the brief
+    #: this feature exists for never saw a lesson.
+    learnings: dict[str, Any] | None = None,
     issue_labels: tuple[str, ...] = (),
+    role: str | None = None,
+    delegate: str | None = None,
+    review_delegates: tuple[str, ...] = (),
+    host_agent: str = agents.HOST_DEFAULT,
+    tdd_override: bool = False,
+    loop_override: bool = False,
+    #: An explicit `--max-iterations` budget for this run, which outranks both the
+    #: flag and the knob and publishes its own source (#1173).
+    loop_budget: int | None = None,
+    effort: str | None = None,
+    team_profile: str | None = None,
+    jury_availability: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the stable adapter contract shared by ``plan --json`` and dry-run commands."""
+    """Build the stable adapter contract shared by ``plan --json`` and dry-run commands.
+
+    ``tdd_override`` is the per-run ``--tdd`` flag. The resolved s4 profile is published as
+    ``implement_mode`` — a sibling of ``workflow_profile``, because ``tdd`` is an s4 profile
+    the same way ``compound`` is a workflow one — and is what selects the ``tdd-order`` gate
+    in the contract's ``gates`` list."""
+    implement_mode = tdd.resolve_mode(config.knobs.implement_mode, flag=tdd_override)
+    # The s4 iteration policy rides inside `implement_mode` (#1165): it is not a third
+    # profile but a policy around whichever profile is running, and `wraps` says which.
+    loop_policy = loop.resolve(
+        config.knobs.loop,
+        flag=loop_override,
+        implement_mode=implement_mode.name,
+        max_iterations=loop_budget,
+    )
     declared_side_effects = command_side_effects(command, config, requirement, loaded)
     graph = command_graph(command, profile=profile)
     if not graph and (project_command := get_project_command(config, command)):
@@ -253,9 +290,13 @@ def build_command_contract(
         "no_mutations": dry_run,
         "project": project_as_dict(config),
         "workflow_profile": workflow_profile(command, profile=profile),
+        "implement_mode": {**implement_mode.as_dict(), "loop": loop_policy.as_dict()},
         "graph": graph,
         "backbone_plan": orchestrator.plan_as_dict(plan),
-        "gates": [gate_as_dict(spec) for spec in gates.plan_gates(config, loaded)],
+        "gates": [
+            gate_as_dict(spec)
+            for spec in gates.plan_gates(config, loaded, implement_mode=implement_mode.name)
+        ],
         "project_commands": [command.as_dict() for command in list_project_commands(config)],
         "extension_hooks": extension_hooks_as_dict(config, loaded),
         "extension_problems": list(extension_problems),
@@ -265,6 +306,9 @@ def build_command_contract(
         "github_transport": transport.as_dict(),
         "checkpoint": checkpoint.checkpoint_contract_as_dict(config),
         "capture": capture.contract_as_dict(config),
+        # The same block `keel ship` publishes, so s4 can open the implement brief
+        # from the plan it was told not to re-derive.
+        "learnings": learnings if learnings is not None else capture.learning_retrieval_as_dict(),
         "run_ledger": ledger.ledger_contract_as_dict(config),
         "resource_claims": lock.contract_as_dict(),
         "side_effects": {
@@ -300,6 +344,13 @@ def build_command_contract(
             command=command,
             config=config,
             transport=transport,
+            delegation=workblock.delegation_as_dict(
+                delegate=delegate,
+                review_delegates=review_delegates,
+                effort=effort,
+                team_profile=team_profile,
+                reviewer_override=reviewer_override,
+            ),
         )
     if command in {"regression", "review-all-day"}:
         contract["scan_contract"] = scan_contract_as_dict(
@@ -315,6 +366,31 @@ def build_command_contract(
             "marker": artifacts.TRIAGE_AUDIT_MARKER,
         }
     if command in {"ship", "pr-loop", "review-cycle", "work-block", "overnight"}:
+        # Resolved once and shared: the reviewer bench the contract publishes and the
+        # assignment a host dispatches have to be the same answer, or two agents reading
+        # the same JSON run different teams (#1014).
+        assignment = team.resolve_assignment(
+            config.knobs.team,
+            tier=review_tier,
+            role=role,
+            default_count=ship_decisions.reviewer_count(review_tier or 2),
+            reviewer_override=reviewer_override,
+            delegate=delegate,
+            review_delegates=review_delegates,
+            host_agent=host_agent,
+            legacy=agents.legacy_team_seats(config),
+            jury_disabled=no_jury,
+            jury_advisory=jury_advisory,
+            team_profile=team_profile,
+            effort=effort,
+            # The panel-availability probe, measured by
+            # `keel.providerprobe.jury_availability` and handed to every resolver
+            # (#1066). This is one more site that resolves a bench, and it has to see
+            # the same measurement as the rest or `keel plan` publishes a panel the run
+            # it plans cannot convene.
+            jury_availability=jury_availability,
+        )
+        contract["assignment"] = assignment
         contract["review_merge_contract"] = ship_decisions.resolve_review_contract(
             tier=review_tier,
             reviewer_override=reviewer_override,
@@ -324,6 +400,9 @@ def build_command_contract(
             jury=jury,
             no_jury=no_jury,
             jury_advisory=jury_advisory,
+            require_distinct_vendors=config.knobs.evidence_require_distinct_vendors,
+            assignment=assignment,
+            learnings=learnings,
         )
         if command == "ship":
             contract["evidence"] = evidence.contract_as_dict(
@@ -787,6 +866,7 @@ def project_as_dict(config: cfg.ProjectConfig) -> dict[str, Any]:
             "lint_cmd": config.knobs.lint_cmd,
             "implementer_agents": dict(sorted(config.knobs.implementer_agents.items())),
             **cfg.delegate_profiles_dict(config),
+            **team.canonical(config.knobs.team),
             "tier3_globs": list(config.knobs.tier3_globs),
             "ci_workflows": dict(sorted(config.knobs.ci_workflows.items())),
             "docs_gate_paths": list(config.knobs.docs_gate_paths),
@@ -801,6 +881,25 @@ def project_as_dict(config: cfg.ProjectConfig) -> dict[str, Any]:
 def gate_as_dict(spec: gates.GateSpec) -> dict[str, Any]:
     """Render a planned gate without losing its capability declarations."""
     return asdict(spec)
+
+
+def gate_outcome_as_dict(outcome: gates.GateOutcome) -> dict[str, Any]:
+    """One gate outcome as ``keel ship --json`` and ``keel run-gates --json`` publish it.
+
+    The severity and whether the gate ran at all travel with it (#1165): ``keel loop
+    brief`` reads these documents, and without them a failing *soft* gate would hold the
+    loop open and an unrun blocking gate would read as a pass.
+    """
+    return {
+        "gate": outcome.gate,
+        "ok": outcome.ok,
+        "skipped": outcome.skipped,
+        "timed_out": outcome.timed_out,
+        "on_fail": outcome.on_fail,
+        "not_run": outcome.not_run,
+        "error": outcome.error,
+        "findings": [_finding_as_dict(finding) for finding in outcome.findings],
+    }
 
 
 def extension_hooks_as_dict(
@@ -843,6 +942,8 @@ def ship_result_as_dict(
     issue_number = None
     pr_number = None
     head_sha = None
+    run_id = None
+    implementer_attribution = None
     if isinstance(run_ledger, dict):
         record = run_ledger.get("record")
         if isinstance(record, dict):
@@ -853,6 +954,14 @@ def ship_result_as_dict(
             pr_number = pull_request.get("number") if isinstance(pull_request, dict) else None
             head_sha = record.get("head_sha")
             head_sha = head_sha if isinstance(head_sha, str) else None
+            run_id = record.get("run_id")
+            run_id = run_id if isinstance(run_id, str) else None
+            # Derived from the record, never from a caller-supplied string: the
+            # provenance comment and the evidence cross-check must read the same
+            # implementer through the same helper (#1013).
+            implementer_attribution = agents.attribution_from_implementer(
+                evidence.ledger_implementer(record)
+            )
     finding_dicts = [_finding_as_dict(finding) for finding in verdict.findings]
     testing = _testing_summary(outcomes)
     artifact_bodies = {
@@ -885,7 +994,9 @@ def ship_result_as_dict(
             participants=("reviewer-a", "reviewer-b", "reviewer-c", "orchestrator"),
             verdict="REQUEST_CHANGES" if verdict.blocked else "LGTM",
             findings_summary=_finding_summaries(finding_dicts),
-            remaining_risks="blocking findings present" if verdict.blocked else "none identified",
+            remaining_risks=(
+                ship_decisions.block_reason(verdict) if verdict.blocked else "none identified"
+            ),
         ),
         "extension_result_template": artifacts.render_extension_result(
             slot="<slot>",
@@ -893,6 +1004,12 @@ def ship_result_as_dict(
             status="not-run",
             mode="advisory",
             summary="Extension result summary goes here.",
+        ),
+        "ship_provenance": artifacts.render_ship_provenance(
+            run_id=run_id,
+            issue=issue_number,
+            head_sha=head_sha,
+            implementer_attribution=implementer_attribution,
         ),
     }
     return {
@@ -904,17 +1021,7 @@ def ship_result_as_dict(
         "run_ledger": run_ledger,
         "closure_comment": closure_comment,
         "artifact_bodies": artifact_bodies,
-        "gate_outcomes": [
-            {
-                "gate": outcome.gate,
-                "ok": outcome.ok,
-                "skipped": outcome.skipped,
-                "timed_out": outcome.timed_out,
-                "error": outcome.error,
-                "findings": [_finding_as_dict(finding) for finding in outcome.findings],
-            }
-            for outcome in outcomes
-        ],
+        "gate_outcomes": [gate_outcome_as_dict(outcome) for outcome in outcomes],
         "verdict": {
             "blocked": verdict.blocked,
             "counts": dict(verdict.counts),
@@ -932,6 +1039,7 @@ def ship_result_as_dict(
             "halted": assessment.halted,
             "bypassed_window": assessment.bypassed_window,
             "review_merge_contract": assessment.review_contract,
+            "assignment": assessment.assignment,
         },
     }
 
@@ -989,6 +1097,7 @@ def standalone_result_as_dict(
     delegate: str | None = None,
     transport: github_transport.GitHubTransport | None = None,
     evaluation: runtime.CapabilityEvaluation | None = None,
+    delegation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Deterministic dry-run result records for standalone non-ship commands."""
     if command == "implement":
@@ -1002,7 +1111,9 @@ def standalone_result_as_dict(
             "implementer": {
                 "source": "delegate" if delegate else "project-routing-or-host",
                 "selected": delegate,
-                "routing_keys": sorted(config.knobs.implementer_agents),
+                # Sorted here, not in the rule: the contract's ordering is the contract's
+                # business. Which spellings name a role is `agents.known_roles`'.
+                "routing_keys": sorted(agents.known_roles(config)),
             },
             "handoff": {
                 "opens_pr": True,
@@ -1059,6 +1170,7 @@ def standalone_result_as_dict(
                 command=command,
                 config=config,
                 transport=transport,
+                delegation=delegation,
             ),
             "execution": {
                 "runs_gates": False,
@@ -1264,6 +1376,7 @@ def session_contract_as_dict(
     command: str,
     config: cfg.ProjectConfig,
     transport: github_transport.GitHubTransport | None = None,
+    delegation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Project-neutral session workflow contract for session/work-block commands."""
     pack = config.policy_pack or {}
@@ -1292,6 +1405,7 @@ def session_contract_as_dict(
             config=config,
             mode="overnight" if command == "overnight" else "daytime",
             transport=github,
+            delegation=delegation,
         )
     if command == "wrap":
         base["wrap"] = {

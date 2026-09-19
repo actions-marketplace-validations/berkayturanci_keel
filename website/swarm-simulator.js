@@ -13,20 +13,20 @@
       name: "Microservices & Core Refactor",
       description: "5 issues partitioned into 2 waves across Claude, Gemini & Codex with direct batch landing.",
       issues: [
-        { id: 742, title: "Viral PR watermark & SVG badges", files: ["src/keel/closure.py", "docs/badges.md"], model: "gemini-2.5-flash", vendor: "Google", wave: 1 },
-        { id: 740, title: "Smart stack init auto-detector", files: ["src/keel/scaffold.py", "src/keel/cli.py"], model: "claude-3-7-sonnet", vendor: "Anthropic", wave: 1 },
+        { id: 742, title: "Viral PR watermark & SVG badges", files: ["src/keel/closure.py", "docs/badges.md"], model: "gemini-3.8-flash-high", vendor: "Google", wave: 1 },
+        { id: 740, title: "Smart stack init auto-detector", files: ["src/keel/scaffold.py", "src/keel/cli.py"], model: "claude-opus-5", vendor: "Anthropic", wave: 1 },
         { id: 741, title: "Homebrew tap formula & curl script", files: ["Formula/keel.rb", "scripts/install.sh"], model: "codex", vendor: "OpenAI", wave: 1 },
-        { id: 745, title: "Conflict self-healing rebase engine", files: ["src/keel/swarm_landing.py"], model: "claude-3-7-sonnet", vendor: "Anthropic", wave: 2, dependsOn: [740] },
-        { id: 743, title: "Post-merge canary & rollback guard", files: ["src/keel/canary.py"], model: "gemini-2.5-pro", vendor: "Google", wave: 2, dependsOn: [740] }
+        { id: 745, title: "Conflict self-healing rebase engine", files: ["src/keel/swarm_landing.py"], model: "claude-opus-5", vendor: "Anthropic", wave: 2, dependsOn: [740] },
+        { id: 743, title: "Post-merge canary & rollback guard", files: ["src/keel/canary.py"], model: "gemini-3-pro", vendor: "Google", wave: 2, dependsOn: [740] }
       ]
     },
     fullstack: {
       name: "Full-Stack AI Monorepo",
       description: "4 concurrent sub-agents in parallel worktrees converging into an integration test wave.",
       issues: [
-        { id: 750, title: "High-throughput API Gateway", files: ["api/gateway.py"], model: "claude-3-7-sonnet", vendor: "Anthropic", wave: 1 },
+        { id: 750, title: "High-throughput API Gateway", files: ["api/gateway.py"], model: "claude-opus-5", vendor: "Anthropic", wave: 1 },
         { id: 751, title: "Vector Embedding & RAG Pipeline", files: ["core/rag.py"], model: "codex", vendor: "OpenAI", wave: 1 },
-        { id: 752, title: "Spatial Canvas & Topology UI", files: ["ui/canvas.ts"], model: "gemini-2.5-flash", vendor: "Google", wave: 1 },
+        { id: 752, title: "Spatial Canvas & Topology UI", files: ["ui/canvas.ts"], model: "gemini-3.8-flash-high", vendor: "Google", wave: 1 },
         { id: 753, title: "E2E Cross-Agent Test Matrix", files: ["tests/e2e.py"], model: "deepseek-r1", vendor: "DeepSeek", wave: 2, dependsOn: [750, 751, 752] }
       ]
     },
@@ -34,8 +34,8 @@
       name: "Adjacent Conflict Self-Healing",
       description: "2 workers touching overlapping routes healed automatically by AST-aware rebase funnel.",
       issues: [
-        { id: 760, title: "OAuth 2.0 PKCE Auth Provider", files: ["auth/routes.py"], model: "claude-3-7-sonnet", vendor: "Anthropic", wave: 1 },
-        { id: 761, title: "Passkey & WebAuthn Handler", files: ["auth/routes.py"], model: "gemini-2.5-pro", vendor: "Google", wave: 1, hasConflict: true },
+        { id: 760, title: "OAuth 2.0 PKCE Auth Provider", files: ["auth/routes.py"], model: "claude-opus-5", vendor: "Anthropic", wave: 1 },
+        { id: 761, title: "Passkey & WebAuthn Handler", files: ["auth/routes.py"], model: "gemini-3-pro", vendor: "Google", wave: 1, hasConflict: true },
         { id: 762, title: "Zero-Trust Session Audit Log", files: ["audit/session.py"], model: "codex", vendor: "OpenAI", wave: 2, dependsOn: [760] }
       ]
     }
@@ -195,7 +195,7 @@
     var issueList = preset.issues;
 
     // Header & stats
-    var btnLabel = state.running ? "⏸ Pause" : (state.step > 0 ? "▶ Resume" : "▶ Run Swarm Simulation");
+    var btnLabel = state.running ? "<span aria-hidden=\"true\">⏸</span> Pause" : (state.step > 0 ? "<span aria-hidden=\"true\">▶</span> Resume" : "<span aria-hidden=\"true\">▶</span> Run Swarm Simulation");
     var lockClass = state.lock.indexOf("LOCKED") >= 0 ? "lock-active" : "lock-idle";
 
     var html = [
@@ -222,11 +222,11 @@
       '    <div class="sim-controls">',
       '      <button type="button" class="sim-btn sim-btn-primary" id="sim-toggle-btn">' + btnLabel + '</button>',
       '      <button type="button" class="sim-btn sim-btn-secondary" id="sim-reset-btn"><span aria-hidden="true">⟳</span> Reset</button>',
-      '      <div class="sim-speed-box">',
+      '      <div class="sim-speed-box" role="radiogroup" aria-label="Animation speed">',
       '        <span>Speed:</span>',
-      '        <button type="button" class="sim-speed-btn ' + (state.speed === 1 ? 'active' : '') + '" data-speed="1">1x</button>',
-      '        <button type="button" class="sim-speed-btn ' + (state.speed === 2 ? 'active' : '') + '" data-speed="2">2x</button>',
-      '        <button type="button" class="sim-speed-btn ' + (state.speed === 4 ? 'active' : '') + '" data-speed="4">4x</button>',
+      '        <button type="button" class="sim-speed-btn ' + (state.speed === 1 ? 'active' : '') + '" data-speed="1" role="radio" aria-checked="' + (state.speed === 1) + '">1x</button>',
+      '        <button type="button" class="sim-speed-btn ' + (state.speed === 2 ? 'active' : '') + '" data-speed="2" role="radio" aria-checked="' + (state.speed === 2) + '">2x</button>',
+      '        <button type="button" class="sim-speed-btn ' + (state.speed === 4 ? 'active' : '') + '" data-speed="4" role="radio" aria-checked="' + (state.speed === 4) + '">4x</button>',
       '      </div>',
       '    </div>',
       '  </div>',
@@ -319,6 +319,20 @@
     ].join("\n");
   }
 
+  // A successful copy is announced through the page's live region (#1212), which
+  // `integrations.js` also announces into on the same page. Cleared first and set on the
+  // next tick, as that file does, so a second copy in a row is announced again rather than
+  // leaving identical text in place; the pending set is cancelled per click so an earlier
+  // one cannot land after a later one.
+  var copyAnnounceTimer = null;
+  function announceCopied() {
+    var sr = document.getElementById("sr-live-region");
+    if (!sr) return;
+    clearTimeout(copyAnnounceTimer);
+    sr.textContent = "";
+    copyAnnounceTimer = setTimeout(function () { sr.textContent = "Copied to clipboard"; }, 0);
+  }
+
   function wireEvents() {
     var toggleBtn = document.getElementById("sim-toggle-btn");
     if (toggleBtn) {
@@ -371,6 +385,7 @@
           navigator.clipboard.writeText(cmd).then(function () {
             copyBtn.textContent = "Copied! ✓";
             copyBtn.setAttribute("aria-label", "Copied to clipboard");
+            announceCopied();
             clearTimeout(copyResetTimer);
             copyResetTimer = setTimeout(function () {
               copyBtn.textContent = COPY_TEXT;

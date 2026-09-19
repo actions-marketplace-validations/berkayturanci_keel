@@ -50,7 +50,7 @@ keel validate projects/*.yaml                 # schema only
 keel validate .claude/project.yaml --root .   # schema + extensions (use in CI)
 ```
 
-## `keel plan <project.yaml> [--root DIR] [--command COMMAND] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--target TARGET] [--issue-title TITLE] [--issue-body BODY] [--issue-label LABEL] [--run-id ID] [--issue N] [--pull-request N] [--json]`
+## `keel plan <project.yaml> [--root DIR] [--command COMMAND] [--tier 1|2|3] [--role LABEL] [--delegate PROVIDER] [--review-delegate PROVIDER]... [--effort low|medium|high] [--team PROFILE] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--target TARGET] [--issue-title TITLE] [--issue-body BODY] [--issue-label LABEL] [--declared-file PATH]... [--run-id ID] [--issue N] [--pull-request N] [--json]`
 
 Render the backbone plan for a project: the fixed steps with the project's built-in gates
 and extensions slotted in. This is the dry-run view — what an actual run would execute.
@@ -99,6 +99,11 @@ Consent mode is resolved as `--consent-mode` > `KEEL_CONSENT_MODE` >
 trusted `KEEL_APPROVE_SCOPE` or `automation.approved_scopes`; `agent` mode delegates the
 approval prompt to the host agent permission system while keeping the structured contract.
 
+For learning retrieval, repeat `--declared-file PATH` with the expected repo-relative
+files before implementation starts. The plan uses these paths together with the issue
+title and labels to populate `contract.learnings` and the reviewer brief. This does
+not require an existing diff or replace the scope recorded by `keel ship`.
+
 When `--issue-title`, `--issue-body`, or `--issue-label` is supplied for a work-owning
 command, the JSON contract includes `issue_intake`. The intake block classifies the issue
 as `ready`, `needs-input`, `blocked`, or `out-of-scope`, extracts acceptance criteria and
@@ -115,6 +120,21 @@ is known.
 keel claim merge --owner "ship-pr-123" --root . --json
 keel release merge --owner "ship-pr-123" --root .
 ```
+
+## `keel release RESOURCE [--owner ID] [--root DIR] [--json]`
+
+Release the claim `keel claim` took. `--owner` scopes the release to one holder; omitting
+it is the deliberate any-owner escape for clearing a claim whose holder is gone.
+
+```bash
+keel release merge --owner "ship-pr-123" --root .
+keel release merge --root . --json      # clear a stuck claim, whoever holds it
+```
+
+Exit 0 covers two statuses, because both are the state the caller asked for: `released`,
+and `missing` — releasing a resource nobody holds is not a failure. A named `--owner` that
+does not match the recorded holder exits 1 with status `not-owner` and reports the holder;
+an *unidentifiable* holder refuses a named release the same way.
 
 ## `keel guard <project.yaml> [--issue NUMBER] [--issue-title TITLE] [--issue-labels L1,L2] [--root DIR] [--json]`
 
@@ -148,7 +168,7 @@ Override the defaults under `policy_pack.blocker_rules` (each rule needs an `id`
 `kind` of `label` (with `labels`) or `title-regex` (with `pattern`)); see
 [configuration.md](configuration.md).
 
-## `keel merge <project.yaml> --pr N [--root DIR] [--method squash|merge|rebase] [--dry-run]`
+## `keel merge <project.yaml> --pr N [--root DIR] [--method squash|merge|rebase] [--transport auto|graphql|rest] [--dry-run] [--effort low|medium|high] [--team PROFILE]`
 
 Perform the sanctioned core-owned PR merge path. `keel merge` acquires the merge resource
 claim, re-checks the merge window inside that claim, reads the live PR check rollup with
@@ -156,15 +176,24 @@ failure-before-pending precedence, runs `evidence-verify` against the current PR
 requires a SHA-stamped gates-pass for the PR's current head, and only then calls
 `gh pr merge`.
 
+**One head throughout.** The merge snapshot (merge state, CI rollup) and the evidence load
+(verdicts, changed files, the heads a capture landing covers) each read the pull request's
+head. When the two reads name different commits, or either cannot be read, the merge
+refuses with *the pull request's head changed while it was being checked* — run it again.
+The merge is then pinned to that head on both transports, so GitHub refuses it if the branch
+moves after the checks (#1219).
+
 The gates-SHA check reads the run ledger and requires a `ship_run` record whose
 `pull_request.number` matches the PR, whose `git.head_sha` equals the PR's current head
-(from the live merge snapshot), and whose gates passed (verdict not blocked and every
+(from the live merge snapshot) — or a head that head **covers**: one it descends from by
+`keel capture-land` commits alone (see [`--onto`](#--onto-the-lesson-rides-the-pull-request)),
+the same set `evidence-verify` accepts review verdicts for — and whose gates passed (verdict not blocked and every
 recorded gate `ok` or `skipped`, none errored). A stale green run from an older head no
 longer authorizes a merge of a newer head; if no record matches, the merge refuses with
 `no gates-pass recorded for the current head <sha>`. The decision is reported in the
 `gates_sha` block of the JSON payload (`matched`, `head_sha`, `run_id`).
 
-Once the merge lands, `keel merge` runs the [`verify-merge`](#keel-verify-merge-projectyaml---root-dir---pr-n---merge-sha-sha---json)
+Once the merge lands, `keel merge` runs the [`verify-merge`](#keel-verify-merge-projectyaml---root-dir---pr-n---merge-sha-sha---transport-autographqlrest---json)
 drift check on it and reports the result as `merge_verification` in the payload and a
 `drift :` line in human output. Exit codes: **0** merged and clean, **1** the merge did not
 happen, **3** it happened *and* may have written over work another PR merged after this one
@@ -173,6 +202,65 @@ the overtaking pull request is named in full, since the merge is already irrever
 the operator has to act on it now. Before #934 this check was documented as running after
 s10 and was called from nowhere; a stale-base squash reverted #811 on main and nothing
 noticed for six days.
+
+### Transport: GraphQL, or REST when the endpoint is blocked
+
+`gh pr view --json` and `gh pr merge` both go over GitHub's **GraphQL** endpoint. On a host
+whose egress proxy allows the REST API and blocks GraphQL, every one of them fails before
+the claim, the window re-check, the rollup read and the evidence verification have run at
+all — so the operator is pushed off the only sanctioned merge path and squashes by hand,
+which is how #1169, #1170 and #1171 were merged.
+
+The same questions are available over REST, and `keel merge` asks them there when it has
+to. Nothing about the contract changes: the claim, the window, the rollup semantics, the
+evidence gate, the SHA-pinned gates-pass and `MERGED` as the authoritative outcome are the
+same objects on either wire. The transport is recorded as `transport: gh-graphql` or
+`gh-rest` in the merge payload, beside `lock`, `window`, `ci` and `evidence`, and named in
+human output only when it is the unusual one. (`keel merge` writes no ledger record of its
+own — `keel ship --append-ledger` is what appends to the run ledger.)
+
+```bash
+keel merge .keel/project.yaml --root . --pr 456 --transport rest
+```
+
+| `--transport` | behaviour |
+| --- | --- |
+| `auto` (default) | GraphQL first. If a read fails, `gh api graphql` is asked whether the endpoint is reachable at all; only a blocked endpoint switches the run to REST |
+| `graphql` | GraphQL only — a failed read is a failure, never re-asked elsewhere |
+| `rest` | REST only; the probe never runs |
+
+**The probe runs after a failed read, not before every run.** A host that can reach GraphQL
+must cost exactly what it cost before this existed, and asking first would add an API call
+to every merge everywhere to answer a question nearly all of them answer the same way. The
+probe is still what decides, because a failed `gh pr view --json` says nothing on its own —
+no such pull request, no auth, a rate limit and a blocked endpoint all exit non-zero, and
+telling them apart by matching on `gh`'s wording is the kind of guess that silently
+re-routes a merge.
+
+**The merge is never the call that discovers it.** The transport is settled by the reads,
+before anything is written. A merge that failed for an unknown reason may or may not have
+landed, and re-driving it over a second wire is how one pull request gets merged twice.
+
+The REST rollup is assembled from two endpoints — `commits/<sha>/check-runs` and
+`commits/<sha>/statuses` — and **both have to be readable**. An empty rollup means no check
+has reported, which the docs-only carve-out is allowed to merge through; a half that could
+not be read means nothing of the kind, so either failing refuses the merge. Both halves are
+carried through in the shape GraphQL returns, because `statusCheckRollup` is a **union** and
+the reducer reads all of it: a `CheckRun` answers from `status`/`conclusion`, a
+`StatusContext` — a commit status, which is how non-Actions CI reports — from `state`. A
+failing commit status therefore fails the merge on either wire.
+
+REST's `merge_commit_sha` is **not** GraphQL's `mergeCommit.oid`. GitHub fills it with the
+*speculative test-merge* SHA (`refs/pull/<n>/merge`) while the pull request is open, and
+replaces it with the commit that landed once it merges — so "merged, and the field is
+filled" is true on the first post-merge read even while the cached test SHA is still being
+served, and the drift check would judge the test merge instead of the squash. The REST
+window read therefore waits until that SHA is **reachable from the base branch**, not
+merely present, and `keel merge` prefers the SHA the merge response itself returns.
+
+Both transports pin the merge to the head every check was run against: REST sends
+`sha=<head>`, and the GraphQL path runs `gh pr merge --match-head-commit <head>`. `gh pr merge`
+applies no pin by default, so keel always passes one; before #1219 only the REST merge did.
 
 Raw adapter `gh pr merge` calls are a spec violation for ship-style flows: adapters should
 delegate s10 to this command so lock, window, CI, evidence, and gates-SHA checks are
@@ -231,6 +319,42 @@ the gate for callers that legitimately do not checkpoint. It **requires a named
 `--operator`** and records the bypass in the merge payload
 (`checkpoint_gate: {status: "bypassed", operator}`).
 
+## `keel attribution --vendor VENDOR [--model MODEL] [--profile NAME] [--config FILE] [--json]`
+
+Print keel's own attribution labels for a delegate vendor/model pair. This is the **only**
+sanctioned way for an adapter to learn what to label a PR with: `keel.agents.attribution()`
+defines the vocabulary, and re-deriving it in prose is what produced `agent:gemini` /
+`model:gemini` for a run keel calls `agent:agy` / `model:gemini-3` (issue #1013).
+
+```bash
+keel attribution --vendor agy --model gemini-3.8-flash-high
+# agent_label   : agent:agy
+# model_label   : model:gemini-3
+# system        : agy:gemini-3.8-flash-high
+
+keel attribution --vendor agy --model gemini-3.8-flash-high --json
+# {"agent_label": "agent:agy", "model_label": "model:gemini-3", "system": "agy:gemini-3.8-flash-high"}
+```
+
+`--json` prints the attribution record itself, so it can be consumed directly (it is the
+same shape as the `attribution` block a delegate result carries). Apply `agent_label` and
+`model_label` to the PR verbatim, and record `system` as the run's implementer string.
+
+`--model` is optional: without it there is no `model_label` (human output prints
+`not recorded`, JSON prints `null`) — attribute no model rather than one that was merely
+asked for.
+
+`--profile NAME` names the `knobs.delegate_profiles` entry that ran and requires
+`--config`. The result then carries `delegate_profile`, so the s11 closure can say *which*
+CLI ran rather than just `cli`, and the model falls back to the profile's own `model` when
+`--model` is omitted. A `--vendor` that contradicts the profile's `vendor` is refused
+rather than silently overridden.
+
+`--config` also switches on vendor validation: a vendor that is neither a built-in delegate
+vendor nor a configured delegate profile is refused. Without `--config` any vendor is
+accepted, because the run ledger carries values written by older runs and a lookup with no
+project config cannot tell a legacy value from a typo.
+
 ## `keel post-comment <project.yaml> --target issue:N|pr:N --artifact ARTIFACT --body-file FILE [--run-id ID] [--dry-run] [--json]`
 
 Post or update a deterministic GitHub issue/PR artifact comment. `post-comment` reads the
@@ -248,9 +372,9 @@ keel post-comment .keel/project.yaml --root . \
   --body-file /tmp/closure-comment.md --run-id "$RUN_ID" --json
 ```
 
-Supported artifacts are `closure-comment`, `issue-update`, `review-verdict`,
-`jury-verdict`, `review-cycle-summary`, `extension-result`, `step-handoff`, and
-`run-control-halt`. When
+Supported artifacts are `ship-provenance`, `closure-comment`, `issue-update`,
+`review-verdict`, `jury-verdict`, `review-cycle-summary`, `extension-result`,
+`step-handoff`, and `run-control-halt`. When
 `--run-id` is supplied, the command edits the latest existing comment that has the same
 marker and run id; otherwise it posts a new comment. Bodies that are missing the expected
 marker, or that look like a literal `@/tmp/...` placeholder, are rejected before any
@@ -309,7 +433,7 @@ keel render-report --kind coverage --payload coverage.json > body.md
 keel render-report --kind triage-audit --payload audit.json --json
 ```
 
-## `keel review <project.yaml> --pr N --reviews FILE [--root DIR] [--issue N] [--closure FILE] [--reviewers 1|2|3] [--head-sha SHA] [--changed-file PATH] [--run-id ID] [--verify] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--json]`
+## `keel review <project.yaml> --pr N (--reviews FILE | --from-jury FILE) [--root DIR] [--issue N] [--closure FILE] [--reviewers 1|2|3] [--jury] [--no-jury] [--jury-advisory] [--head-sha SHA] [--changed-file PATH] [--run-id ID] [--verify] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--effort low|medium|high] [--team PROFILE] [--json]`
 
 Orchestrate a supplied review *evidence bundle* in one deterministic command. The host
 agent runs the actual reviewers and produces the review content; `keel review` is **not**
@@ -332,6 +456,76 @@ The required reviewer count is resolved from the live diff tier using the exact 
 `keel evidence-verify` uses (`ship.resolve_review_contract`). If fewer reviews are supplied
 than the tier requires, the command fails rather than silently under-posting evidence; an
 exact count or more is allowed. `--reviewers` overrides the required count.
+
+### Jury flags — `keel review` resolves the same contract as every other surface
+
+`--jury` / `--no-jury` / `--jury-advisory` are accepted here and mean exactly what they mean
+on `keel ship`, `keel plan`, `keel step-verify`, `keel evidence-verify` and `keel merge`;
+all six resolve the review contract through `ship.resolve_review_contract`, and the resolved
+document is published as `review_contract` in `--json` output (and as the `jury:` line of the
+human-readable summary), so the six can be checked against each other rather than assumed
+equal. Until #1043 this command defined none of them and hardcoded them false, which made its
+`--verify` report **bench-authoritative but jury-blind**: on a plain (non-panel) tier-3
+project it could report `jury-verdict` as required while the `keel ship --no-jury` run that
+produced the pull request was told never to post one.
+
+The flags **never move the reviewer bench** — that is a pure function of config + tier + role
++ `--reviewers` / `--review-delegate` — so the set of verdicts this command posts is
+identical with and without them. They own the jury line only. Precedence is unchanged and is
+`ship.resolve_jury`'s: a `knobs.team` jury-panel tier > `--no-jury` > `--jury` > tier-3
+auto-jury > off, with `team.jury.mode: advisory` able to make an *enabled* jury advisory.
+
+`--from-jury` is orthogonal to all three: it decides *where the verdicts come from* (the
+panel's ballots rather than a host bundle) and always posts the panel's own
+`keel.jury-verdict.v1` consensus record, while the flags decide *whether the contract
+requires a jury verdict*. `--from-jury` additionally declares the real panel size, which on a
+jury-panel tier sizes the required verdict count. On such a tier the panel outranks the
+flags entirely: `--no-jury` / `--jury-advisory` are recorded in `assignment.warnings` and not
+applied, because the panel is that tier's only review.
+
+Pass a run's ship flags through to its `keel review` call. `keel review --verify` re-runs
+`evidence-verify` against the contract *this command* resolved, so `keel ship --no-jury`
+followed by a bare `keel review --verify` asks two halves of one run for two different gates.
+
+### `--from-jury FILE` — the ai-jury panel *is* the review
+
+Exactly one of `--reviews` and `--from-jury` is required: the bundle is the host's, or the
+panel's. `--from-jury` takes an **ai-jury JSON report** (`jury --format json`, report schema
+1.1+, which carries the top-level `reviewers` ballot array) and maps it onto the same bundle:
+
+- one head-pinned `keel.review-verdict.v1` per panelist **that counts as a review**,
+  carrying the `vendor:` and `model:` that actually produced that ballot — the chair is
+  not a panelist and does not get one. A ballot counts as a review iff it is a panelist,
+  its scope is substantive, and its verdict is not `ABSTAIN` (ai-jury's `is_review`,
+  honoured via schema ≥1.2 `counts_as_review` / `scope_substantive` when present). An
+  abstention does not inflate `panelists` and is not posted as `review-verdict-*`;
+- the panel's own `keel.jury-verdict.v1` consensus comment, in the same call, so ballots and
+  verdict are pinned to the same head SHA by construction. It declares `panelists: <N>`
+  beside `vendors: <N>`, which is how the panel's size reaches a later evidence check;
+- a `panel` block in the `--json` result — the ballots, the distinct vendors, and the
+  **verified** consensus findings in keel's severity vocabulary (`critical`/`major` ⇒
+  `block`). That block is the s9 fix-loop input, so a panel's findings gate exactly as a
+  host reviewer's do: write that block to a file and hand it to `keel fixloop brief
+  --findings` to open the round — the block is a `{"findings": [...]}` envelope, which is
+  a shape `--findings` reads as-is, so its array needs no reshaping.
+
+`scope` and `testing` come from the report when schema ≥1.2 carries them. Older reports
+may derive a `Checked …` scope from finding paths only when those paths exist and the
+verdict is not `ABSTAIN`. An empty or abstaining ballot never gets an invented
+`Checked the changed-file diff…` opener — that phrase is keel's own `verdict_substance`
+escape hatch, and using it here made an abstention look like a review.
+
+On a tier whose `knobs.team` review policy is `jury`, the required verdict count *is* the
+panel size, so a report with fewer ballots than the panel declared fails closed. A report
+that carries no ballots at all is refused with the command that produces one, rather than
+posting a thinner review.
+
+```bash
+# s7 on a `review: jury` tier: one panel run, then one posting call.
+jury --format json --diff-file "$DIFF" -o ".keel/state/jury/$RUN_ID.json"
+keel review .keel/project.yaml --root . --pr 456 \
+  --from-jury ".keel/state/jury/$RUN_ID.json" --run-id "$RUN_ID" --live
+```
 
 ```bash
 # Dry by default: render and print what it WOULD post, no network.
@@ -396,8 +590,11 @@ check runs. Dry-run output includes the same would-be record but never writes th
 to infer status from closure comments. A run that never reached capture says so with
 `--capture-status not-run`: the flag stays required, but the record carries no capture
 marker and claims no outcome. Use it to re-record gates for a **rebased** PR — gates are
-pinned to the head SHA, so a new head needs its own record, and a second record carrying a
-marker would be refused (one capture marker per PR).
+pinned to the head SHA, so a new head needs its own record. A second record carrying a
+marker **for the same head** is refused; a new head may carry its own (#1157). Keyed by
+pull request alone, the refusal outlived the head it was written for: a pull request whose
+first ship run was red could never write the passing record the merge gate asks for, and
+the only exit was editing an append-only ledger by hand.
 
 `--host-agent` and `--transport` (`gh`|`mcp`) record the s0 preflight **run context** on
 the `ship_run` record so it becomes durable PR evidence. `--transport` defaults to the
@@ -414,10 +611,258 @@ On a live append, a missing `--host-agent` emits a run-context warning by defaul
 fields would degrade. `--transport` is auto-filled from the resolved GitHub transport when
 omitted, so adapters should not echo a stale transport value.
 
+## `keel capture-land <project.yaml> [--root <dir>] [--pr <N>] [--issue <N>] [--artifact <path>] [--remote <name>] [--onto <branch>] [--write] [--attempts <N>] [--dry-run] [--json]`
+
+Land this run's learning document on a branch — the pull request's own under `/keel:ship`
+(#1203), or `origin/<base_branch>` without `--onto` (#1163).
+
+`policy_pack.capture.learning.sink` writes one Markdown learning per applied capture, and
+with a **relative** sink path — `.keel/learning/`, the default keel dogfoods — the file
+lands in the working tree untracked. Before this command keel stopped there, so the lesson
+was written and thrown away: s2 cuts the next worktree from `origin/<base_branch>`, every
+CI runner clones fresh, and s10's pre-clean deletes the worktree outright. The capture
+contract's `durable_artifacts.commit_required` said the file *had* to be committed;
+`durable_artifacts.land_command` now names what commits it.
+
+**This is not a merge path.** It pushes one commit carrying one file. `keel merge` at s10
+remains the only way a pull request reaches the base branch, and the landing touches no
+merge claim and no merge window.
+
+```bash
+keel capture-land .keel/project.yaml --root . --pr 456 --issue 123 --onto "$BRANCH" --write --json
+```
+
+### `--onto`: the lesson rides the pull request
+
+`/keel:ship` lands the lesson **onto the pull request's own branch**, at s10 and before the
+evidence gate, so the squash carries it into the base branch with the work it describes. It
+cannot be forgotten — there is no second pull request to merge — and it never pushes to the
+base branch, so branch protection never sees it.
+
+The commit moves the head that every review verdict and the gates-pass are pinned to, so
+`keel evidence-verify` and `keel merge` accept a pin for head **H** on head **H′** exactly
+when every commit between them:
+
+- has **one parent** — a merge commit could carry anything;
+- carries the **`keel.capture-land.v1:` marker line** — the exemption is for commits that say
+  they are a landing, not for any edit that touches the sink;
+- differs from its parent by **exactly one path, inside the configured sink**;
+- and that path was **added or modified** — never renamed, copied or removed.
+
+The last rule is not decoration. GitHub's API reports a rename as *one* entry naming where the
+file went, so a marker-carrying commit that moved `src/keel/cli.py` into the sink would read as
+one path inside it; the reader counts the path it came from too, and the status is refused.
+
+**Every reader of a head honours it, the panel pin included.** The review verdicts, the
+gates-pass, the jury vendor count and panel size, and the pin that decides the review contract
+all answer for a covered head. The pin keeps its strict one-head rule — it removes requirements
+— and is simply asked once for the current head and once for each head it covers; asked only
+about the landing's head it missed all three of its sources and let the contract be re-derived
+by probing the landing machine.
+
+Any other commit invalidates the pins exactly as it always did. The walk runs back from the
+current head, reads each commit from the API so it answers the same on a CI runner as in a
+worktree, and stops at the first commit that is not a landing — ordinarily two reads. It only
+applies to a project whose sink is inside the repository with capture enabled.
+
+Without `--onto` the commit goes to the base branch, which is what #1163 shipped and what a
+protected base refuses.
+
+### `--write`: the lesson is written here, and recorded at s11
+
+`/keel:ship` passes `--write`, and the command writes the lesson before it lands it. The
+document is rendered from the pull request's files, its issue, and the **gates-pass s8
+recorded for the pull request's head** — s10 runs no gates, so their words come from that
+record, and with no gates-pass for the head nothing is written (`failed`). **Nothing is
+appended to the run ledger.** The capture is recorded at s11, after the merge, by
+`keel ship --live --append-ledger --capture-status applied --capture-artifact <plan.path>` —
+which records a named artifact rather than rendering a second copy of it.
+
+The first shape wrote the lesson with `keel ship --append-ledger` at s10 instead, and that is a
+ship-run recorder: it appended an `applied` capture for a merge that had not happened. The
+ledger keeps one capture marker per pull request and head, so when the merge then failed, the
+row that would have said so was dropped — the second append exits 0 and writes nothing,
+measured — and the capture health summary reported the open pull request as a clean capture.
+
+**One lesson per pull request.** The sink's filename carries the date, so a retried s10 — the
+merge window closed, and the run resumes the next morning — would render a second document
+and land it beside the first. `--write` first reads the pull request's commits for a lesson a
+landing already put there: a commit carrying the marker that `capture.capture_only_descent`
+accepts against its own parent, whose path the pull request still changes. Found, it is
+reported `already-landed` and nothing is written or pushed — which is also how s11 recovers
+the path when s10's output is gone. Only commits carrying the marker are read, at most ten.
+
+The lesson's changed files leave out the sink's own documents
+(`capture.lesson_changed_files`): once a lesson has landed, the host lists it among the pull
+request's files, and the record appended after the merge must fingerprint the same lesson as
+the document written before it. A lesson that did not land is removed rather than left
+untracked in the checkout (`local_copy: removed`). `--write` refuses `--artifact` (it lands
+what it writes) and `--dry-run` (a dry run writes nothing to land), and needs `--pr`; a sink
+outside the checkout reports `not-required` without reading anything — s11 writes that one.
+
+With neither `--write` nor `--artifact`, the path is read from the `capture.artifact` field of
+the newest `ship_run` ledger record for `--pr`.
+
+### Why plumbing, and not a checkout
+
+The obvious recipe — switch to the base branch, pull, add, commit, push — cannot run on
+the topology keel uses for itself. s2, `overnight` and `swarm` all execute s0–s12 **inside
+a worktree** while the primary checkout holds the base branch:
+
+```
+$ git switch main            # from inside .claude/worktrees/<wt>
+fatal: 'main' is already used by worktree at '/…/keel'
+```
+
+So the commit is built with plumbing instead — `hash-object`, `ls-tree`, `mktree`,
+`commit-tree` against `<remote>/<base_branch>` — and the base branch is never checked out.
+The same command therefore runs unchanged from a worktree, from the primary checkout, and
+from a fresh CI clone.
+
+### Concurrency
+
+A push is a plain fast-forward, never forced. If the target branch moved between this
+command's read and its push — another push to the pull request's branch, or, without `--onto`,
+another ship landing on the base — the push is rejected, the command re-reads the branch as
+it now is, rebuilds its commit on top, and pushes again, up to `--attempts` (default 3) times.
+Forcing would discard whatever the other push brought.
+
+**Only a ref that moved is retried.** git exits 1 for every rejection, so the two are told
+apart by what it says: `fetch first` and `non-fast-forward` mean the branch moved and
+rebuilding will work, and anything else — a protected branch, a declining `pre-receive`
+hook, a permission error — is a refusal that will refuse again. Retrying those burned three
+pushes on something that could not succeed and then reported the branch as having *"moved
+under every one of 3 attempt(s)"*, naming a cause that had not happened and hiding the
+server's own reason. An unrecognised failure counts as a refusal, not as contention: this
+pushes to a shared branch, so it stops and reports rather than guessing.
+
+### Branch protection
+
+Without `--onto`, a base branch that requires pull requests refuses this push, and so does one
+with required status checks — the commit is built with `commit-tree` and has never been through
+CI. Measured against this repository's `main` on 2026-09-16:
+
+```
+remote: error: GH006: Protected branch update failed for refs/heads/main.
+remote: - Changes must be made through a pull request.
+remote: - 13 of 13 required status checks are expected.
+ ! [remote rejected]  … -> main (protected branch hook declined)
+```
+
+The command reports `failed` with the server's reason and does not retry. That refusal is why
+`/keel:ship` lands onto the pull request instead.
+
+### The untracked copy
+
+git will not pull over an untracked file, **even one byte-identical to the file arriving** —
+measured — so a lesson left in the working tree after landing would stop the next `git pull`
+there with *untracked working tree files would be overwritten by merge*. After `landed` or
+`already-landed` the command removes that copy, but only when its bytes equal the committed
+blob; one edited after it was written is kept, and so is one the checkout **tracks** — after
+`git pull` the landed lesson is in the index, every same-bytes check passes on it, and a
+re-run that found it `already-landed` would otherwise have deleted a tracked file. `local_copy` in the JSON says which:
+`removed`, `kept` or `absent`. A re-run that finds the copy already gone, and the path already
+on the target branch, reports `already-landed` rather than a missing artifact.
+
+### Safety
+
+The landing commit is composed from the base branch's own tree objects, and the command
+verifies that the finished commit differs from its parent by **exactly** the artifact path
+before pushing. A commit that touches anything else, or a diff that cannot be read at all,
+is refused rather than pushed. The diff is read with `--no-renames`, so a deletion cannot
+pass as a rename into the lesson, and the tree listing is split on NUL alone, so a sibling
+whose name holds a newline stays in the rebuilt tree (#1219).
+
+**What it builds on is named in full.** The fetch writes
+`refs/remotes/<remote>/<branch>` by name and the landing resolves exactly that ref, never the
+short `<remote>/<branch>`: git resolves a short name through `refs/tags/` and `refs/heads/`
+first, so a tag or local branch literally named `origin/<branch>` — a tag arrives unasked
+with a fetch of any remote whose history carries it — would have been the base, and the
+one-file check, comparing against the same base, would have agreed. With `--write --onto`
+the branch must also still be at the pull request head the lesson was written for; if it
+moved, the landing reports `failed` and pushes nothing (#1219).
+
+The ref is resolved with `git show-ref --verify`, which matches that exact ref or nothing:
+`git rev-parse` still falls back through `refs/tags/` and `refs/heads/` for a full name that
+does not exist, so a local branch literally named `refs/remotes/origin/main` would answer for
+a missing tracking ref (measured). And `--remote` must name a **configured** remote: git
+reads an unknown name as a path, so with no `origin` remote a repository committed at
+`<checkout>/origin` would have been fetched from and pushed to, running its hooks. The
+landing reports `failed` (`no remote named 'origin' is configured`) instead (#1223).
+
+An artifact path that is absolute or climbs out of the checkout (`../x`, `/etc/x`, `C:\x`,
+`~/x`) is refused, not normalised — this command's whole job is to push to a shared branch.
+The refusal is tested on the path as written **and** on the path after backslashes become
+slashes, because those disagree: `\etc\hostname` is drive-relative rather than absolute, so
+no flavour of `PurePath` calls it anchored, and the rewrite then turns it into `/etc/hostname`.
+
+The path must also be **inside the configured sink**, not merely inside the repository.
+The sink's `path` is a template, and only the directory-shaped placeholders are resolvable
+here: `{owner}`, `{repo}`, `{base_branch}` and `{pr}`. One that still holds `{date}`,
+`{slug}` or `{fingerprint}` after those are filled in names a place nobody can point at, so
+the landing refuses it rather than guessing — matching such a component as a wildcard was
+tried and is not a boundary at all: a sink of `{date}` makes the first component match
+anything, so `config/private.env` is "inside" it. Per-run placeholders belong in `filename`.
+A sink of `.` is refused for the same reason: it names the whole checkout.
+Every other test here asks whether git could address it, and the answer is yes for
+`config/private.env` as much as for a lesson — so a ledger record naming one would have
+fast-forwarded the shared base branch with it, and the exactly-one-file check downstream
+would have agreed, because it *was* exactly one file. Containment is compared by path
+component, so a sibling directory whose name merely begins the same way
+(`.keel/learning-notes/`) is outside.
+
+Containment is also checked on the **resolved** path, not only on its spelling: `git
+hash-object` follows symlinks, and the exactly-one-file check downstream counts paths in the
+finished commit rather than where their bytes came from — so a link inside the sink would
+have published whatever it pointed at to the base branch under a lesson's name. The resolved
+path has to be inside the **sink**, not merely inside the checkout: an untracked `.env`
+beside the code is in the repository, and a checkout-wide test says yes to a link to it. A
+sink configured as the repository root (`path: '.'`) therefore names no directory to confine
+anything to, and the landing refuses rather than falling back to the wider boundary.
+
+### Identifying the landing commit
+
+This is a commit keel builds and pushes itself rather than one an implementer wrote, so it
+says so in a line a machine can read — which is also what the head-pin exemption reads:
+
+```
+chore(learning): record the lesson from PR #456
+
+keel.capture-land.v1: pr=456 issue=123 path=.keel/learning/2026-09-14-pr456-....md
+```
+
+The marker **is** the schema version, which keeps it from drifting from the record it
+describes and makes it greppable against the contract that defines it. The subject and the
+message carry no vendor trailer: this commit lands on every consumer's base branch, and a
+core command cannot know whose co-authorship to stamp on one.
+
+### Statuses and exit codes
+
+| `status` | exit | meaning |
+| --- | --- | --- |
+| `landed` | 0 | the lesson is on the target branch — the pull request's own with `--onto`, else `<remote>/<base_branch>` |
+| `already-landed` | 0 | that exact content is already there — with `--write`, a landing already put this pull request's lesson on it; nothing was written or pushed |
+| `not-required` | 0 | the sink is outside the checkout, so git never sees it |
+| `no-artifact` | 0 | this run captured nothing to land — with `--write`, the policy writes no document, or this one duplicates a lesson already durable |
+| `would-land` | 0 | `--dry-run` |
+| `contended` | — | a single attempt's outcome, never the command's: the branch moved, so the next attempt rebuilds |
+| `failed` | 1 | the lesson was not landed; `detail` carries the reason — the last push's own, or with `--write` the read or write that failed — and no lesson `--write` wrote is left behind |
+
+The five non-`failed` statuses exit 0 on purpose: a capture that had nothing to do must
+not fail the ship. `/keel:ship` runs the landing at s10, **before** the merge, and treats
+`failed` as fail-soft too — a lesson that did not land is recorded in the closure and does
+not hold back the work it describes, so the merge goes ahead and nothing is rolled back.
+
 ## `keel capture-verify <project.yaml> [--merged-pr <N>] [--from-transport] [--json]`
 
 Verify that merged PRs have exactly one valid capture marker in the configured run ledger.
 Missing, invalid, or duplicate markers make the command exit non-zero.
+
+"One" is counted on the head the capture was recorded against — the last record carrying a
+marker — not across every head the pull request ever had (#1157). A marker left on a
+superseded head is not a duplicate of the merged head's, and a record that never reached
+capture (`--capture-status not-run`) carries no marker and does not move which head is
+counted.
 
 ```bash
 keel capture-verify .keel/project.yaml --root . --merged-pr 456 --json
@@ -450,15 +895,25 @@ When the merged set is derived (or any reconcile input is supplied) three additi
 
 - **missing-marker** — a merged PR with no valid capture marker in the ledger.
 - **applied-without-artifact** — an `applied` capture lacking a durable artifact reference
-  (recorded via `keel ship --capture-artifact <path|hash>`). `deferred`/`skipped` need none.
+  (recorded via `keel ship --capture-artifact <path|hash>`). `deferred`/`skipped` need none,
+  and neither does a record whose `capture.artifact_scope` is `machine` — see the note below.
 - **reviewer-count-mismatch** — the ledger's `actors.reviewers` count exceeds the evidence-side
   review-verdict count for that PR. Per-PR verdict counts come from the transport when deriving
   live, or from `--verdict-count PR=N` fixtures offline; a PR with no known count is advisory.
 
+The reconcile also reports **notes**, which are listed beside the findings in both the human
+and `--json` output and never fail the command:
+
+- **applied-elsewhere** — an `applied` record whose `capture.artifact_scope` is `machine`,
+  meaning this project's sink writes outside the checkout. Such a run legitimately has no
+  artifact to name here: a later duplicate drops the absolute path it cannot read rather
+  than recording one that resolves to nothing. Reported as a note so the absence is
+  *visible* without being counted as the missing-file finding it is not.
+
 Offline fixtures for deterministic runs: `--merged-prs-json <file>` (a JSON array of
 `{"number": N}`) substitutes for the transport query, and `--verdict-count PR=N` supplies
 evidence-side counts. Any reconcile finding makes the command exit non-zero in addition to the
-base marker semantics.
+base marker semantics; a note never does.
 
 ## `keel capture-reconcile <project.yaml> --merged-pr <N> [--json]`
 
@@ -480,7 +935,49 @@ checks: `emit-capture-marker`, `run-capture-extension`, `post-closure-summary`,
 project capture extension. Ambiguous linked issues or invalid/duplicate existing markers
 block the plan instead of guessing.
 
-## `keel evidence-verify <project.yaml> --pr <N> [--issue <N>] [--json]`
+## `keel close-reconcile <project.yaml> --issue N [--issue N …] [--root DIR] [--ledger-jsonl FILE] [--offline] [--closed] [--status-done] [--json]`
+
+Flag issues that were closed — or labelled done — without a ledger record attesting a
+merge. Closing an issue is the cheap half of the workflow and the ledger is the expensive
+half; when they disagree, the issue is the one that lied.
+
+```bash
+keel close-reconcile .keel/project.yaml --root . --issue 123 --issue 124
+keel close-reconcile .keel/project.yaml --root . --issue 123 --json
+```
+
+Live is the default: the issue's closed/label state is read from `gh`, and the
+merge-attesting `ship_run` records come from the ledger configured under `--root`.
+`--ledger-jsonl` substitutes a JSONL fixture for that read. `--offline` makes no `gh`
+call at all and uses only the supplied `--closed` / `--status-done` flags, which apply to
+every `--issue` — that pair is for tests and back-compat, since live mode reads
+host-authoritative state. The done label comes from
+`policy_pack.status_transitions.done`, falling back to keel's default.
+
+Exit 1 on any finding (and on a missing/invalid config or an unreadable ledger); 0 when
+every observed issue is consistent with the ledger.
+
+## `keel dryrun-verify <project.yaml> --run-id ID --issue N --before-json FILE [--root DIR] [--after-json FILE] [--json]`
+
+Assert, after the fact, that a dry run left nothing behind: no new ledger record, no new
+branch, no new PR. A dry run that mutates is the one failure a dry run cannot self-report.
+
+```bash
+keel dryrun-verify .keel/project.yaml --root . \
+  --run-id ship-123-rehearsal --issue 123 --before-json before.json
+```
+
+`--before-json` is a snapshot captured **before** the rehearsal:
+`{"ledger_run_ids": [...], "branches": [...], "pr_numbers": [...]}`. The after-snapshot is
+gathered live by default — ledger run ids from the configured ledger, branches from
+`git for-each-ref`, PRs from `gh pr list` scoped to the issue's ship-branch pattern — and
+`--after-json` supplies it offline instead.
+
+The after read is **fail-closed**: a corrupt ledger or a failed `git`/`gh` read exits 1
+rather than reporting a clean diff, because an empty-on-error snapshot would mask a real
+leak (`after − before = ∅`). Exit 1 on any leak, 0 when the rehearsal left no trace.
+
+## `keel evidence-verify <project.yaml> --pr <N> [--issue <N>] [--effort low|medium|high] [--team PROFILE] [--json]`
 
 Verify that a PR has the public evidence required by the ship contract before merge.
 
@@ -527,6 +1024,14 @@ drops `jury-verdict` from the required set:
 | `1` | advisory | no |
 | `2`+ | gating | yes |
 
+**Except on a tier whose review policy is the panel** (`knobs.team`'s
+`review.by_tier.<n>: jury`), where the downgrade is suppressed entirely and the verdict
+stays required whatever the count. The table above describes a jury sitting *beside* a host
+bench: downgrading is sound there because the bench still reviewed the change. A panel tier
+has no bench behind it, so a short panel excusing itself from its own consensus record would
+leave the run with the one artifact missing that says the panel was short. The shortfall is
+reported instead — as `review-vendor-distinctness` from `evidence-verify`.
+
 `0` is not a special case — it is the run where no agent returned output, which is how the
 contract's "a jury that did not complete cleanly never gates" falls out of the same
 comparison rather than needing its own branch.
@@ -537,7 +1042,11 @@ enforced. An explicit `--jury-advisory` is *not* reported as a downgrade — it 
 gating — and `--no-jury` is untouched.
 
 **Where the count comes from when the flag is omitted.** The verifier reads `vendors: <N>`
-from a trusted, head-bound `keel.jury-verdict.v1` comment on the PR. That is the only
+from a trusted, head-bound `keel.jury-verdict.v1` comment on the PR. The same comment
+carries `panelists: <N>`, read the same way, which sizes the required reviewer count on a
+tier whose panel *is* the review — as a **floor raised, never lowered**:
+`max(declared, jury.min_vendors)`, so a verdict declaring a short panel cannot shrink what
+the tier owes (see `docs/keel/evidence.md`). That is the only
 channel available to a hosted runner: the run ledger and the jury artifact both live under
 the gitignored `.keel/state/`, so CI can read neither, while PR comments are always
 visible. `keel.artifacts.render_jury_verdict()` emits the field, inferring it from
@@ -551,7 +1060,15 @@ Precedence and failure modes:
 - a verdict that omits the field, sits on a stale head, or comes from an untrusted author
   is **not** read — the count stays undeclared and the jury mode is left alone. Only a
   verdict that actually states the panel size may relax the gate;
-- a non-numeric or negative value is rejected the same way.
+- a non-numeric or negative value is rejected the same way;
+- **and a run that resolved no head reads no count at all** (#1069). `--head-sha` defaults
+  to unset, and offline nothing fills it in; every other evidence reader treats an unknown
+  head as "do not filter", which is right where the gate is head-agnostic end to end and
+  wrong here. This is the one reader whose answer can *remove* a requirement, so it takes
+  the panel pins' rule — `keel.juryavail.is_pinnable_head`, an exact commit or nothing —
+  and a `vendors: 1` verdict posted against an earlier head can no longer make the current
+  head's jury advisory. `panelists:` deliberately keeps the permissive reading, because
+  `max(declared, jury.min_vendors)` can only ever raise the bar.
 
 `0` is a real answer, not a missing one: it is the run where no agent returned output, and
 it must downgrade rather than read as "unknown".
@@ -586,7 +1103,20 @@ which is the point — an explicit operator act stays distinguishable from armin
 - the required count of distinct posted s7 reviewer verdicts from PR comments or reviews
   carrying `keel.review-verdict.v1`, `reviewer: <stable-id>`, and the current
   `head: <sha>` (formal PR reviews may use GitHub's review `commit_id` as the head
-  binding), posted by a trusted GitHub actor. Verdicts may additionally carry
+  binding), posted by a trusted GitHub actor. A verdict must also **name something
+  concrete**, or it is refused as a receipt (#926): an anchor — a path, a
+  `file.py:42`, a backticked token, or a called `module.function()` — or two of the
+  unbackticked forms (a bare filename, a dotted `module.symbol` carrying an
+  underscore or a capital, a lowercase `snake_case` identifier), or a free-form
+  "Checked X, Y and Z" clause. What #1106 changed is that an unbackticked name is
+  *read at all*: before it, `cache.cache_key` and `evidence.py` counted for
+  nothing, so a review naming eleven symbols in plain prose was refused as naming
+  none. They count now — but as **corroborators**, two of which are needed,
+  because `Node.js` and `evidence.py` are spelled the same way and one of either
+  is as likely a mention as a reference. What still makes a *single* token enough
+  is the author pointing at it: backticks, a slash and an extension
+  (`src/keel/evidence.py`), a `:line`, or the parentheses on
+  `module.function()`. Verdicts may additionally carry
   `vendor: <id>` / `model: <id>` provenance; with `--require-distinct-vendors` (or the
   `evidence_require_distinct_vendors` knob) the verifier requires each required verdict to
   declare a vendor and that no two share one — a missing or duplicate vendor fails with a
@@ -752,8 +1282,8 @@ Two independent checks compose into one verdict:
 The comparison itself is pure (`keel.branchscope.verify`): given the head/merge-base/base-tip
 SHAs, the commit distance, and the worktree facts, it returns an `ok`/`stale`/`contaminated`
 verdict with a per-check breakdown. The CLI gathers the live facts via the thin `git`/`gh`
-wrappers (`merge-base`, `rev-parse origin/<base>`, `rev-list --count`, `worktree list
---porcelain`), fail-soft — a fact that cannot be resolved becomes `None` and the pure layer
+wrappers (`merge-base`, `show-ref --verify refs/remotes/origin/<base>`, `rev-list --count`,
+`worktree list --porcelain`), fail-soft — a fact that cannot be resolved becomes `None` and the pure layer
 skips that check rather than hard-blocking.
 
 ```bash
@@ -767,13 +1297,26 @@ and offline CI harnesses can supply every fact directly with `--offline` plus `-
 `--base-tip-sha`, `--merge-base-sha`, `--base-distance`, `--worktree-path`, `--repo-root`, and
 `--linked-worktree true|false`; the same pure verifier path is used either way.
 
-## `keel step-verify --step sN --handoff-file handoff.json --evidence-report evidence.json`
+## `keel step-verify --step sN --handoff-file handoff.json --evidence-report evidence.json [--effort low|medium|high] [--team PROFILE]`
 
 Verify a persisted step handoff before an adapter advances the ship backbone. The handoff
 must be the JSON object produced by `keel.stepverifier.build_handoff`; the evidence report
 must be the JSON verification block from `keel evidence-verify` (or an equivalent report
-with `results`). The command exits non-zero when the handoff schema/status/renderer marker
-is missing or when the step's required evidence ids are not ok.
+with `results`). The whole published handoff schema is checked, not a prefix of it: the
+command exits non-zero when any declared field is missing, of the wrong type, or null or
+blank where that field's schema entry does not permit it — naming it, as `handoff field
+missing: summary` — when the status is not `complete`, when `rendered` is not the
+canonical rendering of the handoff's own fields, when `provenance` is not a canonical
+untrusted-output tag bound to this step, when a completed handoff does not claim the
+evidence ids its step requires, or when those ids are not `ok` in the report.
+
+Every declared field must be **present**; what varies is what it may hold. Each carries
+its own `nullable` and blank rule, so `next_step` and `producer` may be `null` on a step
+that has neither, while `summary` may be neither null nor blank. Omitting a key is not the
+same as setting it to `null`: a producer that skips `next_step` gets `handoff field
+missing: next_step`. The field list is published in the `step_verification.handoff_schema` block
+of the ship contract; [command-contracts.md](command-contracts.md#the-handoff-schema-is-checked-whole)
+documents each field.
 
 ```bash
 keel step-verify --step s7 \
@@ -794,6 +1337,150 @@ summary into the ship ledger record and also exits non-zero on a hard halt.
 keel runcontrols .keel/run/events.json --slot fixloop --action fix
 keel runcontrols .keel/run/events.json --step-cap fixloop=3 --json
 ```
+
+`--provider`, `--attribution`, `--stage` and `--round` record **who** ran the event, which
+is what lets the s11 closure comment attribute an escalated fix round to the seat that
+actually took it. Every result — JSON and human — carries `fix_attribution`: the
+implementation actor read off the `s4`/`implement` event, one record per `s9`/`fixloop`
+round, and the deterministic `sentence` the closure embeds.
+
+```bash
+keel runcontrols .keel/run/events.json --slot implement --provider agy --attribution agy
+keel runcontrols .keel/run/events.json --slot fixloop --round 2 \
+  --provider anthropic-api --stage gate --attribution opus --json
+# fix_attribution.sentence: "implemented by agy, fixed by opus in round 2"
+```
+
+`--attribution` takes the label `keel delegate run` computed (a bare string, or that
+command's whole `attribution` object through `--event-json`) — never one you composed, so
+the label written down and the model that ran cannot drift.
+
+## `keel fixloop brief --findings FILE [--pr N] [--round K] [--budget N] [--unavailable PROVIDER] [--out FILE] [--cwd DIR] [--head SHA] [--issue N] [--fix-sha SHA] [--tier N] [--role LABEL] [--delegate TOKEN] [--host-agent NAME] [--timeout S] [--root DIR] [--project project.yaml] [--json]`
+
+Route review findings back to a fixer — the s9 half of the review loop. It renders the
+round's fix brief and resolves **who fixes it**, both deterministically, so two hosts
+running the same round produce the same words and dispatch the same seat.
+
+The brief groups findings by severity, anchors each on its `file:line`, carries the
+reviewer's own `reproduction`, and states the re-review the push will get: a blocking
+finding means a full re-review, a suggestion-only round means the narrowed one, whose
+instruction (*"verify only the applied fix in commit `<sha>`; do not re-review what you
+already approved"*) is rendered verbatim for the next reviewer's prompt.
+
+`--findings` is a JSON array of findings — `severity` (required: `critical`, `major`,
+`minor`, `nit`), `message`, `source`, `path`, `line`, `anchorable`, `reproduction` — or an
+object with a `findings` array, so a `keel review` bundle can be passed straight through.
+
+**Reviewer text is quoted data, never instructions.** The brief becomes the fixer's
+`--prompt-file`, and findings are the one part of it keel did not write, so every
+reviewer-supplied string is rendered as a blockquote: one `> ` per line (nothing a reviewer
+wrote can sit at the start of a line, which is where every structural token of this format
+lives), the HTML-comment opener defanged so a second brief marker cannot be forged, a
+leading `#` escaped, a line reading as one of the brief's trailer keys rendered as inline
+code, and the field capped — a prompt has a budget. A finding whose message carries its own
+`## Rules for this round` section appears inside the quote and nowhere else.
+
+**The project config is required.** `knobs.team.fix` is what decides whether the round goes
+back to the delegate that implemented or to the host, so a config the command cannot read
+is a **refusal** — `status: no-config` and a non-zero exit — rather than a silent
+resolution against an empty policy, which answers "the host fixes" and is the failure this
+command exists to prevent. `--project` / `--root` name it; `--no-project` is the deliberate
+opt-out for a project that really has no team policy.
+
+The fixer is the **escalation ladder** `implementer → gate → host`, a pure function of the
+round, provider availability, and the budget:
+
+| round | seat | source |
+| --- | --- | --- |
+| 1 | `assignment.fix` | `knobs.team.fix`, defaulting to the alias `implementer` — the provider that implemented this change |
+| 2 | `assignment.gate` | `knobs.team.gate`, the mandatory second opinion |
+| 3 | the host agent | the CLI driving the run |
+
+A rung repeating an earlier one is dropped (escalating to the seat that just failed the
+round is not an escalation), a provider named by `--unavailable` is skipped rather than
+dispatched to, and a round past the last rung stays with the last usable fixer. The
+`--budget` (default 3) is unchanged by the ladder: past it there is no fixer, and the
+command **exits non-zero** (`status: budget-exhausted`, or `no-fixer` when every rung is
+unavailable) so a spent loop cannot be mistaken for a round to run. A further round needs
+an explicit `--budget` — that flag, not `keel ship --max-rounds`, which is the run budget.
+
+```bash
+keel fixloop brief --pr 1042 --findings .keel/run/findings.json --round 2 \
+  --head "$HEAD_SHA" --issue 1016 --out .keel/run/fix-2.md --cwd "$WORKTREE" --json
+```
+
+`--json` prints the whole document: `fixer`, the `ladder` with each rung's availability,
+the `hops` walked to reach this round (`start`, `round-failed`, `provider-unavailable`,
+`ladder-exhausted`), the finding counts, `re_review`, the rendered `brief`, and `dispatch`
+— the ready-made `keel delegate run --role fix` argv for the resolved seat. `dispatch` is
+`null` for a `kind: subagent` seat: a host subagent is run by the host agent and never
+reaches `keel delegate run`.
+
+## `keel loop brief --iteration K --brief FILE --gates FILE [--out FILE] [--title TEXT] [--loop] [--max-iterations N] [--gate-output-max-bytes N] [--tdd] [--root DIR] [--project project.yaml] [--json]`
+
+Decide one s4 loop iteration's outcome and render the next iteration's brief — the pure
+half of the [s4 iteration loop](configuration.md#loop). `--brief` is the base implement
+brief (a file), `--gates` is the gate report the iteration produced: a `keel run-gates
+--json` document (the plan beside the outcomes), a `keel ship --json` document, a
+`{"gate_outcomes": [...]}` envelope, or a bare list of outcomes. The decision is a pure
+function of the iteration number, the outcomes and the policy:
+
+| status | when | exit |
+| --- | --- | --- |
+| `done` | every blocking gate the loop judges passed — the loop is over, proceed to s5 | 0 |
+| `continue` | a judged blocking gate failed and the budget allows another iteration — the next brief is rendered | 0 |
+| `budget-exhausted` | a judged blocking gate is still red after `max_iterations` — the issue is blocked | 1 |
+
+The loop judges the gates `keel ship` runs on the tree before a pull request exists — the
+guard and test phases, of kind `command` or built-in — and that is what the packaged recipe
+runs: `keel run-gates --phase s4 --phases guard,test --defer-jury --json`, whose report carries the plan beside
+the outcomes. A soft gate (`on_fail: suggest` / `warn`) that failed does not hold the loop
+open: it never held a merge either. An agentic gate the command runner did not execute
+(`not_run`), the jury under `--defer-jury`, and a `pre-merge` gate are **deferred**: listed in
+the brief and in `decision.deferred`, never counted as green, never holding the loop open —
+the review, test and merge phases run them. Without that scope a project with a blocking
+agentic tester could never reach `done`. An empty report is refused (exit 1): no gates
+recorded is not a pass.
+
+The rendered brief is the base brief **verbatim** plus one appended section, `## Gate output
+from iteration K`, carrying each gate's outcome and its output as quoted data (blockquoted,
+a leading `#` or `>` escaped, the comment delimiters defanged, trailer keys inline-coded,
+each gate's output capped at `gate_output_max_bytes` of gate text with a visible marker — a
+line longer than what is left is clipped, not dropped), then the rules for the iteration:
+the gate run decides, one commit with subject `loop(K+1/N): <title>` (`--title` is rendered
+as one backtick-free line), never weaken or delete a test, and the budget. Byte-stable for
+identical inputs. A base brief that already carries the loop marker is a rendered brief
+handed back by mistake, and is refused (exit 1).
+
+**The policy is required.** `--loop` and `knobs.loop` resolve it exactly as `keel ship`
+resolved it, so the published `source` is the truth: a project whose loop is off (no block,
+or `enabled: false`) with no `--loop` is a refusal (`status: off`, exit 1), as a config the
+command cannot read is (`status: no-config`, exit 1), rather than a loop nobody bounded;
+`--project` / `--root` name the project, and `--max-iterations N` (1..10) supplies an
+explicit budget for a run without a readable config. `--gate-output-max-bytes N` (at least
+256) overrides the cap; both flags hold the bounds the schema holds the knob to.
+`keel ship` takes the same `--max-iterations N`, so a run bounded by the flag records the
+budget it actually used: it outranks both `knobs.loop` and `--loop`, publishes
+`source: flag:--max-iterations`, and `--loop-iteration` is judged against it. Without the
+flag each number is still judged against the project's policy, so `--loop-iteration 4=…`
+under a default budget of 3 is refused as it always was. `--tdd` says the run is in
+`implement_mode: tdd`, so the published `wraps` reads `implementation`.
+
+A run whose policy is **off** publishes `max_iterations: null` in
+`run_context.implement_loop`: it bounded nothing, and the field used to carry the resolved
+default beside `enabled: false` while no number was being enforced.
+
+```bash
+keel run-gates .keel/project.yaml --root "$WORKTREE" --phase s4 \
+  --phases guard,test --defer-jury --json > "$SCRATCH/iter-1.json"
+keel loop brief --project .keel/project.yaml --root . --iteration 1 \
+  --brief "$SCRATCH/brief.md" --gates "$SCRATCH/iter-1.json" \
+  --title "$ISSUE_TITLE" --out "$SCRATCH/brief-2.md" --json
+```
+
+`--json` prints the whole document: `policy`, `decision` (`status`, `iteration`, `budget`,
+`blocking`, `next_iteration`, `blocked`), the per-gate summary, the rendered `brief` (or
+`null`), `prompt_file`, and `next_action`.
 
 ## `keel checkpoint <project.yaml> [--root DIR] [--json]`
 
@@ -823,10 +1510,15 @@ keel checkpoint .keel/project.yaml --root . --write \
 The writer replaces the previous checkpoint. It is for the active resume point, not for
 append-only shipped-run history; use `keel ledger` for history.
 
-## `keel verify-merge <project.yaml> [--root DIR] --pr N [--merge-sha SHA] [--json]`
+## `keel verify-merge <project.yaml> [--root DIR] --pr N [--merge-sha SHA] [--transport auto|graphql|rest] [--json]`
 
 Confirm a merged PR applied what was reviewed — and that nothing else rode along.
 Read-only: it queries GitHub and mutates nothing.
+
+It takes the same `--transport` as [`keel merge`](#keel-merge-projectyaml---pr-n---root-dir---method-squashmergerebase---transport-autographqlrest---dry-run---effort-lowmediumhigh---team-profile)
+and reports which wire answered as `transport` in the report. Before #1175 the two reads it
+depends on were `gh pr view --json`, so on a proxy-restricted runner the drift check came
+back `unknown` and exited 2 — "could not look" — for every merge.
 
 A merge succeeding is not the same as a merge applying the reviewed diff. An
 `update-branch` merge commit followed by a squash-merge silently reverted unrelated
@@ -959,6 +1651,35 @@ merge** even if the per-phase `keel activity` calls never run. Use `keel activit
 to fill in the **middle** phases (s1–s7, s9, s11–s12) or for the non-ship flows that stamp
 every phase as they go.
 
+## `keel scratch-dir [--root DIR] [--no-create]`
+
+Print the keel-owned scratch directory for transient artifacts, creating it (with its
+gitignore) unless `--no-create`. Adapters wire it as `SCRATCH=$(keel scratch-dir)` so PR
+diffs, issue dumps and draft prose land under `.keel/scratch` instead of the consumer's
+checkout.
+
+```bash
+SCRATCH=$(keel scratch-dir --root .)
+keel scratch-dir --root . --no-create      # just the path
+```
+
+Prints one line — the absolute path — and always exits 0.
+
+## `keel gc <project.yaml> [--root DIR] [--keep-activity N] [--no-scratch] [--no-activity] [--dry-run] [--json]`
+
+Reclaim keel's own disposable runtime artifacts: empty `.keel/scratch`, prune
+`.keel/activity` to the newest `--keep-activity` records (default 50). The run ledger, the
+checkpoint and the locks are durable or self-bounded and are never touched.
+
+```bash
+keel gc .keel/project.yaml --root . --dry-run
+keel gc .keel/project.yaml --root . --keep-activity 100 --json
+```
+
+Fail-soft by design: a failure on one tree degrades to a no-op reported under `degraded`
+(and on stderr) while the other still runs — taking out the trash must never abort a
+caller. Exit 1 only when the config is missing or invalid; otherwise 0, degraded or not.
+
 ## `keel morning <project.yaml> [--root DIR] [--since WHEN] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--json]`
 
 Render the standalone daily-brief contract for a project. The core owns the generic
@@ -998,7 +1719,7 @@ Dry-run mode never runs gates, commits, pushes, opens PRs, or writes reports. Li
 only a preflight contract; adapters perform approved session closeout work after checking
 consent and GitHub transport support.
 
-## `keel work-block <project.yaml> [issues…] [--root DIR] [--queue SELECTOR] [--max N] [--hours H] [--review-comments inline|summary] [--reviewers 1|2|3] [--target TEXT] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--json]`
+## `keel work-block <project.yaml> [issues…] [--root DIR] [--queue SELECTOR] [--max N] [--hours H] [--review-comments inline|summary] [--reviewers 1|2|3] [--delegate PROVIDER] [--review-delegate PROVIDER] [--effort low|medium|high] [--team PROFILE] [--target TEXT] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--json] [--wizard] [--wizard-answer KEY=VALUE]...`
 
 Render the standalone daytime multi-issue work-block contract. The core owns the generic
 `keel.work-block.v1` queue primitive: explicit issue numbers (processed in the order given)
@@ -1014,18 +1735,38 @@ keel work-block .keel/project.yaml 76 --live --approve-scope filesystem,git,gith
 ```
 
 `--max` caps how many issues are attempted, `--hours` sets an optional time budget, and
-`--review-comments` / `--reviewers` pass through to the per-issue ship handoffs. The contract
+`--review-comments` / `--reviewers` pass through to the per-issue ship handoffs.
+`--wizard` / `--wizard-answer` behave exactly as they do for
+[`keel ship`](#ship-wizard) — same probe, same questions, same interactivity guard. The
+implementer and jury choices have no work-block flag of their own, so they are echoed in
+the resolved flag set for the adapter to hand to each child `keel ship`. The contract
 shares its queue primitive with `overnight`; the daytime mode lets the operator redirect
 between items, while a blocked item stops the daytime block instead of continuing. Final
 reporting buckets each issue as shipped, PR-open-not-merged, deferred, blocked, skipped, or
 needs-input. Stop conditions include queue exhaustion, the max/time budget, an operator
 pause, a consent gap, a non-ready or blocking finding, and merge-window close.
 
+
+**Staffing the children (#1017).** `--delegate <provider[:model]>`, `--review-delegate
+<provider>` (repeatable, positional per reviewer slot), `--effort low|medium|high`,
+`--team <profile>` and `--reviewers` are resolved once for the block and handed to **every**
+child `/keel:ship` — which accepts all five, so the handoff the contract publishes is one the
+child really parses. `--effort` and `--team` are also accepted by `plan`, `review`,
+`step-verify`, `evidence-verify` and `merge`, because a bench changes the reviewer count and
+all six of those commands resolve the same review contract; pass the same values to each, or
+the gate re-derives a bench the run never dispatched. The contract publishes both halves under
+`session_contract.work_block.delegation`: `effective` (what the operator passed) and
+`child_args` (the exact flag list to append to each handoff). `contract.assignment` shows
+what those values resolve to against `knobs.team` — `lead`, `implementer`, `effort`,
+`reviewers`, `review_panel`. `--team` names a [`knobs.team.profiles`](configuration.md#team)
+bench; an unknown name lands in `assignment.warnings` rather than being ignored. The adapter
+records the effective values in the session report.
+
 Dry-run mode never spawns ship runs, creates PRs, merges, or writes reports. Live mode is
 only a preflight contract; adapters hand the approved consent scope to each ship delegate and
 keep merge-window and merge-lock enforcement shared with `keel ship`.
 
-## `keel overnight <project.yaml> [hours] [--max N] [--review-comments inline|summary] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--json]`
+## `keel overnight <project.yaml> [hours] [--max N] [--review-comments inline|summary] [--reviewers 1|2|3] [--delegate PROVIDER] [--review-delegate PROVIDER] [--effort low|medium|high] [--team PROFILE] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--json]`
 
 Render the standalone overnight-session contract. The core owns the generic unattended
 session shape: merge-window mode from `keel window`, ship handoff, per-issue worktree
@@ -1036,6 +1777,9 @@ or morning report destinations, stop conditions, and the shared deferral queue.
 keel overnight .keel/project.yaml 8 --max 3 --json
 keel overnight .keel/project.yaml --live --consent-mode standing --json
 ```
+
+It takes the same staffing flags as `keel work-block`, with the same
+`session_contract.work_block.delegation` record and the same session-report requirement.
 
 Dry-run mode never spawns ship runs, creates PRs, merges, or writes reports. Live mode is
 only a preflight contract; adapters hand approved consent scope to ship/implementer
@@ -1094,15 +1838,17 @@ keel plan — example-flutter
     ...
 ```
 
-## `keel run-gates <project.yaml> [--root DIR] [--concurrency N] [--run-id ID] [--command CMD] [--phase PHASE] [--issue N] [--pull-request N]`
+## `keel run-gates <project.yaml> [--root DIR] [--tdd] [--defer-jury] [--json] [--run-id ID] [--command CMD] [--phase PHASE] [--issue N] [--pull-request N]`
 
 Run the project's **command gates** (the `command`/`build`/`lint` Lego) under `--root DIR`
 (default `.`) and report each as a structured finding. Agentic gates (review, design
 parity) are not run here — this is the deterministic, runnable slice of the test step (s8).
 
-**Concurrent Gate Execution (1.13.0+).** Pass `--concurrency N` (or set `concurrency: N` in `knobs`)
-to execute independent command gates concurrently via a worker thread pool while strictly
-preserving deterministic finding ordering, fail-soft behavior, and execution timeouts.
+**Concurrent execution is a library capability, not a CLI one (1.13.0+).**
+`keel.gates.run_gates(..., concurrency=N)` runs independent command gates on a worker
+thread pool while strictly preserving deterministic outcome ordering, fail-soft behaviour
+and execution timeouts. There is no `--concurrency` flag and no `knobs.concurrency` key —
+this subcommand always runs the gates serially.
 
 **Activity auto-stamp (1.6.4+).** Pass `--run-id` and `run-gates` advances the
 [keel-visual](keel-visual.md) board to the test phase (`--phase`, default `s8`; `--command`
@@ -1117,6 +1863,10 @@ outcome — `TIMEOUT` rather than `FAIL` — so a slow host does not read as a b
 It **still blocks**: a hanging command is a real defect. The limit is
 [`knobs.gate_timeout_s`](configuration.md#gate_timeout_s) (default 600s), overridable for
 one slower gate with `timeout:` frontmatter on a `command` extension.
+
+Under `implement_mode: tdd` — or with `--tdd` for one run — the gate list also carries the
+pure **`tdd-order`** gate, evaluated after all the others because its verdict includes
+theirs. See [`knobs.implement_mode`](configuration.md#implement_mode).
 
 There are four outcome labels, and the difference between the last two matters:
 
@@ -1154,6 +1904,19 @@ its review contract resolved. A nonzero exit that *does* carry a parseable repor
 completed review — that is how ai-jury signals "request changes" — so its findings are
 used as-is.
 
+`--json` emits the machine report the [s4 loop](configuration.md#loop) reads — `keel.run-gates.v1`:
+the planned `gates` (id, kind, phase, severity) beside the `gate_outcomes` (each with `ok`,
+`on_fail`, `not_run`, findings), `jury_run`, and `blocked`; the exit code is unchanged, and
+the human listing is not printed. `--phases guard,test` scopes the run to what the loop
+judges: a gate at another phase is reported `not_run` with its `on_fail` and its command is
+never executed, so the exit code reflects only the judged gates and the loop recipe no longer
+has to tolerate one. Without it every planned phase runs, which is s8. `--defer-jury`
+reports the `jury` built-in `not_run` instead
+of convening a panel, exactly as the command runner reports an agentic gate: the loop's
+per-iteration gate run must not spend a cross-vendor panel on every iteration, and a seat
+nobody staffed is never recorded as a pass. With `--run-id`, the `--phase` stamp's verdict
+is the whole plan's — a failing `pre-merge` command gate included — not the loop's.
+
 ```bash
 keel run-gates .keel/project.yaml --root .
 ```
@@ -1180,17 +1943,27 @@ The output also includes the selected GitHub transport and any degraded GitHub o
 capabilities. See [`runtime-capabilities.md`](runtime-capabilities.md) and
 [`github-transport.md`](github-transport.md).
 
-## `keel doctor [project.yaml] [--root DIR] [--offline] [--strict] [--json]`
+<a id="keel-doctor"></a>
 
-Run a read-only diagnostic pass over the installed keel and its adapter surfaces. No
-mutation: `doctor` only reads versions, markers, and on-disk state, then classifies each
-check as `ok` / `warn` / `fail`. The roll-up `status` is the worst of all checks.
+## `keel doctor [project.yaml] [--root DIR] [--offline] [--providers] [--registry FILE] [--strict] [--fix] [--approve-scope SCOPE] [--operator NAME] [--consent-mode MODE] [--json]`
+
+Run a diagnostic pass over the installed keel and its adapter surfaces. Read-only unless
+you pass `--fix`: `doctor` reads versions, markers, on-disk state and (with a config) the
+repository's labels, then classifies each check as `ok` / `skipped` / `warn` / `fail`. A
+check that *could not look* — no config, no `gh`, `--offline` — reports `skipped` rather
+than claiming `ok`, and never moves the roll-up. The roll-up `status` is the worst of the
+checks that did look.
 
 ```bash
 keel doctor                                   # CLI + adapter health only
 keel doctor --root . --json                   # machine-readable report
-keel doctor .keel/project.yaml --root .        # also check core_version + state paths
+keel doctor .keel/project.yaml --root .        # also check core_version, state paths, labels
 keel doctor .keel/project.yaml --offline --strict
+keel doctor --providers                       # which delegates are usable on this machine
+keel doctor --providers --json                # providers[], registry_path, warnings
+keel doctor --providers --registry ./providers.yaml   # probe a registry at another path
+keel doctor projects/keel.yaml --fix \
+  --approve-scope github --operator you       # create the missing labels
 ```
 
 The checks are:
@@ -1217,9 +1990,280 @@ The checks are:
   config path is given.
 - **`state_paths`** — existence/validity of the configured ledger + checkpoint paths.
   Advisory: a missing path is fine (reported as empty history); an invalid path is a `warn`.
+- **`python_toolchain`** — the interpreter `knobs.build_gate_cmd` will actually run on, its
+  version, and whether PyYAML imports there. A `make` gate is resolved the way the Makefile
+  resolves it (an exported `PY`, then this repo's `scripts/find_python.sh`, then `python3`
+  on PATH); any other gate runs in this process, so the answer is `sys.executable`. Below
+  `requires-python` (3.11) or without PyYAML is a `warn` that names the interpreter — a
+  `make test` that dies with a hundred syntax errors is a 3.9 on PATH, not a regression in
+  the tree.
+- **`policy_labels`** — whether the labels this project declares actually exist on its
+  repository. `ship` and `triage` apply `status:*` / `priority:*` / `role:*` and the
+  `agent:*` / `model:*` attribution pair **by name**, and GitHub rejects a label that was
+  never created — keel's own repository ran for months with every one of those labels
+  missing and nothing reported it (#1021). The declared set is
+  [`policy_pack.labels.*`](configuration.md#policy_packlabels) (a bare entry is qualified
+  with its group, so `role: ["core"]` means `role:core`), `policy_pack.scan.issue_labels.*`,
+  and the attribution vocabulary: `agent:<vendor>` for every built-in vendor plus each
+  `knobs.delegate_profiles` entry's vendor, and `model:<base>` for a model a profile pins.
+  A `model:*` minted from `--delegate vendor:model` or a `delegate-model:` issue label is
+  unbounded and cannot be enumerated ahead of time, so the check does not try.
+  Missing labels are a `warn` that prints the exact `gh label create` commands under the
+  check; **never a `fail`**. Only runs when a config path names an `owner`/`repo`, and one
+  `gh label list` is all it costs — `--offline`, no `gh` on PATH, or an unauthenticated or
+  unreachable GitHub each report `skipped` with the reason.
+- **`providers`** — only with `--providers`. Probes every provider keel can dispatch to:
+  the built-in vendors (`claude`, `codex`, `agy`, `ollama`, `anthropic-api`, `openai-api`,
+  `google-api`), every `knobs.delegate_profiles` entry when a config path is given, and every
+  entry of the machine-level [provider registry](configuration.md#provider-registry). `ok`
+  when at least one is available; `warn` when the registry is malformed or nothing is usable;
+  **`fail`** on a registry name clash. Omitted entirely without the flag, so the default run
+  stays as cheap as it was.
+
+`--providers` prints a table under the checks — one row per provider with its transport
+(`cli` · `api` · `local`), where the entry came from (`builtin` · `profile` · `registry`), its
+capabilities (`tools`, `read-only`, `model`), a reason, and any models the provider lists for
+itself (`agy models`, Ollama's `/api/tags`). With `--json` the same document is merged into
+the report at the top level as `providers`, `registry_path`, `registry_present`, `warnings`
+and `errors`.
+
+```text
+keel providers — 2 of 7 available
+  registry: /home/op/.keel/providers.yaml (not present)
+  yes  claude             cli    builtin  tools,read-only,model  /usr/local/bin/claude (2.1.0)
+   no  codex              cli    builtin  tools,read-only,model  codex not found on PATH
+   no  anthropic-api      api    builtin  model                  ANTHROPIC_API_KEY is not set in the environment
+```
+
+Every probe is time-boxed and fail-soft, and **secrets are never printed** — a hosted-API row
+names the environment variable, never its value. Only the hardcoded loopback Ollama URL is
+dialed; an endpoint named by config or by the registry is checked for key presence only. See
+[`runtime-capabilities.md`](runtime-capabilities.md#probing-providers-keel-doctor---providers)
+for the per-transport rules.
+
+`--fix` creates the labels `policy_labels` reported as missing — the one mutation `doctor`
+performs, and it runs the same `gh label create` commands the warning printed. It is gated
+like every other live keel mutation: the `labels` side effect needs the **`github`** consent
+scope, so `--approve-scope github --operator <name>` (or a standing `KEEL_APPROVE_SCOPE` +
+`KEEL_OPERATOR`, or `automation.approved_scopes` in config) must approve it, and without
+that the command refuses and exits non-zero without creating anything. Each label is
+reported as it is created; a label that fails is named and the command exits non-zero
+without stopping the rest.
+
+```text
+  WARN  policy_labels     2 of 18 declared label(s) missing on you/app: agent:agy, role:core
+        $ gh label create agent:agy --repo you/app
+        $ gh label create role:core --repo you/app
+```
 
 By default `doctor` is advisory and exits `0` (unless the command itself errors, e.g. a
-missing or invalid config). Pass `--strict` to exit non-zero when any check is `fail`.
+missing or invalid config, or `--fix` was refused or failed). Pass `--strict` to exit
+non-zero when any check is `fail` — a `skipped` or `warn` check never does that, which is
+why an unreachable GitHub cannot turn a label check into a red run.
+
+<a id="keel-delegate"></a>
+
+## `keel delegate run --provider TOKEN --role ROLE --prompt-file FILE [--cwd DIR] [--timeout S] [--effort low|medium|high] [--model TOKEN] [--root DIR] [--project project.yaml] [--registry FILE] [--run-id ID] [--detach] [--json]`
+
+Dispatch **one** delegate and print the JSON return contract. This is the single executor
+for every transport keel supports — the three built-in agent CLIs, a
+`knobs.delegate_profiles` entry, a machine-level `~/.keel/providers.yaml` entry, a hosted
+vendor API, an OpenAI-compatible endpoint, and a local Ollama model. Before it existed the
+argv shapes, the prompt delivery, the endpoint and the return contract lived only as prose
+in the adapters, so every host agent re-implemented them and the copies drifted.
+
+```bash
+# a tool-enabled implementer in a worktree
+keel delegate run --provider agy:gemini-3.8-flash --role implement \
+  --prompt-file brief.md --cwd ../wt-1012 --timeout 3600
+
+# a read-only reviewer, one hosted API call
+keel delegate run --provider anthropic-api:claude-opus-5 --role review \
+  --prompt-file rubric.md --effort high
+
+# a configured OpenAI-compatible profile — exactly one HTTP call through api_delegate
+keel delegate run --provider openrouter --role review \
+  --prompt-file rubric.md --project .keel/project.yaml
+```
+
+`--provider` takes a provider **name** or `name:model`. Resolution order is **built-in
+vendor > project profile > machine registry**: a built-in always wins and can never be
+redefined, the same invariant `keel validate` enforces for `knobs.delegate_profiles` and
+`keel doctor --providers` reports for the registry.
+
+`--model` overrides the model half. Either way the token is validated before use, because
+it can arrive from a `delegate-model:` issue label — and **which rule applies depends on
+where the model lands**:
+
+| destination | accepted | why |
+| --- | --- | --- |
+| a subprocess argv (`cli`, `profile`), or `google-api`'s URL path | `[A-Za-z0-9._-]`, no leading dash | a stray character could read as another flag, or retarget a URL that carries an API key header |
+| a JSON request body (`ollama`, `anthropic-api`, `openai-api`, `openai-compatible`) | `[A-Za-z0-9._:/-]`, no leading dash, no `..` | real ids need `:` and `/` — `qwen2.5-coder:32b`, `deepseek/deepseek-r1` — and neither can do anything inside a JSON string |
+
+`--role` selects the invocation, not just a label:
+
+| role | invocation |
+| --- | --- |
+| `review` · `gate` · `chair` | read-only / findings-only: the vendor's documented read-only mode, or a profile's `review_args` |
+| `implement` · `fix` | tool-enabled: the vendor's network- and write-enabled mode |
+
+For the three built-in CLIs the read-only invocation carries no write-enabling flag, and
+that is asserted per vendor in `tests/test_delegate.py`. `claude` runs read-only under an
+**allow-list** (`--allowed-tools Read,Grep,Glob`) and no permission bypass: a denylist
+has to be extended every time the CLI grows a tool and is wrong in the window before
+someone notices, while an allow-list refuses a new tool on the day it appears. `agy` is
+the one built-in that still needs its non-interactive permission flag — `--sandbox` is
+the only read-only mechanism it documents — so its promise rests on the sandbox alone.
+
+keel cannot *enforce* read-only for an arbitrary binary, so the result reports both
+`read_only` (the role you asked for) and **`read_only_backed`** (whether anything enforces
+it). They differ in exactly the case that matters: `DelegateProfile.role_args` falls back
+to `args` when `review_args` is unset, so a profile carrying the implementer's
+write-enabling flags plans a *reviewer* with them. That run comes back
+`read_only_backed: false` with a warning naming the provider — **branch on that field, not
+on `read_only`.** Set `review_args` for any profile used as a reviewer; an explicitly empty
+`review_args: []` is a deliberate "this CLI needs no flags to review" and counts as backed.
+
+`--effort` is translated into each vendor's own spelling — a model suffix for `agy`,
+`-c model_reasoning_effort=<level>` for `codex`, `thinking.budget_tokens` for
+`anthropic-api` (with `max_tokens` raised above the budget), `reasoning_effort` for
+`openai-api` and OpenAI-compatible endpoints,
+`generationConfig.thinkingConfig.thinkingBudget` for `google-api`. A provider that cannot
+express effort returns `effort_applied: false` with a warning rather than silently running
+at its default. A provider entry may also carry its own `effort:` as a per-seat default; a
+per-run `--effort` wins, and an unrecognised configured value is a warning rather than a
+failed run.
+
+The prompt is read from `--prompt-file` and delivered on the delegate's **stdin**, never on
+its argv: a prompt carries the diff and the brief, and an argv is world-readable in `ps`
+for the life of the process. The one exception is a profile that declares
+`prompt_mode: arg`, where the operator has said the CLI requires it.
+
+### The return contract
+
+```json
+{
+  "schema_version": "keel.delegate-run.v1",
+  "ok": true,
+  "provider": "agy", "vendor": "agy", "model": "gemini-3.8-flash-high",
+  "role": "implement", "transport": "cli",
+  "text": "…the delegate's output…",
+  "exit_code": 0, "duration_s": 412.6, "timed_out": false,
+  "error_code": null, "error": null,
+  "attribution": { "agent_label": "agent:agy", "model_label": "model:gemini-3", "system": "agy:gemini-3.8-flash-high" },
+  "read_only": false, "read_only_backed": false,
+  "effort_applied": true,
+  "warnings": []
+}
+```
+
+`vendor` is the vendor **attribution** names — a built-in's own token, or a profile /
+registry entry's [`vendor_label`](configuration.md#vendor-label) when it declares one.
+Without that field a configured entry reports the generic `cli`, which is what made two
+entries driving different makers through one binary indistinguishable here and in the
+label derived from this field (#1129). `transport` is one of `cli` (a built-in agent CLI),
+`profile` (any other configured binary), `api` (a hosted or OpenAI-compatible endpoint) or
+`ollama`. `exit_code` is `null`
+for the HTTP transports — there is no process, and a synthetic `1` would let a caller
+mistake a refused API key for a crashed CLI. `attribution` is computed by
+`keel.agents`, so the labels a caller writes cannot drift from what core recorded.
+
+Every failure is **fail-soft**: `ok: false` with a machine-readable `error_code`, never a
+traceback. Branch on the code, never on the message.
+
+| `error_code` | meaning |
+| --- | --- |
+| `unknown-provider` · `bad-provider` | the `--provider` token names nothing keel can resolve |
+| `bad-role` · `bad-effort` · `bad-timeout` | an argument keel refuses |
+| `bad-model` · `no-model` | the model token is unsafe, or the transport needs one and has none |
+| `no-prompt` | `--prompt-file` is missing, unreadable, or empty |
+| `missing-binary` | the CLI is not installed |
+| `nonzero-exit` · `empty-output` | the CLI ran and produced a failure, or nothing |
+| `timeout` | it ran out of time (`timed_out: true`) — keel's wall-clock limit killed it (`exit_code: 124`), **or** the vendor stopped on its own timer and said so |
+| `rate-limit` | HTTP 429, or a CLI that said it was out of quota |
+| `no-key` · `auth` · `http` · `network` · `bad-response` | the HTTP transports' vocabulary |
+| `lost` | a detached run's process vanished, or it passed its own deadline, without recording a result |
+
+`timed_out` means *this run ran out of time*, whichever bound it hit. `exit_code` says
+which: `124` is keel's wall-clock wrapper, another non-zero code is the vendor's own timer,
+and `null` with `error_code: lost` is a **detached** run that passed its deadline without
+recording a result — no process left to have an exit code. `error` quotes what the vendor
+said in the second case. Before #1133 only keel's wrapper set the code, so a vendor that
+timed out was classified by whatever its prose happened to match.
+
+`error_code` is decided from the vendor's **error**, never from its answer. For a
+stream-json vendor that is the `status` and `error` of the final `result` frame — not its
+`response`; otherwise it is stderr plus the tail of stdout. The whole transcript of a long
+run is mostly the model's prose about code, and a classifier reading it will find shas,
+timestamps and `file:line` references that look like status codes, and reviews that discuss
+rate limiting by name. When the evidence reads as both a timeout and a quota refusal,
+`timeout` wins: it is the recoverable reading, and the two send an operator in opposite
+directions.
+
+The **policy** around those codes stays with the caller (ship s4/s7), not here: this
+command never retries, never falls back to the host agent, and never consults the risk
+tier. The no-retry-on-`rate-limit` rule and the refuse-on-tier-3 rule are the
+orchestrator's.
+
+Exit status is `0` when `ok` is true, `1` otherwise. `--json` is accepted for symmetry with
+every other keel command; the contract is JSON either way.
+
+## `keel delegate run … --detach` / `keel delegate wait RUN_ID [--timeout S]` / `keel delegate status`
+
+A delegated implementation runs for tens of minutes; a host LLM's turn does not. `--detach`
+starts the same run as a background child in its own session and returns immediately:
+
+```bash
+keel delegate run --provider agy:gemini-3.8-flash --role implement \
+  --prompt-file brief.md --cwd ../wt-1012 --detach --run-id impl-1012 --root .
+keel delegate status --root .
+keel delegate wait impl-1012 --root . --timeout 3600
+```
+
+The state file `.keel/state/delegate/<run-id>.json` is **authoritative** — `{run_id,
+provider, role, started_at, timeout, deadline_at, status: running|done|crashed, result}`,
+alongside three sidecars: `<run-id>.out` (the child's stdout and stderr), `<run-id>.pid`
+and `<run-id>.crashed`.
+
+**The record is written by the child alone.** The parent writes it once, *before*
+spawning — so a `wait` issued immediately afterwards always finds a file — and never
+touches it again; the pid goes to its own file, and a reaper that concludes a run is gone
+writes the crash marker rather than editing the record. Every one of those would otherwise
+have been a read-check-write on a file another process can replace at any instant, which
+no guard fixes: the child's terminal record can land between the read and the write, and
+`running` goes back over the result the caller is waiting for. Reads compose the four
+files, with the child's own `done` always winning over a crash marker — a marker says
+"this looked abandoned", a `done` record says "the delegate answered". Because the
+*result* only ever comes from the record, it survives the caller exiting, the session
+ending, and a reboot. `.keel/state/` is gitignored, so nothing here is ever committed.
+
+Reusing a `--run-id` is fine — an orchestrator naming a run after its issue will reuse it
+on a retry. The pid and crash markers are cleared as the new record is written, so a
+reused id inherits nothing: without that, the previous run's dead pid would pair with the
+new record and the next `keel delegate status` would reap a run that started milliseconds
+ago.
+
+**Always pass `--timeout` to `run`.** It is stamped into the record as `deadline_at`
+(plus a grace window for the child's final write). Together with a liveness check on the
+recorded pid, that is what bounds a `wait`: a child killed outright — `SIGKILL`, an OOM
+kill, a reboot — never writes anything, so without either signal the record would say
+`running` forever and a `wait` with no `--timeout` of its own would block indefinitely.
+Such a run is marked `crashed` and reported with `error_code: lost`, naming the `.out`
+file that holds whatever the child managed to print.
+
+`keel delegate wait` prints the same JSON contract as a foreground run. It exits `1` when
+the run failed, when the run was lost, when it did not finish within `--timeout`, and —
+failing closed — when the run id is unknown (`unknown-run`), so a mistyped id is an
+immediate error rather than a wait that can only time out. `keel delegate status` lists the runs under the
+state directory, as a table or, with `--json`, as a document, and applies the **same
+liveness and deadline test** first — otherwise the view an operator opens precisely
+because they are *not* waiting would be the one that never notices a killed child. A run id may
+contain only letters, digits, `.`, `_` and `-`: it becomes a file name, and anything else
+is refused rather than normalized.
+
+**This is the primitive an orchestrating agent uses instead of a sleep loop.** A polling
+loop burns the host's context window and cannot survive its turn ending — which is how a
+live run finished three reviewers and posted none of their verdicts.
 
 ## `keel project-commands <project.yaml> [--json]`
 
@@ -1250,7 +2294,7 @@ keel window .keel/project.yaml
 # merge window OPEN  [Europe/Istanbul 07:00-01:30]
 ```
 
-## `keel ship <project.yaml> [--root DIR] [--pr N] [--compound|--profile standard|compound] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--target TARGET] [--issue-title TITLE] [--issue-body BODY] [--issue-label LABEL] [--review-comments inline|summary] [--reviewers 1|2|3] [--jury|--no-jury] [--jury-advisory] [--json]`
+## `keel ship <project.yaml> [--root DIR] [--pr N] [--compound|--profile standard|compound] [--tdd] [--loop] [--loop-iteration K=SHA:pass|fail]... [--role LABEL] [--delegate PROVIDER] [--review-delegate PROVIDER]... [--effort low|medium|high] [--team PROFILE] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--target TARGET] [--issue-title TITLE] [--issue-body BODY] [--issue-label LABEL] [--review-comments inline|summary] [--reviewers 1|2|3] [--jury|--no-jury] [--jury-advisory] [--json] [--wizard] [--wizard-answer KEY=VALUE]...`
 
 Run the **deterministic slice of a ship** against the current checkout and print the
 assessment: how many files changed vs. the base branch, the **risk tier** (→ reviewer
@@ -1298,9 +2342,132 @@ approval values. Approved live runs include a local
 
 Review and merge-gate parity is exposed through `review_merge_contract` in JSON output.
 `--review-comments` selects inline or summary posting, `--reviewers` overrides the
-risk-derived reviewer count, and jury precedence is `--no-jury` over `--jury` over tier-3
-auto-jury over off. `--jury-advisory` keeps an enabled jury report-only. No-jury mode still
+resolved reviewer count, and jury precedence is a `knobs.team` tier whose review policy is
+`jury` over `--no-jury` over `--jury` over tier-3 auto-jury over off. All six commands that
+resolve this contract accept the same three flags (`keel review` included, since #1043).
+**The jury flags never change the reviewer bench**, which is a pure function of config +
+tier + role + `--reviewers` / `--review-delegate`: nothing makes a run *pass* the flags to
+all six — keel's CI passes `--no-jury` to `evidence-verify` on every run and to
+`ship`/`plan` on none — so a bench that moved with a flag would make one command require
+evidence another told the adapter not to produce. On a jury-panel
+tier `--no-jury` / `--jury-advisory` are recorded in `assignment.warnings` and not applied —
+the panel is that tier's only review, so its verdict stays required. `--jury-advisory` keeps an enabled jury report-only. No-jury mode still
 preserves the reviewer, CI, tester, merge-window, merge-lock, closeout, and capture gates.
+
+The resolved [`knobs.team`](configuration.md#team) team is exposed as `assignment` in both
+`keel plan --command ship --json` and `keel ship --json`: `implementer`, `gate`,
+`reviewers[]` (per-slot `provider`/`model`/`effort`, mirrored on
+`review_merge_contract.reviewers.slots`), `review_panel`, `jury`, `fix`, and `warnings`.
+`--role` selects the `team.implement.by_role` seat, `--delegate` overrides the implementer
+for the run, and `--review-delegate` is repeatable and positional per reviewer slot.
+`keel plan --tier` resolves the assignment for a risk tier before a diff exists;
+`keel ship` resolves it against the tier it classified from the real diff.
+
+<a id="ship-wizard"></a>
+
+### `--wizard` — the provider picker
+
+`--wizard` is a pre-s1 front layer that collects the same options the grammar above
+produces; it adds no pipeline behaviour and cannot produce a run the flags could not.
+Its choices come from the probe [`keel doctor --providers`](#keel-doctor) runs, which is
+the single source of truth for what is usable here — **a provider the probe did not find
+is never offered and cannot be selected**, whether it is typed at the prompt or handed in
+with `--wizard-answer`.
+
+**A default is not a decision.** Only a question you actually answer becomes a flag; an
+unanswered one emits nothing and the command resolves it exactly as it would have without
+`--wizard`. That is what makes quick-start safe: the reviewer bench the wizard offers is
+derived at a nominal tier (the real one is not classified until s1, after the wizard has
+run) and the jury question opens on whatever the flags and `knobs.team` already say, so
+writing those back would *override* the policy they were read from — a quick-start run on
+a tier-3 change would silently pass `--reviewers 2 --no-jury`. Pressing Enter keeps the
+default and passes no flag; typing a value is an explicit override.
+
+**What the run wizard cannot express.** The probe lists providers keel can *dispatch* to,
+so a `subagent:<name>` seat is not among them: on a project whose `knobs.team` names one,
+the implementer question shows the first dispatchable provider as its default. Accept it
+(Enter) and the policy still decides s4 — including `implement.by_role` and any
+`subagent:` seat. Answer it and you get `--delegate`, which is a per-run override: it wins
+over `knobs.team.implement` outright, so `implement.by_role` and `--role` no longer apply.
+Answer the implementer question only when you mean to replace the policy's seat for this
+run.
+
+A configured seat this machine cannot reach is named once and then degrades to one it can.
+
+**Interactivity guard.** With no terminal and no recorded answers the wizard is a *logged
+no-op*: it prints `wizard: non-interactive context …` and the command proceeds with the
+literal flags as parsed. Never a hang, never a rejection. A machine where the probe finds
+nothing usable is the same logged no-op.
+
+`--wizard-answer KEY=VALUE` (repeatable, or semicolon-separated) pre-answers questions
+without prompting, on a terminal or not — which is what makes a wizard run reproducible.
+A malformed pair, or one naming a choice the wizard does not offer, exits 1 before any
+gate runs rather than silently running a team nobody asked for.
+
+Supplying any answer other than `mode` implies `mode=customize`, because the first
+question's own default (quick-start) would otherwise end the walk before the second
+question exists. Pass `mode=quick-start` explicitly when you really do mean "ignore the
+rest":
+
+```bash
+# One reviewer from claude, summary posting, everything else left to knobs.team + the tier
+keel ship .keel/project.yaml --root . --wizard \
+  --wizard-answer 'implement.provider=ollama;implement.model=qwen2.5-coder' \
+  --wizard-answer 'review=claude' --wizard-answer 'review_comments=summary'
+```
+
+```text
+keel ship --wizard — resolved
+  flags : --delegate ollama:qwen2.5-coder --reviewers 1 --review-delegate claude --review-comments summary
+  seats : implement=ollama:qwen2.5-coder · review=claude
+```
+
+The `seats` line restates the flags in seat form; it never carries a value the flags do
+not, so there is nothing on it for an adapter to apply separately.
+
+Note what is *absent*: no `--jury`/`--no-jury`, because the jury question was not answered,
+so the tier and `knobs.team` still decide it. An answer naming a key this run never reaches
+(`review.3` in a run, `implement.model` for a provider that lists none) says so
+specifically, rather than being reported as a misspelling.
+
+A run is asked **only what a run can carry**. Every question below lands on a real flag;
+one whose answer no flag could carry would be decorative, and an operator who answered it
+would be told one thing while the published contract said another.
+
+<a id="ship-wizard-questions"></a>
+
+| question | run | `keel init --wizard` | what carries it |
+| --- | --- | --- | --- |
+| `mode` | yes | yes | quick-start vs customize; it steers the walk, not the run |
+| `implement.provider` | yes | yes | `--delegate <provider>` |
+| `implement.model` | yes | yes | `--delegate <provider:model>` |
+| `jury` | yes | yes | `--jury` / `--jury-advisory` / `--no-jury` |
+| `review` | yes | yes | `--reviewers` + `--review-delegate`, per slot. A config asks it once per risk tier (`review.1` / `review.2` / `review.3`) and a run asks it once, because the tier is not classified until s5 |
+| `review_comments` | yes | yes | `--review-comments` |
+| `implement.effort` | no | yes | nothing: there is no `--effort`, and `--delegate` splits `provider:model` and stops there. It is a `knobs.team` seat field |
+| `gate.provider` | no | yes | nothing: there is no `--gate`. The seat is `knobs.team.gate`, and `assignment.gate` is what the adapter dispatches at s7 |
+
+`tests/test_wizard.py` parses that table and fails if it stops matching the planner, so a
+flag that moves a question between the columns has to move the row with it.
+
+The **jury panel** is a config answer for the same reason as the bottom two rows:
+`--reviewers` takes `1|2|3` and nothing on `keel ship` spells "the panel *is* the review",
+so `review=jury` is not offered in a run and is refused if passed to `--wizard-answer`. A
+tier whose *policy* is the panel still resolves to it — that comes from `knobs.team`, not
+from the wizard. (If a run flag ever learns to spell a panel, this is the line to revisit.)
+
+`keel init --wizard` asks the full set, per risk tier, because a config names a bench per
+tier while a run has one — see [the team step](#init-team-step).
+
+Output is the resolved flag set, echoed back for the adapter to pass on literally:
+
+```text
+keel ship --wizard — resolved
+  flags : --delegate ollama:qwen2.5-coder --reviewers 1 --review-delegate claude --review-comments summary --jury-advisory
+  seats : implement=ollama:qwen2.5-coder · gate=claude (distinct from the implementer) · review=claude
+```
+
+With `--json` that echo goes to stderr so stdout carries only the contract document.
 
 Adapters should pass the selected issue text with `--issue-title`, `--issue-body`, and
 `--issue-label` before branch/worktree creation. JSON output then includes
@@ -1329,14 +2496,18 @@ KEEL_APPROVE_SCOPE=filesystem,git,github KEEL_OPERATOR=automation:nightly keel s
 ```
 
 Exits non-zero when the decision is `BLOCK` (failing gates, blocking findings, or failing
-CI), so it can gate a runner before it attempts a real merge.
+CI), so it can gate a runner before it attempts a real merge. When the block comes from a
+failed `on_fail: block` gate, the reason names it — `BLOCK — blocking findings from
+gate(s): lint` — so the line does not read as a contradiction next to a reviewer verdict
+reporting no blocking findings.
 
 `--hotfix` marks an emergency change so it may merge **outside** the merge window (an audit
 line is printed). It never bypasses failing gates, blocking findings, or failing CI.
 
 `--json` emits the structured command contract plus a deterministic `result` record for the
 dry assessment. `result.artifact_bodies` contains canonical Markdown bodies for the PR body,
-issue update, reviewer verdict, jury verdict, and extension result output; adapters should
+issue update, reviewer verdict, jury verdict, extension result output, and the
+`ship_provenance` comment a live run posts on its PR; adapters should
 post those rendered bodies verbatim when available instead of hand-authoring project-specific
 variants. `--dry-run` is accepted for adapter clarity; this CLI command is already
 non-mutating.
@@ -1364,6 +2535,61 @@ keel plan .keel/project.yaml --root . --command ship --profile compound --json
 Omit the flag (or pass `--profile standard`) for the standard delivery path; use
 `--compound` when the operator wants the compound-engineering flavor while retaining the same
 CI, review, merge-window, merge-lock, closeout, and capture safety gates.
+
+### `--tdd` (test-first s4 profile)
+
+`--tdd` selects the **test-first s4 profile** for a single run; `knobs.implement_mode: tdd`
+is the per-project spelling of the same thing (see
+[configuration](configuration.md#implement_mode)). Like `--compound` it is a *profile*, not
+a separate command: the backbone step ids are unchanged, s4 simply runs in two phases — a
+test-only commit carrying the failing tests derived from the issue's acceptance criteria,
+then the implementation that turns them green — and s8 gains the pure, blocking
+`tdd-order` gate that verifies that commit order actually happened. The gate checks
+**order and paths only**: it never runs phase A's tests and cannot report that they were
+red.
+
+```bash
+keel ship .keel/project.yaml --root . --tdd --dry-run --json
+# contract.implement_mode == {"mode": "tdd", "tdd": true, "source": "flag:--tdd",
+#                             "phases": ["tests", "implementation"], "gate": "tdd-order"}
+```
+
+The same block is rendered by `keel plan --tdd`, and `keel run-gates --tdd` adds the gate
+on its own. There is no `--no-tdd`: a project that configured the contract has said the
+contract is the policy, and a flag that switched it off from a command line would make it
+advisory. A `--live --append-ledger` run records `run_context.implement_mode: "tdd"` and one
+`run_context.implement_phases` entry per phase with its commit and the implementer that
+ran it (`--phase-implementer tests=<label>` when a phase really did run on a different
+provider), which the closure comment renders as
+`Implement: TDD (tests <sha> by <implementer> → implementation <sha> by <implementer>)`.
+A run that does not use the profile records `implement_mode: null` and
+`implement_phases: []`, and its closure comment is unchanged.
+
+### `--loop` (bounded s4 iteration loop)
+
+`--loop` selects the **s4 iteration loop** for a single run; `knobs.loop` is the per-project
+spelling (see [configuration](configuration.md#loop)). It is a policy *around* the s4
+profile, not a third profile: after each implement iteration the orchestrator runs the
+command gates, green ends the loop, red starts the next iteration with the same brief plus
+the gate output, up to `max_iterations`. The gate run is the judge, never the implementer's
+text. Under `implement_mode: tdd` it wraps phase B only.
+
+```bash
+keel ship .keel/project.yaml --root . --loop --dry-run --json
+# contract.implement_mode.loop == {"enabled": true, "max_iterations": 3,
+#   "gate_output_max_bytes": 16384, "source": "flag:--loop", "wraps": "implement"}
+```
+
+The same block is rendered by `keel plan --loop`. There is no `--no-loop`, for the reason
+there is no `--no-tdd`. A `--live --append-ledger` run records `run_context.implement_loop`
+— the policy plus one entry per `--loop-iteration K=SHA:pass|fail` (the iteration's commit,
+whether the gates passed after it, and the implementer) — which the closure comment renders
+as `Implement: loop (k/N iterations: <sha> red → <sha> green)` — or, for records made while
+the policy was off, `loop (k iterations recorded, policy off: …)`, since a budget the run
+never had is not a denominator. A run that uses neither the knob nor the flag records
+`implement_loop: null` and its closure comment is unchanged. The
+records are checked before the ledger says they happened: a SHA is 7–40 hex characters, and
+a number recorded twice, or past the budget while the loop is on, is refused (exit 2).
 
 ## `keel implement <project.yaml> <issue> [--root DIR] [--delegate AGENT] [--dry-run] [--live] [--consent-mode MODE] [--approve-scope SCOPE] [--operator ID] [--issue-title TITLE] [--issue-body BODY] [--issue-label LABEL] [--json]`
 
@@ -1399,6 +2625,53 @@ The JSON result records the configured workflow map, latest-run context shape, a
 transport, supported diagnostic classifications, one-fix policy, and next-command
 recommendations.
 
+## `keel canary <project.yaml> [--root DIR] [--pr N] [--commit SHA] [--duration M] [--health-cmd CMD] [--auto-revert] [--json]`
+
+Run the post-merge health probe and, optionally, revert on a regression. The probe is
+`--health-cmd`, falling back to `knobs.build_gate_cmd` and then to `make test`.
+
+```bash
+keel canary .keel/project.yaml --root . --pr 456
+keel canary .keel/project.yaml --root . --commit 0d9ad10 --auto-revert --json
+```
+
+`--pr` and `--commit` only name the target in the report, with one exception: `--auto-revert`
+reverts nothing unless `--commit` names the merge commit to revert — there is no inference
+from a PR number, because reverting the wrong commit is worse than not reverting.
+`--duration` is accepted and currently inert: the probe runs once, and the flag is
+reserved for the sustained-monitoring shape rather than pretending to implement it.
+
+Exit 0 when the probe passes (`status: healthy`), 1 when it fails
+(`status: regression_detected`, with `reverted` and `revert_commit` recording what the
+rollback did) or when the config cannot be loaded.
+
+## `keel rollback COMMIT [--root DIR] [--json]`
+
+Atomically revert one merge commit.
+
+```bash
+keel rollback 0d9ad10 --root . --json
+```
+
+`git revert --no-edit -m 1 <sha>` first, since the target is normally a merge commit;
+a single-parent revert is the fallback. If both fail the command runs `git revert --abort`
+so the working tree is left clean rather than mid-revert, and reports the git output as
+`error`. On success the new revert commit's SHA is reported as `revert_sha`.
+
+Exit 0 when the revert commit was created, 1 otherwise.
+
+## `keel cost-report [--root DIR] [--json]`
+
+Report token consumption, estimated USD cost and per-model analytics from the activity
+records under `.keel/activity`. It takes **no** project.yaml — the records are the input.
+
+```bash
+keel cost-report --root . --json
+```
+
+A missing or empty activity directory is an empty report, not an error: a project that has
+not stamped any activity has spent nothing keel can see. Always exits 0.
+
 ## `keel init [--root DIR] [--force] [--wizard] [--auto]`
 
 Scaffold a default `.keel/project.yaml` for the repo. keel detects the stack from marker
@@ -1414,16 +2687,79 @@ Use it only when intentionally regenerating project config.
 keel init                 # scaffold .keel/project.yaml for the detected stack
 keel init --auto          # smart auto-detect stack, base branch, and test/lint gates without prompts
 keel init --root ../app   # scaffold elsewhere
-keel init --wizard        # prompt for base branch, merge-window hours, timezone, commands
+keel init --wizard        # prompt for base branch, merge window, commands, team
 ```
 
 With `--auto`, keel inspects project marker files, detects the primary base branch from git
 (`main`, `develop`, `master`, `trunk`), selects recommended test and lint commands, and prints a
 structured summary report.
 
-With `--wizard`, keel prompts for each value (base branch, timezone, **merge window
-`HH:MM-HH:MM`**, build/lint commands); press Enter to accept the stack default, or leave a
-field blank to skip it. The result still passes `keel validate`.
+With `--wizard`, keel prompts for each value (base branch, the merge window, consent mode,
+build/lint commands); press Enter to accept the default shown for each. The result always
+passes `keel validate`.
+
+<a id="init-wizard"></a>
+
+### The merge-window question
+
+`timezone` and `merge_window` are [all-or-nothing](configuration.md#timezone-and-merge_window)
+— exactly one of them is a `ConfigError` — so the wizard asks for them as **one** decision
+rather than as two independently skippable prompts:
+
+```text
+Configure a merge window (timezone + hours)? (y/n) [y]:
+Timezone (IANA) [Europe/Istanbul]:
+Merge window HH:MM-HH:MM [07:00-01:30]:
+```
+
+Answer `n` and neither key is written — a project with no window, which is a valid config.
+Answer `y` and neither half is skippable: each answer is checked on entry with the very
+checks `keel validate` will apply — `ZoneInfo` for the zone, and for the hours the
+bundled schema's own `merge_window` pattern (two-digit hours `00`–`23`, minutes `00`–`59`),
+`parse_window`, and the rule that the two ends must differ — and a value that will not
+evaluate is reported in the validator's own words and asked for again, up to three times.
+Give up on either half and the wizard drops the *pair* — it never writes one key without
+the other.
+
+The shape rule is read out of `project.schema.json` rather than restated, so the prompt
+cannot accept what the schema refuses: `9:00-18:00` parses fine as a time but is not a
+window keel writes, and the wizard asks again instead of scaffolding it. `09:00-09:00`
+gets the same treatment for the opposite reason — the schema takes it and it is
+[never open](configuration.md#timezone-and-merge_window), so the wizard asks again rather
+than scaffolding a window that would defer every merge for ever.
+
+<a id="init-team-step"></a>
+
+### The team step
+
+`--wizard` ends with a **team step** that writes [`knobs.team`](configuration.md#team) —
+who implements, who gives the mandatory gate review, who reviews at each risk tier, and
+how the jury gates. Its options come from the same probe
+[`keel doctor --providers`](#keel-doctor) runs, so the block names providers that are
+usable *on this machine* rather than seats copied out of somebody else's example. A
+provider the probe did not find is never offered and cannot be typed in.
+
+The first question is **quick-start vs customize**: quick-start takes every default and
+asks nothing else (an implementer, a reviewer bench of one/two/three seats by tier
+preferring two distinct vendors, no gate seat, no jury). Customize walks the rest —
+implementer provider, its model and reasoning effort where the provider can express one,
+the gate seat, the jury mode, the bench for each tier, and the review-comments mode.
+
+Two rules the step will not let you break, because `keel validate` would not either:
+
+- the gate seat is offered from every provider **except** the implementer, and is written
+  with `distinct_from: implementer` — a gate review from the vendor that wrote the change
+  is not a second opinion;
+- reasoning effort is only asked for a provider that has a spelling for it, and only once
+  a model is chosen for a vendor that spells effort as a model *suffix* (`agy`);
+- the `jury` bench is offered only when the jury is set to **gating**. "The panel is the
+  review" beside an advisory jury leaves that tier with nothing enforceable — no host
+  reviewer slots, and an advisory verdict is not required evidence — which validation
+  refuses outright.
+
+On a machine where the probe finds nothing usable the step is skipped and no `team` block
+is written at all — an absent block is not an empty one, and leaves `config_hash` exactly
+where it was.
 
 ## `keel install-adapter <target> [--root DIR] [--force]`
 
@@ -1438,7 +2774,8 @@ never one copy per agent (that would re-introduce file-copy drift):
 | `claude` | `.claude/commands/keel/<cmd>.md` | Claude Code, as native `/keel:<cmd>` |
 | `skills` | `.agents/skills/keel-<cmd>/SKILL.md` | **every non-Claude agent** (Codex, Antigravity, Gemini, …) via its skill discovery / chat-command wrapper — **one shared copy** |
 | `all` | both of the above | |
-| `plugin` | `commands/<cmd>.md` (repo root) | the committed [Claude Code plugin](plugin.md) — `/plugin install keel` exposes `/keel:<cmd>` |
+| `plugin` | `commands/<cmd>.md` (repo root) | the committed [agent plugin](plugin.md) — `/plugin install keel` exposes `/keel:<cmd>`. Installing it in each agent, with the update path: [install.md](install.md) |
+| `site` | `website/params.js` (repo root) | the static site's `window.KEEL_ARGS` — each command's description, `argument-hint` and flag chips |
 
 ```bash
 keel install-adapter claude          # → /keel:ship, /keel:regression, …
@@ -1446,12 +2783,21 @@ keel install-adapter skills          # → one shared keel-<cmd> skill set under
 keel install-adapter all             # both surfaces
 keel install-adapter claude --force  # overwrite existing adapters
 keel install-adapter plugin          # regenerate the committed plugin command files (commands/)
+keel install-adapter site            # regenerate the site's argument surface (website/params.js)
 ```
 
 The `plugin` target is **repo-level**, not per-project: it regenerates the committed
-`commands/<cmd>.md` files that the Claude Code plugin ships (see [plugin.md](plugin.md)).
+`commands/<cmd>.md` files the agent plugin ships (see [plugin.md](plugin.md)).
 `make plugin` is the same command; a drift test fails if the committed files diverge from the
 `src/keel/adapters/commands/` source bodies.
+
+The `site` target is repo-level for the same reason: it renders `website/params.js` out of the
+same frontmatter, and `make site-params` is the same command. Every published field is derived
+— `desc` is the frontmatter `description`, `hint` is its `argument-hint`, and the flag chips
+are that hint's top-level `[...]` groups — so the file has no hand-maintained region, and
+`tests/test_install.py::TestSiteParamsGenerator` fails if the committed copy is not
+byte-identical to the generator's output. Neither repo-level target is written by
+`install-adapter all`, which installs the per-project surfaces only.
 
 The `skills` surface is a **single** universal skill set (`keel-<cmd>`), not a dir per agent:
 non-Claude agents all read `.agents/skills/`, so one copy serves Codex, Antigravity and Gemini
@@ -1552,6 +2898,50 @@ and verified with `keel validate .keel/project.yaml --root .` plus
 Extension schema migrations are separate from adapter command updates and must be documented
 as their own versioned migration.
 
+## `keel adapter-status [TARGET] [--root DIR] [--include-unmanaged] [--json]`
+
+Report generated-adapter freshness plus orphan / unmanaged surface findings. `TARGET` is
+`all` (default) or one of `claude`, `skills`, `legacy-claude`. The status vocabulary and
+the orphan/unmanaged split are described under
+[`keel install-adapter`](#keel-install-adapter-target---root-dir---force) above.
+
+```bash
+keel adapter-status all --root .
+keel adapter-status all --root . --include-unmanaged --json
+```
+
+Advisory only: keel never deletes a file and no finding here gates a run. Exit 1 only on an
+unknown target; otherwise 0, findings or not.
+
+## `keel update-adapter [TARGET] [--root DIR] [--dry-run]`
+
+Safely refresh generated adapters from the installed keel package. `TARGET` is `all`
+(default), `claude` or `skills`.
+
+```bash
+keel update-adapter all --root . --dry-run
+keel update-adapter all --root .
+```
+
+Updates `missing` and `outdated` files only, and refuses to overwrite `locally-modified` or
+`unknown` ones — those need a human merge. Exit 1 only on an unknown target.
+
+## `keel sync [--root DIR] [--target all|claude|skills] [--dry-run]`
+
+The everyday short name for `update-adapter all`, plus the orphan heads-up and the
+follow-up commands.
+
+```bash
+pipx upgrade keel-workflow
+keel sync --root . --dry-run
+keel sync --root .
+```
+
+`sync` uses the keel package already installed in the active environment: it does not
+contact PyPI, choose a version, or change the installation — upgrade `keel-workflow` with
+`pipx`/`pip` first. After a successful sync it prints the orphan count when there is one
+and recommends `keel validate` / `keel plan`. Same exit codes as `update-adapter`.
+
 ## `keel install-legacy-wrappers <target> [--root DIR] [--command LEGACY=KEEL]`
 
 Install thin compatibility shims for old command names after the parity matrix proves that
@@ -1582,47 +2972,87 @@ behavior, and issue/PR targeting, then delegates to the installed keel adapter. 
 files carry a `keel-generated` marker on the `legacy-*` surfaces so adapter updates and local
 compatibility shims remain distinguishable.
 
-## `keel swarm-plan <project.yaml> [issues...] [--root DIR] [--tree] [--landing {batch,funnel,auto}] [--rebalance] [--json]`
+## `keel swarm-plan <project.yaml> [--issues N,N,…] [--issue N] [--declared-file PATH] [--issue-title TITLE] [--issue-body BODY] [--issue-label LABEL] [--swarm-id ID] [--tree] [--delegate PROVIDER] [--review-delegate PROVIDER] [--effort low|medium|high] [--team PROFILE] [--reviewers 1|2|3] [--json]`
 
 Perform deterministic static dependency analysis, scope prediction, conflict matrix calculation,
-and wave tier partitioning across a list of backlog issues without mutating git or spawning workers.
+wave tier partitioning, **difficulty scoring and per-cluster staffing** across a list of backlog
+issues without mutating git or spawning workers.
+
+The issues are named by flag, not as positionals: `--issues` takes one comma-separated list and
+`--issue` is repeatable. Planning is pure — it reads no repository state — so `swarm-plan` has no
+`--root`.
 
 ```bash
-keel swarm-plan .keel/project.yaml --root . 714 715 716 717 --tree
-keel swarm-plan .keel/project.yaml --root . 714 715 716 717 --json
+keel swarm-plan .keel/project.yaml --issues 714,715,716,717 --tree
+keel swarm-plan .keel/project.yaml --issue 714 --issue 715 --json
+keel swarm-plan .keel/project.yaml --issues 714,715 --team night-shift --effort high --json
 ```
 
 Use `--tree` to render an interactive ASCII DAG execution diagram directly in your terminal.
 
+Every cluster in `--json` carries two extra records (#1017):
+
+- **`difficulty`** — `band` (`easy`/`standard`/`hard`), `score`, the resolved risk `tier`,
+  `file_count`, `dependency_depth`, and the `signals` that produced the score. It is a pure
+  function of the risk tier from `knobs.tier3_globs`, the predicted file count, `priority:*`
+  and `size:*` labels, and how much already-scheduled work the cluster depends on.
+- **`assignment`** — the same record `keel ship --json` renders, resolved per cluster with
+  *this* cluster's role, tier and difficulty band: `lead`, `implementer`, `effort`, `gate`,
+  `reviewers[]`, `review_panel`, `fix`, and `warnings`. Seats come from
+  [`knobs.team`](configuration.md#team) plus `knobs.team.by_difficulty`, with `--team
+  <profile>` and the per-run flags above layered on top.
+
+Scoring and staffing run **after** the partition and never feed back into it: changing
+`team.by_difficulty` (or passing `--team`) changes who runs a cluster and cannot change which
+wave it lands in.
+
 ## `keel swarm-status <project.yaml> [--root DIR] [--swarm-id ID] [--json]`
 
 Inspect live worker progress, wave execution status, and cluster health across active or recent
-multi-agent swarm runs:
+multi-agent swarm runs. Each row names the worker's **lead** and the difficulty **band** it was
+staffed from, so the board answers *who is running this, and why that provider*:
 
 ```bash
 keel swarm-status .keel/project.yaml --root .
 keel swarm-status .keel/project.yaml --root . --swarm-id swarm-2026-08-15 --json
 ```
 
-## `keel swarm-run <project.yaml> [issues...] [--root DIR] [--swarm-id ID] [--rebalance] [--json]`
+## `keel swarm-run <project.yaml> [--root DIR] [--issues N,N,…] [--issue N] [--swarm-id ID] [--max-workers N] [--live] [--tree] [--delegate PROVIDER] [--review-delegate PROVIDER] [--effort low|medium|high] [--team PROFILE] [--reviewers 1|2|3] [--json]`
 
 Launch parallel workers per cluster in dedicated git worktrees under `.keel/worktrees/swarm/`:
 
 ```bash
-keel swarm-run .keel/project.yaml --root . 714 715 716 717 --rebalance
+keel swarm-run .keel/project.yaml --root . --issues 714,715,716,717
+keel swarm-run .keel/project.yaml --root . --issues 714,715,716,717 --live --max-workers 2
 ```
 
-Each worker runs the standard `keel ship` backbone machine in its isolated worktree. If runtime
-file modification divergence is detected, `--rebalance` partitions the conflicting worker to
-subsequent waves.
+Each worker runs the standard `keel ship` backbone machine in its isolated worktree, launched
+with its cluster's resolved team: the implementer seat becomes `--delegate`, each staffed
+reviewer slot a `--review-delegate`, the cluster's role `--role`, and the bench it was staffed
+from `--effort` / `--team`. Passing the last two means **the child inherits the cluster's
+difficulty bench** and re-resolves to the same seats rather than deriving a different team from
+config alone; a `--delegate` on the same line still wins, so the parent can override what the
+bench chose. A seat that is a host `subagent:` rather than a provider is left to the adapter,
+which is the layer that can spawn one. A role label outside `[A-Za-z0-9][A-Za-z0-9._-]*` is
+dropped rather than passed — it would be read as a flag by the child — and the reason is
+recorded in `assignment.warnings`.
 
-## `keel swarm-land <project.yaml> [--root DIR] [--swarm-id ID] [--mode {batch,funnel,auto}] [--json]`
+Issues are named by `--issues` / `--issue`, as for `swarm-plan`. Rebalancing across waves is
+decided by the plan, not by a flag: when runtime file-modification divergence is detected the
+conflicting worker is partitioned to a later wave.
+
+## `keel swarm-land <project.yaml> [--root DIR] [--wave N] [--issues N,N,…] [--issue N] [--swarm-id ID] [--live] [--delegate PROVIDER] [--review-delegate PROVIDER] [--effort low|medium|high] [--team PROFILE] [--reviewers 1|2|3] [--json]`
 
 Land passing cluster branches from completed execution waves into `main` under atomic `merge_lock`:
 
 ```bash
-keel swarm-land .keel/project.yaml --root . --mode auto
+keel swarm-land .keel/project.yaml --root . --wave 1
+keel swarm-land .keel/project.yaml --root . --wave 1 --live
 ```
+
+The landing mode is **derived, not chosen**: `evaluate_wave_landing_mode` reads the wave's diff
+map and picks batch or funnel, so there is no `--mode` flag to get wrong. `--wave` selects the
+wave (default `1`); without `--live` the command reports what it would land.
 
 - **Direct Batch Mode**: Orthogonal disjoint diff trees land concurrently.
 - **Adaptive Funnel Mode**: Overlapping trees land sequentially with automatic fail-soft rebase healing.

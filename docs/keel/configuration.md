@@ -26,8 +26,8 @@ declared through `required_capabilities`, `policy_pack`, or extension docs.
 | `owner` | string | | GitHub owner |
 | `repo` | string | | GitHub repo |
 | `platform` | string | | free-form tag for the consumer's runtime family |
-| `timezone` | string | | IANA tz for the merge window (`Europe/Istanbul`, `Etc/GMT-3`) |
-| `merge_window` | string `HH:MM-HH:MM` | | open merge window; the complement is the night no-merge window |
+| `timezone` | string | | IANA tz for the merge window (`Europe/Istanbul`, `Etc/GMT-3`); required with `merge_window` |
+| `merge_window` | string `HH:MM-HH:MM` | | open merge window (hours `00`-`23`, the two ends must differ); the complement is the night no-merge window; required with `timezone` |
 | `merge_window_mode` | `freeze` \| `pause` | `freeze` | outside the window: `freeze` blocks the merge but keeps gates/CI running; `pause` halts the pipeline |
 | `consent_mode` | `explicit` \| `standing` \| `agent` | `explicit` | default live-run consent mode for every command |
 | `gates` | string[] | | built-in gates to run: any of `build`, `lint`, `jury` |
@@ -70,6 +70,29 @@ specific product.
 `timezone` is an IANA timezone used to evaluate `merge_window`. `merge_window` is the open
 merge interval in `HH:MM-HH:MM` format and may wrap midnight. `keel window` and `keel ship`
 use both values to decide whether a merge may proceed.
+
+The two are **all-or-nothing**: set both, or neither. A config that sets exactly one is a
+`ConfigError`, because the half-configured pair cannot be evaluated — every surface reads
+a missing half as "no window configured" and reports the window *open*, so a project that
+declared `merge_window` and forgot `timezone` used to merge straight through the night it
+meant to block.
+
+Both values are also checked for meaning, not just shape, at `keel validate` time:
+`merge_window` must parse as `HH:MM-HH:MM` with hours `00`-`23` and minutes `00`-`59`
+(`29:00-01:00` is rejected), and `timezone` must resolve as an IANA zone on this machine
+(`Definitely/Nowhere` is rejected). Both used to be accepted and then raised out of the
+middle of a `keel ship` run instead.
+
+A window's two ends must also **differ**. `09:00-09:00` is a `ConfigError`: the window is
+evaluated as `opens <= now < closes`, which is empty when the two are equal, so such a
+window is closed at every instant of every day — `keel validate` printed `OK` and every
+`keel ship` then deferred at the merge gate for ever, which is the same silent-and-permanent
+failure as the missing half above. Only the degenerate equal case is refused; a window may
+still **wrap midnight** (`22:00-06:00` is the all-night window it reads as), and the
+neighbouring minute (`09:00-09:01`) is a real, if narrow, window.
+
+`keel init --wizard` therefore asks for the pair as [one question](cli.md#init-wizard),
+never two: it cannot scaffold half of it.
 
 #### `merge_window_mode`
 
@@ -133,7 +156,11 @@ contracts, but executable project behavior remains in extension files or project
 |---|---|---|---|
 | `build_gate_cmd` | string | ✅ | command the `build` gate runs |
 | `lint_cmd` | string | | command the `lint` gate runs (gate skipped if absent) |
-| `implementer_agents` | map role→agent | | role to local agent mapping |
+| `implementer_agents` | map role→agent | | **deprecated** by `team.implement.by_role`: role to local agent mapping (still accepted and mapped onto it) |
+| `team.lead` | seat | | seat that coordinates a batch of ships; workers report through it |
+| `team.by_difficulty` | map band→bench | | `easy`/`standard`/`hard` → the bench that staffs work of that weight |
+| `team.profiles` | map name→bench | | operator-selectable benches, chosen with `--team <name>` |
+| `team` | object | | who implements / gates / reviews per role and risk tier, and how the jury gates |
 | `delegate_profiles` | map name→profile | | named generic delegate vendors, referenced as `--delegate <name>` |
 | `tier3_globs` | string[] | | high-risk paths that force full scrutiny |
 | `ci_workflows` | map name→glob | | CI workflow display name → gating path glob |
@@ -143,7 +170,10 @@ contracts, but executable project behavior remains in extension files or project
 | `required_capabilities` | string[] | | runtime capabilities that must be present before mutating work starts |
 | `optional_capabilities` | string[] | | runtime capabilities that may degrade explicitly when unavailable |
 | `evidence_gate_label` | string | | Legacy PR label that also arms the required pre-merge evidence gate (default `keel:ship`); ship provenance now arms the gate by default |
-| `evidence_require_distinct_vendors` | boolean | | When `true`, `evidence-verify` additionally requires each required review verdict to carry vendor provenance and that no two share a vendor (default `false`) |
+| `evidence_require_distinct_vendors` | boolean | `false` | requires each required review verdict to carry vendor provenance, and no two to share a vendor. **Opt-in: unset is `false` on every risk tier**; set it to `true` on a project whose reviewer bench really spans vendors |
+| `swarm_review_evidence` | boolean | | Swarm landings enforce the same per-PR review-evidence contract as ship s10 (default `true`); `false` is the explicit, logged opt-out |
+| `implement_mode` | `default` \| `tdd` | | the s4 implement profile: one pass (default), or test-first in two phases with the blocking `tdd-order` gate at s8 |
+| `loop` | object | | the s4 iteration loop: after each implement iteration the command gates run; green ends the loop, red starts the next with the same brief plus the gate output, up to `max_iterations` (1–10, default `3`). The gate run is the judge, never the implementer's text; composes with `implement_mode: tdd` (wraps phase B) |
 | `gate_timeout_s` | integer ≥ 1 | | wall-clock seconds a command gate may run before it is killed (default `600`) |
 | `jury_timeout_s` | integer ≥ 1 | | wall-clock seconds the `jury` built-in may run before it is killed (default `600`) |
 
@@ -160,8 +190,424 @@ Command run by the built-in `lint` gate. If absent, the lint gate is skipped.
 
 #### `implementer_agents`
 
-Map from a role label or project role to the local implementer agent name. `keel ship` and
-`keel implement` use it when choosing the implementation delegate.
+**Deprecated by [`team.implement.by_role`](#team).** Map from a role label or project role
+to the local implementer agent name. Still accepted: keel maps each value onto a
+`team.implement.by_role` seat, reading a value that names a provider keel can resolve as
+that provider and anything else as a host subagent (`subagent:<name>`). That ambiguity —
+the same field documented as a vendor string here and as a Claude subagent name in
+`ship.md` s4 — is why `team` exists. `team.implement` wins where both name a role.
+
+#### `team`
+
+Who runs the ship. `knobs.team` is the whole team a project fields, not just an
+implementer: which provider implements (per issue role), which one gives the mandatory
+**gate review**, which ones review (per risk tier — or `jury`, when the cross-vendor panel
+*is* the review), who applies the findings, and how the jury gates.
+
+```yaml
+knobs:
+  team:
+    implement:
+      default: { provider: claude }
+      by_role:
+        core: { provider: agy, model: gemini-3.8-flash-high, effort: high }
+        docs: { provider: "subagent:docs-writer" }
+    gate:                                  # one second opinion on every implementation
+      provider: codex
+      distinct_from: implementer
+    review:
+      by_tier:
+        "1": [{ provider: claude }]
+        "2": [{ provider: claude }, { provider: grok-via-openai-compatible }]
+        "3": jury                          # the panel is the review (see the caveat below)
+    jury:
+      mode: gating
+      min_vendors: 2
+      on_unavailable: fallback       # or `block` — what to do when the panel cannot sit
+    fix: { provider: implementer }         # who applies review findings
+    lead: { provider: claude }             # coordinates a batch; workers report through it
+    by_difficulty:                         # how much work it is -> which bench staffs it
+      easy: { implement: { provider: ollama, model: qwen2.5-coder } }
+      hard:
+        lead: { provider: claude, model: opus }
+        implement: { provider: codex, effort: high }
+        review: jury
+    profiles:                              # operator-selectable benches (--team <name>)
+      night-shift:
+        implement: { provider: codex, effort: medium }
+        review: [{ provider: agy, model: gemini-3.8-pro }]
+```
+
+**`review.default` and `review.by_tier`.** `by_tier` names the seats for a specific risk
+tier; `default` covers every tier `by_tier` does not name, and takes the same two shapes —
+a list of reviewer seats, or `jury`. A tier with neither falls back to the tier-derived
+count staffed by the host agent, which is keel's pre-`team` behaviour.
+
+**The gate review is adapter-enforced.** `team.gate` is emitted in the assignment and the
+adapter dispatches it; core has no evidence item for it, so nothing in `keel merge` or
+`keel evidence-verify` blocks a merge whose gate review never ran. This is the same
+emit-only boundary operator consent sits behind (see
+[`operator-consent.md`](operator-consent.md)) — the deterministic core does not perform the
+dispatch, so it cannot certify it happened.
+
+**`fix` is who applies review findings**, and its default is the alias `implementer`: the
+seat s4 actually dispatched, whatever it resolved to. Omitting the block means the same
+thing as writing `fix: { provider: implementer }`; name a provider instead to send every
+fix round to one seat regardless of who implemented.
+
+s9 does not read this key directly — `keel fixloop brief` does, and escalates from it when
+a round fails or the seat is unavailable, along the ladder `fix` → `gate` → the host agent.
+A rung repeating an earlier one is dropped rather than dispatched twice, and the
+three-round review-fix budget is unaffected: the ladder decides who fixes, not how often.
+See [`cli.md`](cli.md) under `keel fixloop brief`.
+
+**Providers.** A `provider` names an entry the same registry `keel delegate run` resolves:
+a built-in vendor (`claude`, `codex`, `agy`, `ollama`, `anthropic-api`, `openai-api`,
+`google-api`), a [`delegate_profiles`](#delegate_profiles) entry, or a machine-level
+`~/.keel/providers.yaml` entry. Two spellings are reserved:
+
+- `subagent:<name>` — a **host (Claude-class) subagent**, never a `keel delegate run`
+  dispatch. This is the pre-`team` meaning of an `implementer_agents` value, made explicit.
+- `implementer` — *whoever implemented this change*. Valid at `fix.provider` and
+  `gate.distinct_from` only.
+
+**Validation** (`keel validate`) rejects a provider name that is neither a built-in vendor
+nor a `delegate_profiles` entry nor a `subagent:` name; an `effort` on a provider that has
+no spelling for reasoning effort (`claude`, `ollama`, a generic `cli` profile), or on `agy`
+without the `model` its suffix-based effort needs; a `gate.provider` equal to a configured
+implementer when `gate.distinct_from: implementer`; more than three reviewer seats for a
+tier; and a `review` value that is neither seats nor `jury`. A machine-level
+`~/.keel/providers.yaml` entry is deliberately **not** consulted: validation must give the
+same answer on every machine.
+
+**`"3": jury` means the panel is dispatched once and its ballots *are* the review.** On
+such a tier `s7` runs ai-jury and `keel review --from-jury <report.json>` posts one
+head-pinned `keel.review-verdict.v1` per panelist that counts as a review (ai-jury
+`is_review`) — carrying the vendor and model that produced that ballot — plus the
+`keel.jury-verdict.v1` consensus record. Abstentions are not posted and do not inflate
+`panelists`. Host reviewers are
+**not** staffed as well: paying for three host readings *and* a four-agent panel over the
+same diff, while the panel's ballots reached no gate, is what this policy replaced. The
+required verdict count is the panel's own size, declared as `panelists: <N>` on the posted
+jury verdict; see [`evidence.md`](evidence.md#4-who-the-reviewers-are-the-bench-or-the-panel).
+
+**Adopt it deliberately — and keel itself has not yet.** A panel tier commits every change
+at that tier to a jury run: it has no host reviewer slots to fall back on, and nothing
+per-run can take the panel away. keel's own `projects/keel.yaml` therefore keeps three
+reviewer seats at tier-3 with `jury.mode: advisory` until `keel review --from-jury` has been
+exercised on a real pull request.
+
+Three consequences worth stating plainly:
+
+- **No per-run flag can take the panel away.** `--no-jury` and `--jury-advisory` are
+  recorded in `assignment.warnings` and not applied on a panel tier, because removing the
+  panel there would leave the tier with *no* required review evidence at all — a stricter
+  policy producing a weaker gate. Below a panel tier both flags keep their usual meaning.
+- **`jury.mode: advisory` may not be combined with a jury panel.** "The panel is the
+  review" and "the panel does not gate" together mean the tier requires nothing, so
+  `keel validate` refuses the pair. Note that `jury.mode` is a **single global knob** while
+  review panels are **per-tier**, so the refusal is whole-config: "a gating panel at tier-3,
+  with the advisory jury that `--jury` would raise at tier-1/2" is rejected even though
+  `resolve_jury` would scope the two correctly at run time (a panel tier ignores the mode;
+  a non-panel tier applies it). Express that shape as `jury.mode: gating` plus seats at the
+  tiers that should not gate, or keep the panel off until `jury.mode` is per-tier.
+- **A short panel changes nothing about what the tier owes.** Below `jury.min_vendors`
+  participating vendors a jury is downgraded `gating → advisory` only where it sits *beside*
+  a host bench. On a panel tier there is no bench behind it, so the downgrade is suppressed:
+  the verdict stays gating and required, and every ballot stays required. The shortfall is
+  refused by `evidence.panel_vendor_check` as `review-vendor-distinctness` instead — a short
+  panel does not get to excuse itself from the consensus record that says it was short. The
+  bench does not move with the vendor count either: only `evidence-verify` and `keel merge`
+  can read a count off a posted verdict, so a bench that followed it would put two surfaces
+  of the same run in disagreement about who reviews. Every review-aware surface *accepts*
+  the jury flags — `keel review` included, since #1043 — but nothing makes a run pass them
+  to all six, which is the other half of why the bench may not follow them.
+
+### `jury.on_unavailable` — when the panel cannot be staffed here
+
+A panel tier commits every change at that tier to a jury run, and no per-run flag can take
+the panel away. That is the right shape while the panel can actually run. When it cannot —
+an agent CLI is not installed, is unauthenticated, or the account is out of quota — the
+tier would otherwise be simply stuck: the only review it has is one this machine cannot
+convene. A single-maintainer project hits that routinely.
+
+So **before s7 dispatches the panel, keel probes it** — the panel s7 would actually
+dispatch, which is the `jury` binary and the agents *it* is configured with, not keel's own
+delegate list. The probe asks the runner first (`jury --doctor --json`, ai-jury's own
+readiness document): that establishes the binary is present and runnable, and reports which
+of its agents are usable. For a runner that answers but names no agents, keel falls back to
+the inventory `keel doctor --providers` already collects — one `PATH` lookup and one
+`--version` call per CLI vendor, an env-var *name* check per hosted API, one loopback
+request for Ollama — so keel keeps one answer to "is this provider usable here" instead of
+two that drift.
+
+**That document is also how the binary identifies itself.** A `jury` on `PATH` that exits 0
+without printing an `ai-jury.doctor.*` report is *not* a usable runner, and keel's own
+inventory cannot make the panel staffable behind it: the fallback stands in for a panel
+ai-jury declined to enumerate, never for a panel runner nobody established is there. An
+ai-jury genuinely too old for the flag does not land in that case — it parses arguments
+strictly and exits non-zero on an unrecognized `--json`, which is already reported as an
+unusable runner naming the exit code.
+
+The panel is *staffable* when **both** halves hold: the `jury` runner is usable here, and
+at least `jury.min_vendors` distinct vendors are available to it. Two entries that shell out
+to the same CLI are one vendor and one opinion, exactly as they are everywhere else — and
+agent CLIs on `PATH` with no `jury` to convene them are an inventory, not a panel, so a host
+with `claude` and `codex` and no ai-jury installed is *not* staffable.
+
+`on_unavailable` is what happens when it is not:
+
+| value | behaviour |
+| --- | --- |
+| `fallback` *(default)* | Staff a **host bench of the same size the tier requires** — three seats at tier-3, exactly as a tier without a panel resolves — and record why. |
+| `block` | Refuse the run, with a message naming each unavailable provider and the reason the probe reported. |
+
+**`block` refuses the work the panel would have reviewed, not everything on the machine.**
+The probe is a measurement of the *host* and one measurement can staff many benches, so the
+refusal is taken where the bench is resolved rather than where the panel was measured. For
+`keel ship`, `plan`, `review`, `step-verify`, `evidence-verify` and `merge` that is the same
+moment and nothing looks different. It matters for `keel swarm plan`, which scores every
+cluster's tier *while* it partitions and so must measure before any cluster exists: a
+project with `by_tier."3": jury` and `on_unavailable: block` can plan and run a wave of
+tier-1 work on a host with no panel installed, and is refused the moment a cluster whose
+review *is* the panel comes up. The measurement still travels to every cluster either way —
+`assignment.jury.availability.decision` reads `block` on all of them.
+
+A missing runner is a seat like any other: it is listed first under
+`availability.unavailable` as `jury`, so the message an operator reads names the thing to
+install rather than sending them to chase a panelist that was never the problem.
+
+`fallback` is the sensible default for a solo project: the panel is the better review when
+it is available and should not become a wall when it is not. `block` preserves the strict
+behaviour for a project whose product claim *is* cross-vendor review.
+
+**The fallback changes who sat, never how many.** It seats the tier's own reviewer count
+and publishes the tier's own required evidence: three `review-verdict-*` items at tier-3,
+not two. What it does drop is `jury-verdict`, and it must — there is no panel to produce
+one, and requiring it would leave the tier stuck one layer down.
+
+**Nothing about it is silent.** The probe's verdict is recorded in full — which seats were
+unavailable and why — and travels with the run:
+
+- `assignment.jury.availability` and `review_merge_contract.jury.availability` carry the
+  whole record; `assignment.reviewer_source` reads `jury-fallback` rather than `risk-tier`,
+  so a fallback bench is distinguishable from a tier that never had a panel;
+- `assignment.warnings` names the unavailable seats in one sentence;
+- `availability.runner` says whether the `jury` binary itself was usable, and
+  `availability.inventory` says which of the two sources the vendor counts were read from;
+- the run ledger records it at `run_context.jury_panel`;
+- the closure comment renders a **Jury panel:** line — `panel unavailable — a host bench of
+  the same size reviewed instead`, listing the seats, or `panel sat — the cross-vendor panel
+  reviewed this change` — followed, when the record carries a head, by
+  `<!-- keel.jury-panel.v1 head=… decision=… -->`, the machine-readable half a verification
+  surface elsewhere reads the run's decision from. **Every** panel decision renders the
+  line, `available` included: the marker is the run's record where the ledger cannot be
+  read, and a run that said nothing could not outrank an earlier ship of the same commit
+  that had. Only a run of a project with no panel posts the comment it always did, byte for
+  byte.
+
+That is the point: a reader can tell a jury-reviewed change from a fallback-reviewed one
+without re-deriving it. A panel that quietly collapses and still reports success is
+[ai-jury #682](https://github.com/berkayturanci/ai-jury/issues/682), and this must not
+reintroduce it on keel's side.
+
+**Availability is measured, never asserted.** There is no flag that says "the panel is
+fine", and #1014's rule survives intact: what may not take the panel off is an operator's
+*preference*. Availability is a fact about the world, and it is allowed to change the
+outcome precisely because it is recorded.
+
+**A surface that only verifies is pinned to what the ship measured.** The probe is right for
+a surface about to *dispatch* a panel and wrong for one checking evidence somebody else
+produced: `keel evidence-verify` and `keel merge` run wherever CI puts them, so re-measuring
+there would answer "could *this* runner convene a panel" when the question is "what was this
+change reviewed by". Both take the ship's decision instead, strongest source first:
+
+1. the `ship_run` ledger entry written for **this head** of that pull request
+   (`run_context.jury_panel`), which carries the decision the shipping run measured,
+   fallback included;
+2. failing that, the same decision read back off the **closure comment** that run posted
+   on the pull request, which carries `<!-- keel.jury-panel.v1 head=… decision=… -->`
+   beside its human `Jury panel:` line;
+3. failing that, a head-pinned `keel.jury-verdict.v1` posted on the pull request — the
+   panel sat, and the ballots prove it from the one place a bare runner can read.
+
+**The run's own record outranks the posted verdict, and the order is load-bearing.** The
+run's record says what *this run actually did*; a posted verdict says what somebody put on
+the pull request, which is not the same claim. A run that shipped under the fallback seated
+three host reviewers and owes `review-verdict-1..3`, and a leftover jury verdict at that
+same head — from an earlier ship of the commit, a force-push back onto it, or a
+collaborator who ran `jury` by hand — is not that run's review. Taking the verdict first
+dropped three required items on the strength of a comment no run had promised. A same-head
+record that says nothing about a panel is likewise the run speaking: it did not ship under
+one, and no comment may say otherwise on its behalf.
+
+**With one exception, and it is the difference between a `null` and a missing key.** A row
+this feature wrote always carries `run_context.jury_panel`, because keel always writes the
+key — `null` there is the run answering "this tier named no panel", and it silences the two
+lower sources. A ledger row written *before* #1066 has no such key at all: missing
+vocabulary, not a statement. Silencing on its behalf would answer a question that run was
+never asked, so on a workstation still carrying one, a change the panel really did jury
+would have had its posted ballots ignored and `review-verdict-1..3` demanded by a probe of
+the local machine. Those rows fall through to the closure comment and then to the ballots,
+exactly as they did before #1066 existed.
+
+**Why the closure comment is a source at all.** The ledger is the stronger copy and it does
+not travel: `.keel/state/` is gitignored, so a hosted `evidence-verify` or `merge` — the CI
+check, or any machine other than the one that shipped — has no same-head record to read, and
+the precedence above would hold on the shipping workstation and nowhere else. The closure
+comment is the *same statement*, rendered from that same record, in the one place that goes
+with the pull request. It is read only from a trusted author (the same fail-closed
+`author_association` check a posted verdict gets — keel posts it on the operator's behalf,
+which is that authority and no more), only inside an actual closure comment, and only when
+its marker names the head under verification.
+
+**Both run-record sources select the *latest* record for the head, and that direction is
+itself the rule.** One head can be shipped more than once — a re-run, a force-push back onto
+the commit, a second ship on another machine — and each ship writes a ledger row and posts a
+closure comment. The ledger source keeps the **last** matching row (records are appended
+chronologically); the closure source keeps the **last** matching comment (GitHub returns
+them oldest first). They have to agree about *which ship they are quoting*, or ranking them
+against each other means nothing: the machine with a ledger would answer for the newest ship
+and the machine without it for the oldest. Reading the closure comments first-match did
+exactly that, and a run whose panel sat rendered no marker to outrank the older one with —
+so a commit shipped once under the fallback and again where the panel convened left one
+marker saying `fallback`, and CI pinned the host-bench contract onto a panel-reviewed
+change. Every panel decision now renders its marker, `available` included, and both sources
+are last-wins.
+
+Only with no record of the run's own *and* no posted verdict does the verification surface
+probe on its own, which is what it did before. The published record says which it was:
+`availability.source` is `probe`, `pull-request`, `run-ledger` or `closure-comment`, and a
+pinned record carries `probed: false` — "we were told" and "we checked" are not the same
+claim. The whole precedence lives in one function, `keel.juryavail.pin`;
+`keel.cli._shipped_jury_availability` only reads the three artifacts and hands them over.
+
+**Every source is pinned to the exact head, and none is read without one.** A pull
+request outlives its heads, so a ship of an earlier head may not answer for the head being
+verified now — that would be a stale run relaxing a live gate, since a pin can take
+`review-verdict-1..3` off the required set outright. A run that could not resolve a head at
+all — a detached checkout, an API answer with no `headRefOid` — therefore pins *nothing*
+from either source and measures its own machine, the same answer a record from another head
+already got.
+
+Two machines can still resolve the *same tier* differently when they are each about to
+dispatch — a CI runner with no agent CLI plans a fallback where a workstation plans the
+panel — and each says which it did rather than quietly claiming the other's provenance. What
+they can no longer do is disagree about a change that has already been reviewed. The residue
+is narrow and fails closed: a fallback-shipped change verified, with no readable ledger, on a
+machine that *can* staff the panel is held to the panel it did not run.
+
+**`config_hash`.** `on_unavailable` is absent from the canonical `team` block when it is
+unset, like every other optional field there, so a project that never names the setting
+keeps the `config_hash` it had before the setting existed. Writing it explicitly — even as
+`fallback`, the value it would default to — is a config change and rotates the hash, which
+is the guarantee `knobs.team` has made since #1014: the hash changes *iff* `team` does.
+
+**Tier keys are quoted strings** (`"1"`, `"2"`, `"3"`). YAML reads a bare `1:` as an
+integer key, which a JSON schema cannot describe; keel says so instead of accepting it and
+meaning something else.
+
+**What it resolves to.** `keel plan --command ship --json` and `keel ship --json` render
+the resolved team as `assignment` — `implementer`, `gate`, `reviewers[]` (with per-slot
+`provider`/`model`/`effort`), `jury`, `fix`, and a `warnings` list — and the same seats
+appear on `review_merge_contract.reviewers.slots`, so any host runs the same team. A tier
+whose review policy is `jury` yields empty `slots`, `reviewers.source: "jury"` and a gating
+jury: the panel is the review, `reviewers.count` is the number of ballots that must be
+posted, and the evidence gate requires that many review verdicts **plus** the jury verdict
+as the consensus record.
+
+**A committed policy may only name built-ins and `delegate_profiles`.** Validation does not
+consult the machine-level `~/.keel/providers.yaml`, so a registry entry named in
+`knobs.team` fails `keel validate` — deliberately: the policy is committed and read by
+people whose home directories do not have that entry, and a rule that only holds on its
+author's laptop is not a rule. Reach a registry provider **per run** instead, with
+`--delegate` / `--review-delegate`, which resolve through the full registry; or promote it
+to a `delegate_profiles` entry when the whole team should share it.
+
+**Per-run overrides still win.** `--delegate <provider[:model]>` replaces the implementer;
+`--review-delegate` is repeatable and **positional per slot** (first flag = slot A, second
+= slot B). `--reviewers N` overrides the seat count, except on a `jury` tier, where it is
+reported in `assignment.warnings` rather than silently replacing the panel.
+
+##### `team.lead`, `team.by_difficulty` and `team.profiles` — staffing a batch
+
+The seats above answer *who runs a ship*. These three answer *who runs a **batch** of
+ships* — a swarm cluster, a work block, an overnight session.
+
+**`lead`** is the seat that coordinates the batch and that its workers report through: a
+swarm spawns one lead per cluster, and the cluster's workers show that lead on
+`keel swarm-status`. Unset, the lead is the host agent driving the run.
+
+**`by_difficulty`** keys a bench on how much work something is. A **difficulty band** is
+not a risk tier:
+
+| | asks | read from | used for |
+| :--- | :--- | :--- | :--- |
+| risk tier | how dangerous is this change | `knobs.tier3_globs` + the changed files | how much review it needs |
+| difficulty band | how much work is this | tier, predicted file count, `priority:*`/`size:*` labels, dependency depth | which bench is worth spending on it |
+
+A one-line fix to a tier-3 glob is dangerous and trivial; a twelve-file docs migration is
+safe and long. Keeping them apart is what lets one backlog say *the hard cluster gets the
+strong implementer at high effort, the easy ones go to the cheap local model*.
+`keel swarm-plan` scores every cluster and prints the band with the signals that produced
+it; the bands are `easy`, `standard` and `hard`, and `keel validate` rejects any other key.
+
+**`profiles`** are benches an operator picks by name with `--team <profile>` on
+`work-block`, `overnight` and the `swarm` commands. A profile **outranks** the scored band
+— it is the operator naming the bench for this batch — but it does not replace it: each of
+`lead`, `implement`, `review` and `effort` resolves down the list on its own, so a profile
+that names only reviewers leaves the band's implementer standing.
+
+Resolution, most specific first, for each field independently:
+
+```
+--delegate / --review-delegate / --effort   (per-run flags)
+  > team.profiles.<--team>                  (operator-named bench)
+  > team.by_difficulty.<band>               (scored bench)
+  > team.implement.by_role.<role>           (which part of the system)
+  > team.implement.default
+  > knobs.implementer_agents.<role>         (deprecated)
+  > the host agent
+```
+
+A bench outranks `by_role` deliberately: the role says *which part of the system this is*,
+the band says *what this piece of work costs*, and only the second can express "the hard
+ones get the strong implementer". `effort` is the one exception to "most specific first" —
+a seat that names both a provider and an effort is one statement, so the seat's own effort
+beats the bench's; only the `--effort` flag beats the seat.
+
+A `--team` name with no matching profile is reported in `assignment.warnings` and the run
+falls back to the configured policy — it is never silently ignored.
+
+**A child ship inherits the bench.** `--effort` and `--team` are accepted by `keel ship` and
+`keel plan`, not only by the batch commands, and a batch hands them to every child. That is
+what makes a difficulty bench survive the handoff: the child re-resolves the *same* bench
+from the *same* config instead of falling back to the role default. The parent may still
+override what the bench chose — `--delegate` and `--review-delegate` on the child's command
+line win over any bench, exactly as they do on the parent's.
+
+**A bench `effort` is validated against every seat it could land on.** A seat's own `effort`
+sits beside its provider, so an operator reading one line sees both halves. A bench's does
+not — it lands on whichever implementer resolves for that band, written somewhere else — so
+`keel validate` checks it against each candidate implementer under the same rules: an `agy`
+seat needs the `model` its effort suffix rides on, a provider with no effort dial is
+refused, and a `subagent:` implementer (which has no dial at all) is refused too. A seat
+naming its own `effort` never receives the bench's, so it is not flagged.
+
+`team` participates in `config_hash` only when it is present, so adding the knob does not
+rotate the hash for a project that has not adopted it — and `config_hash` changes whenever
+`team` does.
+
+**Writing one with the wizard.** `keel init --wizard` / `keel setup --wizard` end with a
+team step that builds this block from the [`keel doctor --providers`](cli.md#keel-doctor)
+probe, so the seats it writes are providers that exist on the machine doing the
+scaffolding. It offers only what a *committed* policy may name — the built-in vendors and
+this project's `delegate_profiles`, never a machine-level `~/.keel/providers.yaml` entry —
+for the same reason validation refuses one, and it will not offer an `effort` whose
+provider has no spelling for it. `keel ship --wizard` picks the same seats for a single
+run instead of writing them down; it *does* offer registry providers, because
+`--delegate` resolves through the full registry. See
+[`cli.md`](cli.md#init-team-step).
 
 #### `delegate_profiles`
 
@@ -199,6 +645,7 @@ Then: `/keel:ship 123 --delegate cursor`.
 | `model_arg` | string | | flag the model is passed on, as `<model_arg> <model>` (default `--model`) |
 | `endpoint` | string | ✅ for `openai-compatible` | the OpenAI-shaped chat-completions URL. Loopback by default |
 | `api_key_env` | string | ✅ for `openai-compatible` | the **name** of the env var holding the key — never the key, and only an [allowlisted name](#which-env-vars-may-hold-a-delegate-key) |
+| `vendor_label` | string \| null | | what `agent:<vendor>` should say for this entry — see [below](#vendor-label) |
 
 <a id="which-env-vars-may-hold-a-delegate-key"></a>
 **Which env vars may hold a delegate key.** This field names the variable whose *value*
@@ -271,7 +718,11 @@ the reviewer role. `args` typically carries the implementer's write-enabling fla
 `cursor-agent`'s `--force` approves edits non-interactively — so a reviewer invoked with
 them can edit the checkout. Set `review_args` to a read-only invocation for any profile
 you use as a reviewer. keel validates neither list; this is operator-configured, not
-enforced.
+enforced — but it does **report** it: `keel delegate run --role review` returns
+`read_only_backed: false` plus a warning naming the profile when `review_args` is unset,
+which is the signal an orchestrator refuses on. `review_args: []` is not the same as
+omitting the key: an empty list says "no flags needed to review" and counts as configured,
+while `null`/absent falls back to `args`.
 
 **Quote a profile name that YAML would not read as a string.** A bare `on:`, `yes:`,
 `2:` or `~:` key parses as a boolean, integer or null, not a name — `keel validate`
@@ -294,6 +745,137 @@ trust level as `build_gate_cmd` — it is never taken from PR content or agent o
 
 For full model options and provider configurations, see the [Supported AI Models & Providers Guide](models.md).
 Design and proposals: [`docs/proposals/generic-delegate-vendors.md`](../proposals/generic-delegate-vendors.md).
+
+<a id="provider-registry"></a>
+**The machine-level provider registry (`~/.keel/providers.yaml`).** Which providers are
+usable is a property of the **machine and the person**, not of the project: one operator has
+`claude`/`codex`/`agy` logged in and no API key, another has only `XAI_API_KEY`. Those facts
+do not belong in a file everyone on the team commits. The registry is where an operator
+keeps them:
+
+```yaml
+# ~/.keel/providers.yaml — never committed; override the path with KEEL_PROVIDERS
+providers:
+  cursor:
+    transport: cli                 # cli | api | local
+    command: cursor-agent
+    review_args: ["-p"]            # a read-only invocation for the reviewer role
+    model: composer-2.5
+    model_arg: --model             # default "--model"
+    effort: high                   # vendor-specific reasoning-effort selector
+  vllm:
+    transport: api
+    endpoint: http://127.0.0.1:8000/v1/chat/completions
+    api_key_env: VLLM_API_KEY      # the NAME, never the key
+  my-gateway:
+    transport: api                 # non-loopback: needs the env opt-in below
+    endpoint: https://gateway.example.com/v1/chat/completions
+    api_key_env: KEEL_DELEGATE_KEY_GATEWAY
+```
+
+**A registry `api` endpoint is held to the same loopback-only default as a project
+profile's**, so a remote one of your own — the `XAI_API_KEY`-style case this registry
+exists for — is refused until you export the opt-in:
+
+```bash
+export KEEL_ALLOW_REMOTE_ENDPOINT=1     # any non-loopback endpoint, registry included
+export KEEL_ALLOW_INTERNAL_ENDPOINT=1   # additionally, for 10./172.16./192.168. hosts
+```
+
+Until then the entry is **skipped with a warning naming that variable**, and every other
+entry still registers. The opt-in stays in the environment rather than in the file for the
+same reason it does for `project.yaml`: a file must not be able to widen its own reach —
+so no registry entry can grant itself a remote endpoint, however trusted the directory it
+sits in.
+
+| field | required | description |
+|---|---|---|
+| `transport` | ✅ | `cli` (a local binary), `api` (an OpenAI-shaped hosted endpoint), `local` (a model served on this machine) |
+| `command` | ✅ for `cli` / `local` | the executable keel runs |
+| `endpoint` | ✅ for `api` | the OpenAI-shaped chat-completions URL, under the same loopback-by-default rules as a profile's |
+| `api_key_env` | ✅ for `api` | the **name** of the env var holding the key |
+| `model` | | default model for this entry |
+| `model_arg` | | flag the model is passed on, as `<model_arg> <model>` (default `--model`) |
+| `effort` | | vendor-specific reasoning-effort selector, carried through to dispatch |
+| `review_args` | | flags for the reviewer role; their presence is what the probe reports as `read_only_mode` |
+| `vendor_label` | | what `agent:<vendor>` should say for this entry — see [below](#vendor-label) |
+
+**A registry entry's `review_args` is present or it is not — there is no third state.**
+A *profile* distinguishes them, because `role_args` falls back to `args`: `review_args: []`
+there means "this CLI needs no flags to review", a deliberate choice keel counts as a
+configured read-only invocation, while omitting the key entirely means the reviewer
+silently receives the implementer's `args`. A registry entry has no `args` to fall back
+to, so an empty or absent `review_args` is the same thing — nothing configured — and
+`keel delegate run --role review|gate|chair` reports `read_only_backed: false` with a
+warning for it. See [`cli.md`](cli.md#keel-delegate).
+
+<a id="vendor-label"></a>
+**`vendor_label` — what `agent:<vendor>` says (#1129).** `vendor` on a profile, and the
+transport on a registry entry, name *how* keel reaches the model: `cli` for every local
+coding-agent CLI. That is the wrong word for attribution. Two entries driving two makers
+through one binary —
+
+```yaml
+providers:
+  grok:           { transport: cli, command: cursor-agent, model: cursor-grok-4.6-high-fast }
+  gpt-via-cursor: { transport: cli, command: cursor-agent, model: gpt-5.3-codex-high }
+```
+
+— both reported `vendor: cli` in the delegate contract and both were labelled `agent:cli`.
+`reviewers.require_distinct_vendors` reads exactly that field, so it could not tell Grok
+from GPT, and would equally have refused two genuinely different reviewers. Adding
+`vendor_label: xai` and `vendor_label: openai` makes the contract say `xai` / `openai` and
+the labels `agent:xai` / `agent:openai`. The entry name is unaffected: it stays in
+`provider` and in `attribution.delegate_profile`.
+
+Unset changes nothing — every built-in already names itself, and a project that never
+writes the field keeps its labels and its `config_hash`.
+
+The value becomes a GitHub label keel *applies* and `attribution_check` later reads back,
+so it may not shadow a built-in vendor (`claude`, `codex`, `agy`, `ollama`, `*-api`), may
+not restate `cli`/`openai-compatible`, and is limited to lowercase letters, digits, `.`,
+`-` and `_`. In a project profile a bad value is a `keel validate` error; in the registry
+it is a warning and the entry keeps the generic label, like every other registry rule.
+
+**One caveat for the registry.** `keel doctor` checks that every label keel might apply
+already exists on the repository, and it can only enumerate the *project's* profiles — the
+registry lives in your home directory, on one machine, unread by the project config. If
+you label a registry entry, create `agent:<label>` on the repository yourself.
+
+**Precedence: built-in > project profile > registry.** A built-in vendor always wins and can
+never be redefined — not by a committed profile, not by a file in your home directory. Below
+the built-ins a project's `knobs.delegate_profiles` entry wins, so a repository can pin the
+provider its team shares; below that the registry adds entries the project never has to know
+about. `keel delegate run` resolves in exactly this order.
+
+**A clash is an error naming both sources, not a silent override.** A registry entry named
+after a built-in vendor (`claude`, `codex`, `agy`, `ollama`, `*-api`) or after one of this
+project's profiles is refused: it is dropped from the plan and reported by
+`keel doctor --providers` as a `fail` that names the registry path *and* the
+`knobs.delegate_profiles.<name>` it collided with. This mirrors the built-in shadowing rule
+above — the operator is told which file to edit instead of discovering mid-run that their
+entry did nothing. The check lives in `doctor` rather than `keel validate` on purpose:
+`keel validate` must stay a function of the committed config alone, so its result cannot
+depend on whose home directory it runs in.
+
+**A broken registry never breaks a run.** A missing file means no machine-level providers —
+the state of every machine that has not opted in. A malformed document, an unknown
+transport, a `cli` entry with no `command`, an `api` entry with no key name: each is a
+warning on the entry, keel keeps the entries that parse, and nothing raises.
+
+**`api_key_env` here is not held to the project allowlist.** The
+[allowlist above](#which-env-vars-may-hold-a-delegate-key) exists because `project.yaml` is
+committed and reviewed by people other than its author — the threat model is a config an
+attacker influenced through a pull request. This file is not committed and not shared: it
+sits in your home directory at the same trust level as your shell profile, and an operator
+whose only key is `XAI_API_KEY` should not have to rename it. The **denylist still applies**:
+a high-privilege system credential (`GITHUB_TOKEN`, `AWS_*`, `SSH_AUTH_SOCK`, …) may never
+become an `Authorization` header, wherever the entry was written.
+
+Nothing here affects `config_hash`: a project that references no machine-level provider
+hashes exactly as it did before, and the registry is never part of the hash.
+
+Inspect the whole picture with [`keel doctor --providers`](cli.md#keel-doctor).
 
 #### `tier3_globs`
 
@@ -358,8 +940,21 @@ verifier output. Override the legacy arming label per run with
 
 #### `evidence_require_distinct_vendors`
 
-Off by default (`false`), so behaviour is exactly the count + head-pin check. When set to
-`true`, `keel evidence-verify` additionally enforces **verdict provenance distinctness**:
+**Opt-in. Unset is `false`, on every risk tier.** The knob makes two different claims
+separable. The *count* claim — three reviewers looked at this — keel can verify from the
+posted evidence for any bench a project configured. The *independence* claim — three
+independent opinions looked at this — needs distinct vendors, and it is a property a
+cross-vendor panel provides rather than one every high-tier review has to carry. Asserting
+it by default would have keel say, on the project's behalf, something the project never
+said: a reviewer bench drawn from one vendor is the normal case for someone running a
+single agent CLI, and that person's TIER-3 change must still be reachable without
+configuring anything (#1065). Set it to `true` on a project whose bench really does span
+vendors, and the requirement then lives in a file a reviewer can read.
+
+The setting stays tri-state at the config boundary — unset, `true`, `false` — so an
+explicit `false` remains distinguishable from silence, but the two resolve identically.
+When it resolves to `true`, `keel evidence-verify` additionally enforces **verdict
+provenance distinctness**:
 each required review verdict must carry a `vendor:` provenance line, and no two required
 verdicts may declare the same vendor. This closes the gap where one agent could post N
 verdicts under invented reviewer ids — the verdict *count* was checkable but the *vendors*
@@ -372,6 +967,209 @@ jury — satisfies it simply by carrying distinct vendor provenance; keel takes 
 on any review vendor. A missing `vendor:` on a required verdict, or two verdicts sharing a
 vendor, fails verification with a blocking `review-vendor-distinctness` finding. Override
 per run with `keel evidence-verify --require-distinct-vendors`.
+
+#### `implement_mode`
+
+The **s4 implement profile**. `default` is the single implement pass keel has always run.
+`tdd` asks for the change to be written test-first, and then *verifies* that it was:
+
+```yaml
+knobs:
+  build_gate_cmd: "make test"
+  implement_mode: tdd
+
+policy_pack:
+  name: my-project
+  test_groups:
+    unit:
+      command: "make test"
+      paths: ["src/**", "tests/**"]   # what makes the group relevant
+      test_paths: ["tests/**"]        # where the tests actually live
+```
+
+In `tdd` mode s4 runs **two phases against the same provider**, one `keel delegate run`
+call and one commit each:
+
+| phase | what the implementer is asked for | diff | gates |
+|---|---|---|---|
+| `tests` | the failing tests derived from the issue's acceptance criteria | test paths only | expected **red** |
+| `implementation` | the change that turns them green, without weakening a test | the change | must end **green** |
+
+At **s8** the run then carries one extra gate, `tdd-order`. It is `on_fail: block`, and it
+is a **pure function of the commit list and the path policy** — keel looks up the base ref,
+reads the branch through a single `git log`, and decides in `keel.tdd`, with no other I/O.
+It passes when:
+
+1. the branch history is readable at all (an unreadable one blocks — it is not an empty branch);
+2. the first non-merge commit touches at least one path, and **only** test paths;
+3. that commit *adds or modifies* at least one test — a first commit that only runs
+   `git rm` over the suite is the opposite of writing it;
+4. no later commit *removes* a test — deleted outright, **or renamed out of the test
+   paths**, which stops the suite collecting it just as surely (`git mv tests/test_a.py
+   src/legacy_test_a.py` is `git rm` wearing a rename). A rename *within* the test paths
+   is an ordinary move and stays fine, and a copy is not a removal at all — its source
+   still exists. Making the failing tests go away is the cheapest way to make phase B
+   "pass";
+5. a later commit touches a non-test path — the implementation the tests were written for;
+6. the rest of the gate run is green.
+
+Otherwise it blocks and names what to fix: the offending paths in the first commit, the
+removed tests to restore (a rename-out is named by the path it *left*, the one that
+stopped being a test), the test globs it matched against, or the missing half of s4.
+
+The branch is read with `git log --topo-order --first-parent --reverse --name-status
+<base>..HEAD`. Ancestry order, not commit-date order: once a branch integrates its base at
+s10, a base commit dated *before* the tests commit would otherwise sort ahead of it and be
+judged as this implementer's first commit. `--first-parent` follows only this branch's own
+line, so the commits a base merge brought in are not on it at all; the merge commits
+themselves stay and are skipped rather than judged.
+
+`<base>` is the ref every other gate diffs against: `refs/remotes/origin/<base_branch>` when
+that ref exists, else `refs/heads/<base_branch>`. It used to be the bare local branch name,
+and keel cuts its worktrees from `origin/<base_branch>` while the primary checkout's local
+branch lags. The range then began *below* the branch point, so the base commit the branch was
+cut on top of was judged as the implementer's first commit, and a test-first branch was
+blocked for touching `src/` first. `--first-parent` cannot drop such a commit, because it is
+on the branch's own line. A bare name is also a short name, which a tag called `main`
+outranks: with that tag on an implementation-first commit, the gate passed a branch that was
+not written test-first (#1227, both measured).
+
+> **What the gate does not check.** It reads commit **order and paths**, and nothing else.
+> It never runs phase A's tests, so it cannot report that they were red, and it cannot tell
+> whether the committed tests assert anything. Three residuals follow, each a reviewer's
+> catch rather than a gate's:
+>
+> - a first commit adding an **empty file** under `tests/` satisfies rule 3 — and so does
+>   one that merely **renames an existing test** within the test paths, since the
+>   destination is present and is a test path;
+> - a test deleted inside a **merge from a side branch** is not judged. Merges are skipped
+>   deliberately: a test legitimately deleted on the base arrives through every branch that
+>   integrates it, and judging merges would block this implementer for someone else's
+>   change. The cost is that `git rm tests/test_a.py` on a side branch merged with
+>   `--no-ff` leaves no non-merge commit recording the deletion. Telling a base merge from
+>   a side merge is not something the commit list can do — both are just a second parent —
+>   so the gate declares the gap rather than guessing;
+> - nothing here says the tests are *good*.
+>
+> The gate makes the *shape* of a test-first run machine-checkable; it does not certify
+> that the tests are good.
+
+**Where the test paths come from.** The fallback is **whole-config, not per-group**, and
+that distinction matters when you write the config:
+
+- if **no** group declares `test_paths`, the globs are the union of every group's `paths`;
+- if **any** group declares `test_paths`, the globs are the union of the declared
+  `test_paths` **only** — every group that declares none contributes nothing, including
+  its `paths`.
+
+So `{unit: {paths, test_paths}, e2e: {paths}}` yields `unit.test_paths` alone, and `e2e`'s
+selectors are dropped: give `e2e` its own `test_paths` if its tests should count. This is
+deliberate rather than incidental. Group `paths` are *selectors* — the paths that make the
+group relevant — and on a real project they routinely include the implementation surface
+(keel's own `unit` group selects `src/**` as well as `tests/**`). Mixing the remaining
+groups' selectors back in would re-import exactly the surface `test_paths` exists to
+exclude, and a gate whose "test paths" include `src/**` is vacuous.
+
+A project that declares no path at all fails the gate **closed**, with a message naming
+the key to add: a gate that cannot look must not pass.
+
+`--tdd` selects the profile for a single run of `keel ship`, `keel plan` or
+`keel run-gates`. There is no `--no-tdd`: a project that configured the contract has said
+the contract is the policy, and a flag that switched it off from a command line would make
+it advisory. The resolved profile is published as `contract.implement_mode` by
+`keel plan`/`keel ship --json` (`mode`, `source`, `phases`, `gate`), the ledger records
+`run_context.implement_mode` plus one `run_context.implement_phases` entry per phase —
+each carrying that phase's commit **and the implementer that ran it**, so "the same
+provider wrote the tests and the implementation" is auditable rather than assumed
+(`keel ship --phase-implementer tests=<label>` records a phase whose implementer differed
+from `--implementer`). The closure comment says
+`Implement: TDD (tests <sha> by <implementer> → implementation <sha> by <implementer>)`.
+A `default` run records neither key's value — `implement_mode` is `null` and
+`implement_phases` is `[]` — and its closure comment is unchanged.
+
+Backbone step ids are unchanged: `tdd` is an s4 profile the way `compound` is a workflow
+profile. Setting it to `default` (or leaving it out) does not change `config_hash`.
+
+#### `loop`
+
+The **s4 iteration loop**. s4 has always been one implement pass: when the gates come back
+red after it, nothing in the backbone sends the work back to the seat that wrote it — the
+s9 fix loop reads *review findings*, and the s6 retry budget is for a branch that has
+already been pushed — so a red `make test` after a single pass fell to the host, or blocked
+an issue that was two iterations from green. `knobs.loop` keeps the implementer iterating,
+with **the gates as the judge**:
+
+```yaml
+knobs:
+  build_gate_cmd: "make test"
+  implement_mode: tdd          # optional; the loop composes with default and tdd alike
+  loop:
+    enabled: true              # defaults to true when the block is present
+    max_iterations: 3          # 1..10; 1 is the single pass keel has always run
+    gate_output_max_bytes: 16384
+```
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `enabled` | boolean | `true` when the block is present | `false` keeps the block's numbers and switches the loop off; `--loop` switches it back on for one run |
+| `max_iterations` | integer 1–10 | `3` | how many implement iterations s4 may run before a red gate run blocks the issue |
+| `gate_output_max_bytes` | integer ≥ 256 | `16384` | cap on each gate's output quoted into the next iteration's brief, in bytes of UTF-8 of gate text (the quote prefix and the escapes sit outside the count) |
+
+The contract, which `/keel:ship` drives and `keel loop brief` decides:
+
+- **Iteration 1 is the ordinary implement pass.** After each iteration the orchestrator
+  runs `keel run-gates --phase s4 --phases guard,test --defer-jury --json` inside the
+  worktree — it executes only the phases the loop judges and reports the plan beside the
+  outcomes — and the loop judges the guard- and test-phase gates of kind `command` or
+  built-in (`build`, `lint`, the
+  presets, any `tester`/`test` Lego of kind `command`). An agentic Lego, the jury and a
+  `pre-merge` gate are **deferred**: listed in the brief, never counted as green, never
+  holding the loop open — the review, test and merge phases decide them, and no iteration
+  convenes a panel (a `pre-merge` *command* gate is still executed by that run, so a slow
+  one costs every iteration). Green ends the loop; red starts iteration k+1.
+- **The completion criterion is the gate run, never the implementer's text.** A delegate
+  that says it is done with red gates is iteration k *failing*, not the loop *ending*. A loop
+  whose budget is spent with the gates still red is `budget-exhausted`: `keel loop brief`
+  exits non-zero and the issue is blocked, the same exit shape `keel fixloop brief` uses,
+  so a spent loop cannot be mistaken for an iteration to run.
+- **The brief is fixed; the evidence changes.** Iteration k+1 receives the same brief as
+  iteration 1 plus one appended section, **Gate output from iteration k**, rendered by core
+  from the gate outcomes — gate id, passed / failed / deferred, the finding text, each
+  gate's output truncated at `gate_output_max_bytes` with a visible marker (a line longer
+  than what is left is clipped, not dropped). Gate output is **quoted data**, never
+  instructions: every line is blockquoted, a leading `#` or `>` is escaped, the comment
+  delimiters are defanged and a line reading as one of the brief's trailer keys becomes
+  inline code, so a test's output cannot contribute a heading, a marker or a rule to the
+  prompt; the issue title is rendered as one backtick-free line for the same reason.
+- **Same seat, one commit per iteration.** The loop re-dispatches `assignment.implementer`
+  and never escalates — escalation is s9's ladder. Each iteration ends with one commit,
+  subject `loop(k/N): <issue title>`, so the ledger and the closure can point at what each
+  iteration changed. s10 squash-merges as always, so the base branch history is unaffected.
+- **Composes with `tdd`.** Under `implement_mode: tdd` the loop wraps **phase B only**:
+  phase A (the failing tests) is one commit and never iterates, because its red gate run is
+  its proof. The `tdd-order` gate reads the *first* implementation commit, so a looped
+  test-first branch passes it unchanged; its *other gates green* input is the judged gates
+  (guard and test), so a deferred `pre-merge` gate cannot turn it red on every iteration.
+  The published `wraps` says which phase the loop is around (`implement` or
+  `implementation`).
+- **Published and recorded.** `keel plan` / `keel ship --json` publish
+  `contract.implement_mode.loop` — `{enabled, max_iterations, gate_output_max_bytes, source,
+  wraps}` — beside the s4 profile. A `--live --append-ledger` run records
+  `run_context.implement_loop` with the policy and one entry per iteration
+  (`--loop-iteration K=SHA:pass|fail`: its commit, whether the gates passed after it, and
+  the implementer), and the closure comment renders
+  `Implement: loop (k/N iterations: <sha> red → <sha> green)` — after the TDD phases on a
+  test-first run. A project with neither the knob nor the flag publishes `enabled: false`,
+  records `implement_loop: null`, and its `config_hash` does not rotate.
+- **There is no `--no-loop`**, for the reason there is no `--no-tdd`: a project that
+  configured the contract has said the contract is the policy.
+
+Why this shape and not another: a host stop hook (the Ralph loop) exists in one host and
+leaves no record, while keel runs inside Claude Code, Codex, Gemini CLI and Antigravity
+through one backbone; s9 is post-PR and post-review with a seat ladder, and folding a
+compile error into it would spend review budget on what `make test` already said; and a
+third `implement_mode` value would make `tdd` and the loop mutually exclusive, when the
+loop against tests the implementer has to satisfy is the combination worth having.
 
 #### `gate_timeout_s`
 
@@ -435,6 +1233,28 @@ A nonzero exit that *does* carry a parseable report is a completed review — ai
 "request changes" that way — so its findings are used as-is. The test is deliberately
 "did we parse a verdict", not "was the exit code zero".
 
+#### `swarm_review_evidence`
+
+Whether `keel swarm-land` holds a cluster whose open PR does not pass the same pre-merge
+review-evidence verification `keel merge` enforces at s10 (#828). Default `true`.
+
+```yaml
+knobs:
+  swarm_review_evidence: false   # clusters land on CI alone — see below
+```
+
+Setting it `false` is the **explicit, logged** opt-out, not a quiet one: a live
+`swarm-land` prints `swarm review evidence: OFF by config` to stderr before landing
+anything, because skipping review has to be a visible configured exception rather than a
+driver's judgement call. `swarm-land` runs no CI of its own, so with the gate off a
+cluster lands unverified.
+
+Left on, the gate runs in dry runs too — the checks are read-only — so a preview reports
+`would hold: <reason>` per cluster instead of promising a landing a live run would refuse.
+A *live* wave with any held cluster exits non-zero. See
+the `keel swarm-land` section of [cli.md](cli.md)
+for what each hold reason means and [swarm.md](swarm.md) for the landing modes.
+
 ## `policy_pack`
 
 `policy_pack` is the durable project policy contract. It is data, not executable logic:
@@ -461,7 +1281,7 @@ back to packaged command prose.
 | `workflow_policies` | map command→object | | command-specific workflow policy such as posting mode, reviewer isolation, CI/fix-loop behavior, and completion markers |
 | `reports` | map name→string | | report destinations, paths, or issue prefixes |
 | `capture_redaction` | object | | additional project-owned deny regexes applied before capture artifacts are persisted |
-| `capture` | object | | post-merge capture enablement/mode; content and destinations remain extension-owned |
+| `capture` | object | | post-merge capture enablement/mode; content stays extension-owned, and so does the destination unless [`learning.sink`](#policy_packcapturelearningsink) names one |
 | `review` | object | | project-owned rubric additions and required PR/review sections |
 
 ## `automation`
@@ -526,6 +1346,12 @@ Map from label group to allowed label names. Common groups include `status`, `pr
 `role`, `type`, or command-specific groups. Triage, ship, regression, and closeout flows
 can use these vocabularies instead of hardcoding labels in command bodies.
 
+An entry may carry its group (`status: ["status:done"]`) or not (`role: ["core"]`); both
+name the label `status:done` / `role:core`. Declaring a label does not create it, and
+GitHub rejects a label that does not exist — [`keel doctor`](cli.md#keel-doctor)'s
+`policy_labels` check reports the declared labels missing from the repository, and
+`keel doctor <config> --fix` creates them.
+
 ### `policy_pack.status_transitions`
 
 Map from lifecycle transition name to the label or state target. Examples include
@@ -585,6 +1411,255 @@ Allowed skip reasons are `dry-run`, `deferred`, `merge-failed`, `recursion-guard
 fail-soft: the merge is not reverted, but the marker and ledger must record the applied,
 deferred, or allowed skipped state so `keel capture-verify` can surface gaps.
 
+#### `policy_pack.capture.learning.sink`
+
+The built-in capture extension. Declare a sink and an **applied** capture writes one
+Markdown file per run; omit it and keel records the marker and writes nothing, which is
+the behaviour every project had before it existed.
+
+```yaml
+policy_pack:
+  name: example
+  capture:
+    enabled: true
+    mode: extension
+    learning:
+      enabled: true
+      mode: create-learning
+      sink:
+        kind: markdown-dir
+        path: "~/knowledge/projects/{repo}/learnings"
+        filename: "{date}-pr{pr}-{slug}-{fingerprint}.md"
+```
+
+`learning.enabled` is not decoration, and neither is `mode`. Together they are what
+`learning_decision` reads, and **the decision is the gate**: a file is written for
+`create-learning` and for nothing else. `enabled` false, `enabled` omitted, `mode:
+defer` and `mode: marker-only` each declare that this project does not want a durable
+artifact, and a configured sink does not override that — it only says where one would
+go if the policy asked for it.
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `kind` | string | `markdown-dir` | the only kind. A directory of Markdown; keel never learns what reads it |
+| `path` | string | `.keel/learning` | destination directory; `~` and the placeholders below expand |
+| `filename` | string | `{date}-pr{pr}-{slug}-{fingerprint}.md` | file name template, same placeholders; **must contain `{fingerprint}`** |
+
+Placeholders are `{owner}`, `{repo}`, `{base_branch}`, `{date}`, `{pr}`, `{slug}` (the
+issue title, lowercased and hyphenated) and `{fingerprint}` (the first 12 characters of
+the learning's dedupe fingerprint). **The set is closed**: an unknown placeholder is
+rejected when the config is read, because its only other symptom would be a directory
+literally named `{repoo}`, created successfully, on a machine nobody is watching.
+
+**`filename` must contain `{fingerprint}`**, and that is refused at load time too. Date,
+PR and slug do not distinguish two lessons: a second `create-learning` run on the same
+pull request the same day is a *different* lesson with a different fingerprint, and
+without it in the name the write destroys the first one — leaving its ledger record
+pointing at a document that says something else. The dedupe cannot help there; it
+suppresses *identical* fingerprints, and these differ.
+
+Each file opens with front matter the read path relies on — `schema`, `title`,
+`description`, `repo`, `pr`, `issue`, `date`, `fingerprint`, `labels`, `changed_files` —
+then four fixed sections: **What changed**, **What we learned**, **What to do
+differently next time**, and **Files**. Content passes through
+[`policy_pack.capture_redaction`](#policy_packcapture_redaction) before it is written,
+which is the existing durable-artifact rule rather than a new one.
+
+**Files** is one Markdown link per `changed_files` entry, so a *link-following* reader — a
+knowledge-graph builder such as graphify, a wiki, an agent that reads an index and follows
+its links — gets the file ↔ lesson edge that a path inside a YAML list cannot give it. The
+link text is the repo-relative path; the destination depends on where the sink is:
+
+| sink | destination | example |
+|---|---|---|
+| inside the checkout (a relative `path` that stays under the root — the default) | relative to the document's own directory, POSIX separators, percent-encoded; the prefix is derived lexically from the normalised directory | `[src/keel/capture.py](../../src/keel/capture.py)` |
+| outside it (an absolute or `~` `path`, or a relative one that climbs out such as `../learnings`), owner + repo + head known | the file on GitHub at the merged head (`keel ship --head-sha`) | `[src/keel/capture.py](https://github.com/<owner>/<repo>/blob/<head-sha>/src/keel/capture.py)` |
+| outside it, any of those unknown | the bare path in a code span (fenced with a longer backtick run when the path carries one) — never a relative link that resolves to nothing | `` `src/keel/capture.py` `` |
+
+An empty `changed_files` renders the heading and `_No files recorded._`, so the document
+always has the same four sections. The front matter is not changed by the section: the
+`changed_files` list above the `---` is what keel's own reader matches on. A side effect
+worth knowing: `retrieve_relevant_learnings` scores a document by its text; the front-matter
+list already matched a query naming a file once, and the link matches it again (in its text,
+or in its destination when the text carries an escape), so such a lesson scores higher than
+the front matter alone gave it. Link text escapes the
+bracket pair, the backslash, the angle brackets, the emphasis and strikethrough delimiters,
+the ampersand and the backtick, so `__init__.py` reads as written rather than as a bold
+`init`.
+
+**A sink outside the checkout is single-machine, by design.** A relative `path` is
+recorded in the ledger relative to `--root`, so it means the same file in every clone. An
+absolute or `~` path is recorded as written — and the run ledger is *committed*, so that
+path travels to teammates and CI runners where it names nothing. keel says so rather than
+pretending otherwise: the capture block records `artifact_scope: repository | machine`
+beside `artifact`, `keel capture-verify` reports a **note** (`applied-elsewhere`, never a
+finding) for a `machine`-scoped artifact instead of the `applied-without-artifact` finding
+reserved for a file that is genuinely missing, and the duplicate-reuse never hands a later
+run a path only one host can read. A record written before that field existed is read from
+the path's own shape, so nothing already in a ledger changes meaning (#1185).
+
+**One directory, two readers.** The sink is a plain Markdown folder, so the same files serve
+a knowledge-graph builder and a note vault. graphify ingests the directory as documents: it
+draws reference edges between the Markdown documents it can link, and a link whose target
+is a code file counts as text — its semantic pass reads the whole file, front matter
+included, so the path reaches it either way and the link is for the readers that follow
+links. Obsidian opens a folder as a vault, shows the front matter as properties and
+draws the links in its graph view, on three conditions. The vault root must be the
+repository root or a directory above it, so an in-repo sink's relative links stay inside
+the vault. The sink must not sit under a dot-prefixed folder: vanilla Obsidian neither
+shows nor indexes one, so the default `.keel/learning/` is invisible to it — point `path`
+at a visible directory such as `docs/learnings/`, or install a community plugin that
+indexes hidden folders. And *Show all file types* (the setting formerly named *Detect all
+file extensions*, under *Files and links*) must be on, so a `.py` or `.yaml` target is
+indexed and the edge resolves — without it the link still renders, as an unresolved node —
+and such a target is an attachment in the graph view, drawn only while its *Attachments*
+filter is on. keel writes no `.obsidian/` folder and no wikilinks (the #1154 contract), so
+nothing in the vault is keel-specific.
+
+Three behaviours worth knowing:
+
+- **The path becomes `capture.artifact`.** That field is what makes an `applied` capture
+  provable rather than asserted — `keel capture-verify` reports `applied` with no
+  artifact as a finding — so a project with a sink stops passing `--capture-artifact`
+  by hand for a file it did not write.
+- **A `duplicate` learning decision writes nothing**, and records the earlier run's
+  file as its artifact. That is the fingerprint dedupe doing its job — but the run still
+  claims `applied`, and `applied` with no artifact is a finding, so the record points at
+  the file the run it duplicates wrote. Only when that path still resolves: a record can
+  name a file since deleted, or one written on another machine into a shared folder this
+  checkout cannot see, and an artifact that resolves to nothing is worse than none.
+- **A sink that cannot be written is fail-soft**, like every other capture failure: the
+  record becomes `skipped:capability-unavailable` and the merge is untouched.
+
+**keel writes the file; `keel capture-land` commits it.** With a relative `path` the
+file lands in the working tree, and an uncommitted one is invisible to the next
+worktree (s2 cuts it from `origin/<base_branch>`) and discarded by every CI runner.
+The capture contract says which case you are in: `durable_artifacts.commit_required`
+is true exactly when the path is inside the repository, and
+`durable_artifacts.land_command` then names the command that lands it.
+
+**An in-repo sink is durable, and the lesson merges with the work (#1203).** At s10, before
+the evidence gate, the ship runs
+`keel capture-land <project.yaml> --root . --pr <N> --onto <branch> --write`, which writes the
+lesson and commits it onto the **pull request's own branch** as its last commit. It records
+nothing: s11 appends the capture after the merge, naming that file with `--capture-artifact`,
+so a merge that fails leaves no `applied` claim behind. The squash carries it into
+`base_branch` together with the work it describes — so it cannot be forgotten, because there
+is no second thing to merge, and it never pushes to the base branch, so branch protection
+never sees it. The command builds its commit with plumbing and never checks a branch out:
+s2, `overnight` and `swarm` all run inside a worktree while the primary checkout holds
+`base_branch`, so `git switch <base>` there fails with *already used by worktree*. See
+[`cli.md`](cli.md) for the statuses and exit codes.
+
+**The review still holds for the head the landing produces.** Every review verdict and the
+gates-pass are pinned to a head, and the landing moves it by one commit. `keel evidence-verify`
+and `keel merge` therefore accept a pin for head **H** on head **H′** exactly when every
+commit between them has one parent, carries the `keel.capture-land.v1` marker line, and
+differs from its parent by **exactly one path inside this sink**. Any other commit
+invalidates the pins as it always did — so nothing but the landing may be added to a pull
+request after review. The exemption only exists for a project whose sink is inside the
+repository with capture enabled; for any other project a marker and a path grant nothing.
+
+**Why not a direct push to the base branch.** That was the first shape (#1163), and a base
+branch that requires pull requests refuses it — measured against this repository's `main` on
+2026-09-16: *GH006: Protected branch update failed … Changes must be made through a pull
+request … 13 of 13 required status checks are expected.* `capture-land` without `--onto`
+still does that, and still reports such a refusal as `failed` with the server's reason, not
+retried.
+
+**The command removes the untracked copy it landed.** git will not pull over an untracked
+file even when it is byte-identical to the one arriving — measured — so a lesson left in the
+working tree after landing would stop the next `git pull` there. The copy is removed only
+when its bytes equal the committed blob; one edited after it was written is kept, and a file
+the checkout tracks is never removed.
+
+**A path outside the checkout needs no landing step, and is durable on the machine
+that wrote it, and only
+there.** The recorded `capture.artifact` is that machine's absolute path, and the run
+ledger *is* committed — so a teammate or a CI runner reading the same record finds no
+file, the dedupe cannot point at it, and the run records `applied` with no artifact.
+An in-repo sink has no such problem: the path in the record is repo-relative and the
+file reaches the base branch in the same squash as the work, which is why it is the better
+default of the two.
+
+The default `.keel/learning/` is **not** runtime-ignored. Everything else keel writes
+under `.keel/` is disposable per-run state; learnings are the exception, because a
+learning git throws away is one the read path can never find.
+
+#### `policy_pack.capture.learning.source`
+
+The read side of capture. Where the **implement** and **review** briefs look for
+lessons this project already recorded, so an agent implementing issue N is shown that
+issue N-40 hit the same trap.
+
+```yaml
+policy_pack:
+  capture:
+    learning:
+      source:
+        - ".keel/learning"
+        - "~/knowledge/shared/learnings"
+```
+
+| | |
+|---|---|
+| type | string, or a list of strings |
+| default | the `sink`'s `path`, else `.keel/learning` |
+| placeholders | `{owner}`, `{repo}`, `{base_branch}` |
+
+**Unset is the useful default.** A project that turned the sink on already has exactly
+one place its learnings live, and a second setting to keep in step with the first is a
+second setting to get wrong. A list reads several directories — a repo-local folder plus
+a shared cross-project one — and the results are ranked together, so a shared folder's
+best lesson can outrank a weak local one.
+
+The placeholder set is closed and validated when the config is read, like the sink's.
+It is **smaller** than the sink's on purpose: `{pr}`, `{date}` and `{slug}` name one
+document, and a directory naming a single PR would retrieve that PR's lesson and nothing
+else. A sink path that uses one of them still works as a *sink*; as a default source it
+is skipped rather than read as a folder literally called `{pr}`.
+
+Before implementation, `keel plan --command ship --json` retrieves using the issue
+title, labels and repeatable `--declared-file PATH` arguments. Supply expected
+repo-relative paths even when no edits exist yet. The adapter carries the resulting
+`learnings.section` into both briefs. YAML block and flow lists are accepted in
+front matter; ordinary prose such as `Issue: a duplicate marker blocks the merge`
+remains searchable.
+
+**How a file is ranked.** A file with `keel.learning.v1` front matter is matched
+*exactly* on the `labels` and `changed_files` it declares, and **a declaration outranks
+any amount of prose**: a lesson naming `src/keel/ledger.py` is about a task touching
+`src/keel/ledger.py`, while one that merely says "ledger" eight times is worded like it.
+Text only orders files that declare the same number of matches — added into one total, a
+wordy rival overtook the declaring file on any query longer than a word or two.
+
+Text matching needs **two distinct query words**, not a point total. One is a
+coincidence — "keel" appears in every learning this repository writes — and repetition
+does not make it less of one, which is what a point floor could not express: at four
+points a single word said four times passed while a genuine three-word match in a short
+handwritten note did not. keel's own section headings are subtracted before counting, or
+an issue titled *"What changed in the merge window"* would match every document this
+sink has ever written.
+
+A file with no front matter is plain Markdown and ranks on its text alone, so learnings
+keel wrote and learnings a person wrote both reach a brief.
+
+**Only files that really live in the directory are read.** A lesson is text a brief quotes
+to an agent, and a symlink in the directory — `.keel/learning/x.md -> ~/.aws/credentials` —
+would make whatever it points at into one. A file whose real path is outside the directory
+is skipped; a link to another lesson in the same directory, or a directory reached through
+a link, still reads (#1219).
+
+At most five reach a brief, under a fixed **Relevant past learnings** heading, each as a
+title, one line and a path. The rendered section is capped so a brief cannot become an
+unbounded prompt.
+
+**No learnings means no section.** Not an empty heading, not a note that none were
+found — a project with an absent or empty directory gets exactly the brief it got before
+this existed, and pays one `is_dir()` for it. What *was* retrieved is recorded on the run
+ledger as `capture.retrieved`, a list of fingerprints, so a later run can tell a lesson
+nobody had from one that was put in front of the implementer and still not applied.
+
 ### `policy_pack.risk_rules`
 
 Array of high-risk policy rules. Each entry requires:
@@ -641,6 +1716,7 @@ Map from test group name to a test command contract. Each group requires `comman
 |---|---|---|---|
 | `command` | string | ✅ | runnable project test/audit command |
 | `paths` | string[] | | path selectors that make the group relevant |
+| `test_paths` | string[] | | where this group's **tests** live, when that differs from `paths`. Read by the [`implement_mode: tdd`](#implement_mode) `tdd-order` gate |
 | `reports` | string[] | | report paths or destinations produced by the command |
 | `required_capabilities` | string[] | | capabilities needed before the command can run |
 | `optional_capabilities` | string[] | | capabilities that may degrade when unavailable |

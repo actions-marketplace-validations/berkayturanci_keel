@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,13 @@ def build_ship_run_record(
     capture_status: str | None = None,
     capture_reason: str | None = None,
     capture_artifact: str | None = None,
+    #: The files the *capture* is about, when they are not the files this run's git
+    #: diff reported. On a post-merge s11 the local diff is empty and the sink reads
+    #: the PR's files from the host; the ledger has to hash the same list or the
+    #: dedupe compares two fingerprints of one lesson. ``None`` keeps
+    #: ``changed_files``, which is every other caller.
+    capture_changed_files: list[str] | tuple[str, ...] | None = None,
+    capture_retrieved: list[str] | tuple[str, ...] = (),
     capture_not_run: bool = False,
     issue_title: str | None = None,
     issue_labels: list[str] | tuple[str, ...] = (),
@@ -111,9 +119,14 @@ def build_ship_run_record(
     transport: str | None = None,
     profile: str | None = None,
     jury_mode: str | None = None,
+    jury_panel: dict[str, Any] | None = None,
+    implement_mode: str | None = None,
+    implement_phases: list[dict[str, Any]] | None = None,
+    implement_loop: dict[str, Any] | None = None,
     consent_status: str | None = None,
     consent_scopes: list[str] | tuple[str, ...] | None = None,
     run_controls: dict[str, Any] | None = None,
+    fix_attribution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one deterministic consumer-neutral ship ledger record."""
     return {
@@ -177,12 +190,21 @@ def build_ship_run_record(
             "implementer": implementer,
             "reviewers": list(reviewer_agents or ()),
             "tester": tester,
+            # Who took each s9 fix round, from the run-events file (#1016). An escalated
+            # round was not fixed by the implementer, and a closure comment rendered from
+            # `implementer` alone says it was.
+            "fixers": _fixers(fix_attribution),
+            "attribution_sentence": _attribution_sentence(fix_attribution),
         },
         "run_context": _run_context(
             host_agent=host_agent,
             transport=transport,
             profile=profile,
             jury_mode=jury_mode,
+            jury_panel=jury_panel,
+            implement_mode=implement_mode,
+            implement_phases=implement_phases,
+            implement_loop=implement_loop,
             consent_status=consent_status,
             consent_scopes=consent_scopes,
         ),
@@ -193,14 +215,36 @@ def build_ship_run_record(
             status=capture_status,
             reason=capture_reason,
             artifact=capture_artifact,
+            retrieved=capture_retrieved,
             title=issue_title,
             labels=issue_labels,
-            changed_files=changed_files,
+            # Not `changed_files`: `changes.files` above records what this run's git
+            # diff reported, which must stay None-preserving, while the capture
+            # fingerprint has to be the one the document on disk was written with.
+            changed_files=(
+                capture_changed_files if capture_changed_files is not None else changed_files
+            ),
             existing_records=existing_records or [],
             config=config,
             not_run=capture_not_run,
         ),
     }
+
+
+def _fixers(fix_attribution: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The per-round fixer records from a ``keel.fix-attribution.v1`` document."""
+    rounds = fix_attribution.get("rounds") if isinstance(fix_attribution, dict) else None
+    if not isinstance(rounds, list):
+        return []
+    return [item for item in rounds if isinstance(item, dict)]
+
+
+def _attribution_sentence(fix_attribution: dict[str, Any] | None) -> str | None:
+    """The rendered *"implemented by agy, fixed by opus in round 2"* phrase, when recorded."""
+    if not isinstance(fix_attribution, dict):
+        return None
+    sentence = fix_attribution.get("sentence")
+    return sentence if isinstance(sentence, str) and sentence.strip() else None
 
 
 def _declared_block(declared_files: list[str] | None) -> dict[str, Any] | None:
@@ -238,8 +282,12 @@ def _run_context(
     transport: str | None,
     profile: str | None,
     jury_mode: str | None,
+    jury_panel: dict[str, Any] | None,
     consent_status: str | None,
     consent_scopes: list[str] | tuple[str, ...] | None,
+    implement_mode: str | None = None,
+    implement_phases: list[dict[str, Any]] | None = None,
+    implement_loop: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the deterministic consumer-neutral preflight run-context block.
 
@@ -247,6 +295,10 @@ def _run_context(
     closure renderer can present ``unknown``/``none`` without a schema change.
     Consent is a small summary: a status and the approved mutation scopes,
     reusing the operator/approve-scope inputs already resolved by the caller.
+
+    ``implement_mode``/``implement_phases`` are the s4 profile (#1020). A ``default`` run
+    records ``None`` and an empty phase list, so a record written before the knob existed
+    reads identically to one written by a run that did not use it.
     """
     scopes = [str(scope) for scope in (consent_scopes or ()) if str(scope).strip()]
     return {
@@ -254,6 +306,20 @@ def _run_context(
         "transport": transport if _nonblank(transport) else None,
         "profile": profile if _nonblank(profile) else None,
         "jury_mode": jury_mode if _nonblank(jury_mode) else None,
+        # The panel-availability probe this run measured, or `None` when the tier
+        # never named a panel (#1066). Recorded so a reader of the ledger can tell
+        # a jury-reviewed change from one a host bench reviewed because the panel
+        # could not be staffed, without re-deriving it from a machine that has
+        # since changed.
+        "jury_panel": dict(jury_panel) if isinstance(jury_panel, dict) else None,
+        # The s4 profile and, under `tdd`, one record per phase — the ledger is where a
+        # closure comment and a later audit learn that this change was written test-first
+        # and which commit each half of s4 produced.
+        "implement_mode": implement_mode if _nonblank(implement_mode) else None,
+        "implement_phases": [dict(phase) for phase in implement_phases or ()],
+        # The s4 iteration loop (#1165): its policy and one record per iteration, or
+        # `None` for a run that neither configured nor recorded one.
+        "implement_loop": dict(implement_loop) if isinstance(implement_loop, dict) else None,
         "consent": {
             "status": consent_status if _nonblank(consent_status) else None,
             "scopes": scopes,
@@ -302,6 +368,16 @@ def latest_ship_run_for_pr(
 
     Records are appended in chronological order, so the last match is the most
     recent ship run for that PR. Returns ``None`` when no record matches.
+
+    **Scoped by pull request, not by head, and a caller that gates on the record must
+    say so itself.** A pull request outlives its heads, so the record this returns may
+    have been written for a commit that is no longer the head — right for a reader
+    asking "what happened on this PR" (capture health, scope verification), wrong for
+    anything a merge decision hangs on. The two callers that gate check the head
+    themselves: :func:`gates_pass_for_head` selects on ``git.head_sha`` here, and
+    :func:`keel.juryavail.shipped` refuses a record whose head is not the one being
+    verified — without which an earlier head's fallback weakened the current head's
+    contract (#1068 round 2).
     """
     match: dict[str, Any] | None = None
     for record in records:
@@ -359,6 +435,7 @@ def gates_pass_for_head(
     records: list[dict[str, Any]],
     pr_number: int,
     head_sha: str,
+    covered_heads: Collection[str] = (),
 ) -> tuple[bool, dict[str, Any] | None]:
     """Find a passing gates run recorded against ``head_sha`` for ``pr_number``.
 
@@ -375,9 +452,19 @@ def gates_pass_for_head(
     the superseded pass authorize the merge and the later red never be consulted:
     a fail-open in exactly the gate that exists to hold the merge closed. Only the
     most recent verdict for the head counts.
+
+    ``covered_heads`` are heads the current one descends from by capture commits alone
+    (#1203): the learning lands on the pull request's own branch after the gates ran, so
+    the gates-pass is recorded against a head the branch has moved one lesson past. A
+    record for one of them counts, and **latest-wins still holds across the whole set** —
+    a red record for any of them after a green one is the verdict. The set is produced by
+    `capture.capture_only_descent` and nothing else, so it admits a markdown file inside
+    the sink, never code; CI still runs on the new head and `keel merge` still requires
+    that rollup to be green.
     """
     if not isinstance(head_sha, str) or not head_sha.strip():
         return False, None
+    accepted = {head_sha, *covered_heads}
     latest: dict[str, Any] | None = None
     for record in records:
         if record.get("record_type") != RECORD_TYPE_SHIP_RUN:
@@ -388,7 +475,7 @@ def gates_pass_for_head(
             continue
         git = record.get("git")
         record_sha = git.get("head_sha") if isinstance(git, dict) else None
-        if record_sha != head_sha:
+        if record_sha not in accepted:
             continue
         latest = record
     if latest is None or not record_gates_passed(latest):
@@ -396,9 +483,33 @@ def gates_pass_for_head(
     return True, latest
 
 
+def _latest_per_pr(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One record per pull request — the last — keeping records that name none.
+
+    A pull request has one capture, and since #1157 it can leave more than one
+    marked record: the writer's clash is keyed by ``(pull request, head)``, so a
+    superseded head's marker survives beside the merged head's. Counting rows
+    rather than pull requests then reported one merged pull request twice —
+    ``applied: 1, skipped: 1`` for a single capture — in morning, wrap and status.
+    Insertion order is preserved so these readers still list captures in the order
+    the ledger recorded them.
+    """
+    latest: dict[int, dict[str, Any]] = {}
+    unkeyed: list[dict[str, Any]] = []
+    for record in records:
+        pull_request = record.get("pull_request")
+        number = pull_request.get("number") if isinstance(pull_request, dict) else None
+        if isinstance(number, int):
+            latest[number] = record
+        else:
+            unkeyed.append(record)
+    keep = list(latest.values()) + unkeyed
+    return [record for record in records if any(record is kept for kept in keep)]
+
+
 def capture_health_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     """Summarize capture visibility for morning, wrap, status, and ledger readers."""
-    merged_records = [r for r in records if _is_merged_ship_run(r)]
+    merged_records = _latest_per_pr([r for r in records if _is_merged_ship_run(r)])
     items = [_capture_health_item(record) for record in merged_records]
     counts = {
         "applied": 0,
@@ -485,21 +596,72 @@ def _capture_marker(record: dict[str, Any]) -> str | None:
     return marker if isinstance(marker, str) and marker.strip() else None
 
 
+def record_head_sha(record: Mapping[str, Any]) -> str | None:
+    """The head a ship_run record was written for, or ``None`` when it names none."""
+    git = record.get("git")
+    head = git.get("head_sha") if isinstance(git, Mapping) else None
+    return head.strip() if isinstance(head, str) and head.strip() else None
+
+
+def capture_marker_for_head(
+    records: list[dict[str, Any]],
+    *,
+    pr_number: int | None,
+    head_sha: str | None,
+) -> dict[str, Any] | None:
+    """The recorded capture marker for this ``(pull request, head)``, if any.
+
+    The same rule :func:`existing_capture_marker` enforces, asked **before** a
+    record exists. The clash is keyed on the pair and nothing else, so a caller
+    about to do durable work for this run can find out whether its append will
+    land — a learning file written ahead of an append that then no-ops is a
+    document on disk that no ledger record will ever point at.
+    """
+    if not isinstance(pr_number, int):
+        return None
+    head = head_sha.strip() if isinstance(head_sha, str) and head_sha.strip() else None
+    for existing in records:
+        if existing.get("record_type") != RECORD_TYPE_SHIP_RUN:
+            continue
+        other = existing.get("pull_request")
+        if (other.get("number") if isinstance(other, dict) else None) != pr_number:
+            continue
+        if record_head_sha(existing) != head:
+            continue
+        if _capture_marker(existing) is not None:
+            return existing
+    return None
+
+
 def existing_capture_marker(
     records: list[dict[str, Any]], record: dict[str, Any]
 ) -> dict[str, Any] | None:
     """The already-recorded capture marker ``record`` would duplicate, if any.
 
-    Exactly one capture marker per merged PR is an invariant that was only ever
-    *detected*, never prevented: :func:`keel.capture.verify_session` refuses the whole
-    session on a second one ("multiple capture markers found for merged PR"),
-    ``capture-reconcile`` returns ``blocked`` with no actions to offer, and nothing in
-    this module can remove a line — so the only exit is editing the ledger by hand.
+    One capture marker per **(pull request, head)**, enforced at write time. It was
+    once only *detected*, and only afterwards: :func:`keel.capture.verify_session`
+    refuses the whole session on a second one ("multiple capture markers found for
+    merged PR"), ``capture-reconcile`` returns ``blocked`` with no actions to offer,
+    and nothing in this module can remove a line — so the recovery was editing the
+    ledger by hand, which is forging audit history to make a gate pass.
 
     Re-running the same append is the most natural thing to do after a crash mid-s11,
     which made the obvious recovery the very action that bricks the run. Checking here
     costs one pass over records the caller already holds. Returns the conflicting
     record so the caller can name it; ``None`` when the append is new.
+
+    **Scoped to the head, because that is how the merge gate reads it** (#1157). Keyed
+    by pull request alone, this refused every later head once *any* record carried a
+    marker — including the very first run, red. :func:`gates_pass_for_head` and
+    :func:`keel.juryavail.is_ship_run_for_head` then asked for a passing record on the
+    *current* head, which no run was any longer allowed to write. A pull request whose
+    first ship run failed became permanently unmergeable, and the documented exit was
+    editing an append-only audit ledger to make a gate pass, which is the one action
+    this design exists to prevent. The writer now keys the record the way every reader
+    that gates does: retrying the same head still clashes, a new head is a new run.
+
+    A record naming no head is compared to other records naming no head — the same
+    rule, applied to the value they have, rather than an exemption from it.
     """
     if _capture_marker(record) is None:
         return None
@@ -507,15 +669,7 @@ def existing_capture_marker(
     pr = pull_request.get("number") if isinstance(pull_request, dict) else None
     if not isinstance(pr, int):
         return None
-    for existing in records:
-        if existing.get("record_type") != RECORD_TYPE_SHIP_RUN:
-            continue
-        other = existing.get("pull_request")
-        if (other.get("number") if isinstance(other, dict) else None) != pr:
-            continue
-        if _capture_marker(existing) is not None:
-            return existing
-    return None
+    return capture_marker_for_head(records, pr_number=pr, head_sha=record_head_sha(record))
 
 
 def append_record(path: str | Path, record: dict[str, Any]) -> None:

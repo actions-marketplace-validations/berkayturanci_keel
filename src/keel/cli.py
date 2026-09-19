@@ -10,16 +10,21 @@ Subcommands
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
+import shlex
+import shutil
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from . import (
     __version__,
     activity,
+    agents,
     api_delegate,
     artifacts,
     branchscope,
@@ -32,9 +37,12 @@ from . import (
     consent,
     consentverify,
     contracts,
+    delegate,
+    delegaterun,
     doctor,
     dryrunverify,
     evidence,
+    fixloop,
     flows,
     gates,
     git,
@@ -43,10 +51,14 @@ from . import (
     guard,
     install,
     jury,
+    juryavail,
     ledger,
     lock,
+    loop,
     mergeverify,
     project_commands,
+    providerprobe,
+    redaction,
     review,
     runcontrols,
     runtime,
@@ -57,16 +69,37 @@ from . import (
     status,
     stepverifier,
     swarm,
+    tdd,
+    team,
     window,
+    wizard,
+    wizardrun,
     workspace,
 )
 from . import config as cfg
 from . import findings as fnd
 from . import orchestrator as orch
+from . import providers as providers_mod
 from .extensions import ExtensionError, load_extensions
-from .gates import GateSpec
+from .gates import GateOutcome, GateSpec
 from .model import DEFAULT_GATE_TIMEOUT_S, DEFAULT_JURY_TIMEOUT_S
 from .runner import command_gate_runner, run_argv
+
+#: Help text for the per-run ``--loop`` flag (#1165), shared by ``ship`` and ``plan``.
+_LOOP_FLAG_HELP = (
+    "run s4 as a bounded, gate-verified iteration loop for this run (knobs.loop): after "
+    "each implement iteration the command gates run; green ends the loop, red starts the "
+    "next iteration with the same brief plus the gate output, up to max_iterations. Wraps "
+    "tdd phase B under implement_mode: tdd"
+)
+
+#: Help text for the per-run ``--tdd`` flag, shared by ``ship``, ``plan`` and
+#: ``run-gates`` so the three cannot describe the same profile differently.
+_TDD_FLAG_HELP = (
+    "run s4 test-first for this run (implement_mode: tdd): a test-only commit carrying "
+    "the issue's acceptance criteria, then the implementation, verified by the "
+    "tdd-order gate at s8"
+)
 
 
 def _gate_status(outcome) -> str:
@@ -83,25 +116,140 @@ def _gate_status(outcome) -> str:
     return "TIMEOUT" if outcome.timed_out else "FAIL"
 
 
+#: Sentinel for a `--phases` value naming a phase keel has no gates for. Distinct from
+#: `None`, which means "no scope: run every planned phase".
+_PHASE_SCOPE_INVALID = frozenset({"\x00invalid"})
+
+
+def _run_gate_phases(value: str | None) -> frozenset[str] | None:
+    """Parse ``--phases``: ``None`` for no scope, a set, or :data:`_PHASE_SCOPE_INVALID`.
+
+    Refused rather than silently narrowed, because a typo that scoped the run to nothing
+    would report every gate ``not_run`` and exit 0 — a green answer from a run that
+    checked nothing, which is the shape `--require-armed` exists to refuse elsewhere.
+    """
+    if value is None:
+        return None
+    names = frozenset(part.strip() for part in value.split(",") if part.strip())
+    if not names or not names <= frozenset(gates.BACKBONE_PHASES):
+        return _PHASE_SCOPE_INVALID
+    return names
+
+
 def _gate_runner(
-    root: str, diff_text: str, *, jury_mode: str = "gating", timeout: int = DEFAULT_GATE_TIMEOUT_S
+    root: str,
+    diff_text: str,
+    *,
+    jury_mode: str = "gating",
+    timeout: int = DEFAULT_GATE_TIMEOUT_S,
+    run_jury: bool = True,
+    phases: frozenset[str] | None = None,
 ):
     """A gate runner that handles command gates plus the ``jury`` built-in (on the diff).
+
+    ``phases`` scopes the run the way ``run_jury`` scopes the panel: a spec whose phase
+    is outside the set is reported ``not_run`` and its command is never executed. The s4
+    loop judges only the guard and test phases (:data:`keel.loop.JUDGED_PHASES`) and
+    defers the rest, but without this the runner still *paid* for a ``pre-merge`` Lego on
+    every iteration and its red result was what made ``run-gates`` exit non-zero on an
+    otherwise green one (#1172). ``None`` runs every planned phase, which is s8.
 
     ``timeout`` is the project's ``knobs.gate_timeout_s``; it covers any command spec
     that reached the runner without a resolved per-gate limit. The jury builtin reads
     its own budget off ``spec.timeout``, which ``plan_gates`` resolves from
-    ``knobs.jury_timeout_s``.
+    ``knobs.jury_timeout_s``. With ``run_jury`` false the jury is reported ``not_run``,
+    exactly as the command runner reports an agentic gate: the s4 loop's per-iteration
+    gate run (#1165) must not dispatch a cross-vendor panel on every iteration, and a
+    seat nobody staffed is never recorded as a pass.
     """
     commands = command_gate_runner(root, timeout=timeout)
 
     def run(spec: GateSpec):
+        # Same shape the jury takes below, and the same reason: a gate this run is not
+        # judging must be reported, never executed, and never recorded as a pass.
+        if phases is not None and spec.phase not in phases:
+            return True, [], False, True
         if spec.kind == "builtin" and spec.id == "jury":
+            if not run_jury:
+                return True, [], False, True
             jury_limit = spec.timeout if spec.timeout is not None else DEFAULT_JURY_TIMEOUT_S
             return jury.run_gate(diff_text, cwd=root, mode=jury_mode, timeout=jury_limit)
         return commands(spec)
 
     return run
+
+
+def _tdd_order_outcome(
+    spec: GateSpec,
+    config: cfg.ProjectConfig,
+    root: str,
+    *,
+    gates_green: bool,
+) -> tuple[GateOutcome, tdd.OrderResult]:
+    """Evaluate the pure ``tdd-order`` gate: git through the seam, the decision in core.
+
+    The only I/O is two git reads — :func:`_ship_base_ref`'s exact lookup of the base ref,
+    then one :func:`keel.git.commit_log`; parsing the log, matching the paths and deciding
+    the verdict all live in :mod:`keel.tdd`, which is why the gate is unit-tested offline
+    against commit lists instead of against a repository.
+
+    **The range starts at the base ref every other gate diffs against** —
+    :func:`_ship_base_ref`, not the bare local branch. keel cuts its worktrees from
+    ``origin/<base>`` while the primary checkout's local branch lags, and ``<base>..HEAD``
+    then begins below the branch point: somebody else's base commit became "this
+    implementer's first commit", and a test-first branch was blocked for touching
+    ``src/`` first (measured, #1227). ``--first-parent`` cannot drop such a commit, because
+    the branch was cut on top of it. The bare name is also a short one, which a tag called
+    ``main`` outranks — the class #1220 closed for the diff base.
+    """
+    result = tdd.check_order(
+        tdd.parse_commits(
+            git.commit_log(_ship_base_ref(config.base_branch, root), "HEAD", cwd=root)
+        ),
+        test_globs=tdd.test_globs(config.policy_pack),
+        gates_green=gates_green,
+    )
+    findings = [] if result.ok else [fnd.Finding("major", result.message, spec.id)]
+    outcomes = gates.run_gates((spec,), lambda _spec: (result.ok, findings))
+    return outcomes[0], result
+
+
+def _run_planned_gates(
+    specs,
+    runner,
+    *,
+    config: cfg.ProjectConfig,
+    root: str,
+    phases: frozenset[str] | None = None,
+) -> tuple[list[GateOutcome], tdd.OrderResult | None]:
+    """Run the planned gates, evaluating the deferred ``tdd-order`` gate last.
+
+    Returns the outcomes plus the commit-order result, which the ledger records as the
+    run's two s4 phases. ``None`` when the run is not in ``tdd`` mode — there were no
+    phases, which is not the same as phases nobody could identify.
+    """
+    now, later = gates.split_deferred(specs)
+    outcomes = gates.run_gates(now, runner)
+    if not later:
+        return outcomes, None
+    # The other gates' verdict *is* the "last gate run is green" half of the contract:
+    # a branch whose tests were committed first and are still red has not finished s4.
+    # "The other gates" are the ones s4 can make green — the guard- and test-phase gates
+    # (#1165): a pre-merge gate needs the pull request and says nothing about the tests
+    # the branch was written against, and it would otherwise turn the order gate red on
+    # every loop iteration of a project that carries one.
+    # `tdd-order` is evaluated here rather than through the runner, so the runner's phase
+    # scope does not reach it. Apply the same test: a scope that excludes its phase must
+    # report it `not_run`, like any other gate outside the run (#1172).
+    if phases is not None and later[0].phase not in phases:
+        outcomes.append(gates.run_gates((later[0],), lambda _spec: (True, [], False, True))[0])
+        return outcomes, None
+    phase_of = {spec.id: spec.phase for spec in now}
+    judged = [o for o in outcomes if phase_of.get(o.gate) in loop.JUDGED_PHASES]
+    green = not fnd.summarize(gates.collect_findings(judged)).blocked
+    outcome, result = _tdd_order_outcome(later[0], config, root, gates_green=green)
+    outcomes.append(outcome)
+    return outcomes, result
 
 
 def _cmd_version(args: argparse.Namespace) -> int:
@@ -234,8 +382,9 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         return 1
 
     loaded, problems = load_extensions(config, args.root, strict=False)
+    mode = tdd.resolve_mode(config.knobs.implement_mode, flag=args.tdd)
     try:
-        plan = orch.build_plan(config, loaded)
+        plan = orch.build_plan(config, loaded, implement_mode=mode.name)
     except gates.GateError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -273,13 +422,37 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         operator=approval_operator,
         target=args.target,
         reviewer_override=args.reviewers,
+        review_tier=args.review_tier,
         review_comments=args.review_comments,
         jury=args.jury,
         no_jury=args.no_jury,
         jury_advisory=args.jury_advisory,
         issue_title=args.issue_title,
         issue_body=args.issue_body,
+        # Retrieved here as well as in `_cmd_ship`: s4 composes the implement
+        # brief from what `keel plan` printed, long before s5 runs `keel ship`,
+        # so the brief this feature exists for saw nothing when only ship had it.
+        learnings=_retrieve_learnings(args, config, None),
         issue_labels=_issue_labels(args),
+        role=args.role,
+        delegate=args.delegate,
+        review_delegates=tuple(args.review_delegate),
+        tdd_override=args.tdd,
+        loop_override=getattr(args, "loop", False),
+        loop_budget=getattr(args, "max_iterations", None),
+        # The panel-availability probe for the tier this contract is being built at
+        # (#1066) — the same measurement `_review_assignment` hands the other six
+        # surfaces, so `keel plan` cannot publish a panel the run it plans could not
+        # staff.
+        jury_availability=providerprobe.jury_availability(
+            config, tier=args.review_tier, profile=args.team_profile
+        ),
+        # `plan` accepts these, so `plan` has to resolve them. Accepting a flag and then
+        # not threading it published an assignment that disagreed with the one `ship`
+        # renders from the identical command line — two answers to the one question this
+        # resolver exists to answer once (#1014).
+        effort=args.effort,
+        team_profile=args.team_profile,
     )
     consent_ok, consent_message = consent.assert_operator_consent(contract["operator_consent"])
     if args.json:
@@ -323,8 +496,9 @@ def _cmd_run_gates(args: argparse.Namespace) -> int:
     for prob in problems:
         print(f"  ! extension not loaded: {prob}", file=sys.stderr)
 
+    mode = tdd.resolve_mode(config.knobs.implement_mode, flag=args.tdd)
     try:
-        specs = gates.plan_gates(config, loaded)
+        specs = gates.plan_gates(config, loaded, implement_mode=mode.name)
     except gates.GateError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -338,10 +512,35 @@ def _cmd_run_gates(args: argparse.Namespace) -> int:
     if evaluation.missing_optional:
         print(evaluation.render(), file=sys.stderr)
 
-    diff_text = git.diff(config.base_branch, "HEAD", cwd=args.root)
-    outcomes = gates.run_gates(
+    # The same helper `keel ship` uses. `_gate_runner` runs the **jury** on this diff,
+    # so a second spelling meant the same jury on the same branch at the same head got
+    # different input depending on which command invoked it: after a base merge,
+    # `main...HEAD` carries the commits that merge brought in and `origin/main...HEAD`
+    # does not (#1184).
+    phases = _run_gate_phases(args.phases)
+    if phases is _PHASE_SCOPE_INVALID:
+        print(
+            f"--phases: unknown phase in {args.phases!r}; "
+            f"choose from {', '.join(gates.BACKBONE_PHASES)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    base_ref = _ship_base_ref(config.base_branch, args.root)
+    diff_text = git.diff(base_ref, "HEAD", cwd=args.root)
+    outcomes, _tdd_result = _run_planned_gates(
         specs,
-        _gate_runner(args.root, diff_text, jury_mode="gating", timeout=config.knobs.gate_timeout_s),
+        _gate_runner(
+            args.root,
+            diff_text,
+            jury_mode="gating",
+            timeout=config.knobs.gate_timeout_s,
+            run_jury=not args.defer_jury,
+            phases=phases,
+        ),
+        config=config,
+        root=args.root,
+        phases=phases,
     )
     verdict = fnd.summarize(gates.collect_findings(outcomes))
     # Stamp *after* the verdict exists, and carry it. Stamping on reach alone recorded
@@ -357,6 +556,19 @@ def _cmd_run_gates(args: argparse.Namespace) -> int:
         issue=getattr(args, "issue", None),
         pr=getattr(args, "pull_request", None),
     )  # the run reached the test gate (s8)
+    if args.json:
+        # The machine report the s4 loop reads (#1165): the plan beside the outcomes, so
+        # `keel loop brief` can tell a command gate from an agentic or pre-merge one.
+        report = {
+            "schema_version": "keel.run-gates.v1",
+            "phase": args.gate_phase,
+            "jury_run": not args.defer_jury,
+            "gates": [contracts.gate_as_dict(spec) for spec in specs],
+            "gate_outcomes": [contracts.gate_outcome_as_dict(o) for o in outcomes],
+            "blocked": verdict.blocked,
+        }
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 1 if verdict.blocked else 0
     for o in outcomes:
         # A timeout still blocks; it is labelled apart so a slow host does not read
         # as a broken test (and a hanging command still reads as red).
@@ -600,11 +812,13 @@ CHECKPOINT_MERGE_STEP = "s10"
 #: three real outcomes, which broke two things (#945):
 #:
 #: * a **rebased PR could never be merged again**. The gates record is keyed on
-#:   ``(pr, head_sha)`` so a new head needs a new record, but
-#:   :func:`keel.ledger.existing_capture_marker` refuses a second record carrying
-#:   a marker for the same PR — and every accepted status produced one. Both
-#:   guards are right; the record just had no way to satisfy one without
-#:   violating the other.
+#:   ``(pr, head_sha)`` so a new head needs a new record, and
+#:   :func:`keel.ledger.existing_capture_marker` refused a second record carrying
+#:   a marker for the same PR *whatever its head* — and every accepted status
+#:   produced one. Both guards were right; the record had no way to satisfy one
+#:   without violating the other. #1157 keys the clash on ``(pr, head_sha)`` too,
+#:   so that particular deadlock is gone and this flag is no longer the only way
+#:   out of it. The reason below is the one that remains, and it is enough.
 #: * a record **asserted a capture that never happened**. A real status is read
 #:   back as a capture outcome — including by
 #:   :func:`keel.ledger._is_merged_ship_run`, which treats one as evidence the PR
@@ -845,9 +1059,11 @@ def _cmd_merge(args: argparse.Namespace) -> int:
             payload["window"] = {"bypassed": True, "reason": "hotfix"}
 
         try:
-            snapshot = _merge_snapshot(args.pr, cwd=args.root)
-        except ValueError as exc:
+            transport, snapshot = _merge_snapshot_over_best_transport(args)
+        except _SnapshotFailed as exc:
+            payload["transport"] = exc.transport
             return _finish_merge(args, payload, str(exc), code=1)
+        payload["transport"] = transport
         payload["ci"] = snapshot["ci"]
         if snapshot["merge_state"] not in {"CLEAN", "HAS_HOOKS", "UNKNOWN"}:
             return _finish_merge(
@@ -859,6 +1075,22 @@ def _cmd_merge(args: argparse.Namespace) -> int:
 
         evidence_payload = _verify_merge_evidence(args, config, phase=evidence.PHASE_PRE_MERGE)
         payload["evidence"] = evidence_payload
+        # **One head, or no merge.** The snapshot and the evidence load each read the pull
+        # request's head, and what follows is judged across the two reads: the CI rollup and
+        # the merge pin come from the first; the verdicts, the changed files and the heads a
+        # capture landing covers come from the second. A push between them had the covered
+        # set of one head admit the gates-pass lookup for another — and that other head was
+        # the one merged. Both reads must name the same commit, and it must be a commit.
+        snapshot_head = snapshot["head_sha"]
+        if not snapshot_head or evidence_payload.get("head_sha") != snapshot_head:
+            return _finish_merge(
+                args,
+                payload,
+                "the pull request's head changed while it was being checked "
+                f"({snapshot_head or 'unreadable'}, then "
+                f"{evidence_payload.get('head_sha') or 'unreadable'}); run keel merge again",
+                code=1,
+            )
         if ci_state == "no-checks":
             # ship.md's rule, now enforced in core rather than by adapter prose: an
             # empty check set is acceptable only when every changed path is a docs
@@ -877,7 +1109,8 @@ def _cmd_merge(args: argparse.Namespace) -> int:
             missing = ", ".join(evidence_payload["verification"]["missing"])
             return _finish_merge(args, payload, f"missing evidence: {missing}", code=1)
 
-        head_sha = snapshot["head_sha"]
+        # A string from here on: the evidence load types its head, and the two are equal.
+        head_sha: str = evidence_payload["head_sha"]
         gates_run_id: str | None = None
         if args.hotfix:
             payload["gates_sha"] = {"bypassed": True, "reason": "hotfix", "head_sha": head_sha}
@@ -887,7 +1120,14 @@ def _cmd_merge(args: argparse.Namespace) -> int:
             except ledger.LedgerError as exc:
                 return _finish_merge(args, payload, f"invalid run ledger: {exc}", code=1)
             matched, record = ledger.gates_pass_for_head(
-                gates_records, args.pr, head_sha if isinstance(head_sha, str) else ""
+                gates_records,
+                args.pr,
+                head_sha,
+                # The same set the evidence gate just proved, not a second walk: two reads
+                # of one history could disagree, and the merge would then be judged by the
+                # more permissive of them. Walked from this very head, which the check
+                # above is what guarantees.
+                covered_heads=tuple(evidence_payload.get("covered_heads") or ()),
             )
             gates_run_id = record.get("run_id") if record else None
             payload["gates_sha"] = {
@@ -913,11 +1153,24 @@ def _cmd_merge(args: argparse.Namespace) -> int:
 
         if args.dry_run:
             return _finish_merge(args, payload, "dry-run: merge not performed", code=0)
-        merged = github.merge_pr(args.pr, method=args.method, cwd=args.root)
+        # Pinned on both wires: every check above was of this head, so GitHub is asked to
+        # merge this head or nothing — `sha` over REST, `--match-head-commit` over GraphQL.
+        merged = (
+            github.rest_merge_pr(args.pr, method=args.method, head_sha=head_sha, cwd=args.root)
+            if transport == TRANSPORT_REST
+            else github.merge_pr(args.pr, method=args.method, head_sha=head_sha, cwd=args.root)
+        )
         payload["merged"] = merged.ok
         payload["merge_output"] = merged.output
         if not merged.ok:
             return _finish_merge(args, payload, "gh merge failed", code=1)
+        # **The landed SHA, from the call that landed it.** The merge response names the
+        # commit; reading it back off the pull request is a second question whose answer
+        # can still be the speculative test merge. `_merge_drift_report` already prefers
+        # `--merge-sha`, so this is the same seam an operator uses.
+        landed = github.rest_json(merged) if transport == TRANSPORT_REST else None
+        if isinstance(landed, dict) and isinstance(landed.get("sha"), str):
+            args.merge_sha = landed["sha"]
         _autostamp(
             config,
             args.root,
@@ -933,7 +1186,7 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         # #934 — which is how a stale-base squash reverted #811 on main and stayed
         # there for six days. It runs here rather than in a later job because the
         # answer is most actionable in the same breath as the merge.
-        verification = _merge_drift_report(args)
+        verification = _merge_drift_report(args, transport=transport)
         payload["merge_verification"] = verification
         if mergeverify.is_drift(verification):
             # Distinct from 1. The merge *succeeded* — reporting failure would read
@@ -943,6 +1196,186 @@ def _cmd_merge(args: argparse.Namespace) -> int:
         return _finish_merge(args, payload, "merged", code=0)
     finally:
         lock.release_resource(_lock_root(args.root), "merge", owner=owner, best_effort=True)
+
+
+def _shipped_jury_availability(
+    artifacts: dict[str, Any],
+    ledger_record: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """What the *ship* measured about the panel, for a surface that only verifies (#1066).
+
+    ``None`` when nothing pins this head, which leaves the caller to probe exactly as it
+    did before.
+
+    A machine-dependent probe is right for a surface about to *dispatch* a panel. It is
+    wrong for one checking evidence somebody else produced: ``keel evidence-verify`` and
+    ``keel merge`` run wherever CI puts them, so a change juried on a workstation and
+    checked on a bare runner had its own contract quietly rewritten — the panel item dropped
+    from the required set and ``review-verdict-1..3`` demanded instead, holding it to a host
+    bench nobody ever sat. Re-measuring answers "could *this* machine convene a panel"; the
+    question is "what was this change reviewed by".
+
+    **This function is I/O only, and deliberately holds no rule of its own.** Which source
+    wins, what a blank head does, what a same-head record that says nothing about a panel
+    means — all of it is :func:`keel.juryavail.pin`, the single authority on "what did this
+    run ship under". Read that docstring; #1068 rounds 2–5 were each a rule written in one
+    place and forgotten in its twin, and the last of them was the *precedence* living in
+    the order of two ``if``-statements right here, where no reader thought to look for it.
+
+    Everything below is the reading of the three artifacts that authority ranks:
+
+    * the ``ship_run`` ledger entry for this pull request (already loaded by the caller,
+      because one surface treats an unreadable ledger as fatal and the other does not);
+    * the panel decision the run recorded in the closure comment it posted on the pull
+      request (:func:`keel.evidence.shipped_panel_decision`) — the same statement as the
+      ledger's, from the copy that travels, which is what makes the ledger's precedence
+      mean anything on a host that cannot read ``.keel/state/`` (#1068 round 6);
+    * whether a head-pinned jury verdict is posted on the pull request.
+
+    The verdict is asked for only against a pinnable head:
+    :func:`keel.evidence.panel_verdict_posted` documents that as its precondition, since it
+    goes through :func:`keel.evidence._matches_head`, which reads a blank head as *no head
+    filter* — right for counting evidence, wrong for a pin. Both sites ask the one
+    predicate, :func:`keel.juryavail.is_pinnable_head`, so hardening it hardens both, and
+    :func:`keel.juryavail.pin` refuses a blank head again on its own account rather than
+    trusting this caller to have done it. The closure-comment read needs no such guard:
+    it matches the marker's ``head`` against this one, so a blank head matches nothing.
+
+    Trust is the evidence module's own rule at all three sources, and deliberately the
+    same one: keel posts the closure comment on the operator's behalf, which is exactly the
+    authority a posted jury verdict has — no more. An untrusted author's comment may not
+    relax the contract in either shape.
+    """
+    # **The current head first, then each head it covers** (#1203). The panel decision is
+    # a pin, and a pin removes requirements — so it keeps `juryavail`'s strict one-head
+    # rule, asked once per head rather than widened. Every source it ranks (the ledger
+    # record, the closure comment, a posted jury verdict) was written against the head
+    # before the lesson landed; asked only about the landing's head, all three missed, the
+    # pin came back `None`, and the caller *probed this machine* for the panel instead —
+    # re-deriving the review contract from the landing host's availability, which is the
+    # rewrite #1066 and #1068 exist to stop. The landing changes one file inside the sink,
+    # never who reviewed the code, so a pin for a covered head is the ship's own statement.
+    for head in (artifacts["head_sha"], *artifacts.get("covered_heads", ())):
+        decision = juryavail.pin(
+            ledger_record,
+            head_sha=head,
+            closure_panel_decision=evidence.shipped_panel_decision(
+                artifacts["pr_comments"], head_sha=head
+            ),
+            panel_verdict_posted=juryavail.is_pinnable_head(head)
+            and evidence.panel_verdict_posted(
+                artifacts["pr_comments"],
+                artifacts["pr_reviews"],
+                head_sha=head,
+                covered_heads=(),
+            ),
+        )
+        if decision is not None:
+            return decision
+    return None
+
+
+def _review_assignment(
+    config: cfg.ProjectConfig,
+    args: argparse.Namespace,
+    *,
+    tier: int | None,
+    pinned: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The one resolution of ``knobs.team`` every review-aware command reads (#1014).
+
+    Five commands resolve a review contract — ``ship``, ``plan``, ``review``,
+    ``step-verify``, ``evidence-verify`` — and ``keel merge`` verifies evidence with a
+    sixth. Each of them derived the reviewer bench independently, which was survivable
+    only while the bench came from the risk tier alone. It stopped being survivable with
+    ``knobs.team``: on a project whose ``review.by_tier."3"`` is ``jury``, ``keel ship``
+    resolved ``review_panel: jury`` with **zero** reviewer slots while
+    ``keel evidence-verify`` fell back to ``reviewer_count(3)`` and demanded
+    ``review-verdict-1..3`` — a gate no run of that project could ever satisfy, because
+    the two halves of one contract disagreed about who the reviewers were.
+
+    So the resolution lives here, once, and every site calls it with the same inputs.
+    Flags a given subcommand does not define read as absent (``getattr``) rather than
+    being re-spelled per parser: ``keel merge`` has no ``--role``, and a reviewer bench
+    must not depend on which command is asking.
+    """
+    review_delegates = tuple(getattr(args, "review_delegate", None) or ())
+    # The probe #1066 asks for, at the one place all six surfaces pass through. It runs
+    # *only* on a tier whose review policy is the panel, so a project that never convenes
+    # one pays nothing and behaves exactly as before — and not at all when the caller
+    # already knows what the ship measured (`_shipped_jury_availability`), because a
+    # surface that only verifies must be held to that run's decision, not to this host's.
+    availability = (
+        pinned
+        if pinned is not None
+        else providerprobe.jury_availability(
+            config, tier=tier, profile=getattr(args, "team_profile", None)
+        )
+    )
+    return team.resolve_assignment(
+        config.knobs.team,
+        tier=tier,
+        role=getattr(args, "role", None),
+        default_count=ship.reviewer_count(tier or 2),
+        reviewer_override=getattr(args, "reviewers", None),
+        delegate=getattr(args, "delegate", None),
+        review_delegates=review_delegates,
+        host_agent=getattr(args, "host_agent", None) or agents.HOST_DEFAULT,
+        legacy=agents.legacy_team_seats(config),
+        # Recorded, never applied: the bench is a pure function of config + tier +
+        # role + the explicit --reviewers / --review-delegate overrides.
+        jury_disabled=bool(getattr(args, "no_jury", False)),
+        jury_advisory=bool(getattr(args, "jury_advisory", False)),
+        # A child ship inherits its parent's bench through these two (#1017). They are
+        # read here rather than only on the batch commands because the batch hands them
+        # *down*: a `--team` the child parses but does not resolve would staff the
+        # parent's clusters and silently drop out of the child's own assignment.
+        team_profile=getattr(args, "team_profile", None),
+        effort=getattr(args, "effort", None),
+        jury_availability=availability,
+    )
+
+
+def _remote_base_ref(base_branch: str) -> str:
+    """The remote-tracking name for the base branch — the one spelling of it.
+
+    Separate from :func:`_ship_base_ref` because the *name* is shared and the
+    *fallback* is not. A diff wants something to diff against; a verdict would
+    rather decline than judge against the wrong ref.
+
+    Spelled in full (:func:`keel.git.remote_tracking_ref`): a local branch named
+    ``origin/<base>`` — which ``gh pr checkout`` creates for a pull request whose head
+    branch is called that — outranks the remote-tracking ref under the short spelling, and
+    the gates and the jury then diffed against it.
+    """
+    return git.remote_tracking_ref("origin", base_branch)
+
+
+def _ship_base_ref(base_branch: str, root: str) -> str:
+    """The base ref a command **diffs** against.
+
+    ``origin/<base>`` when the remote-tracking ref resolves, else the configured local
+    branch, which keeps dry-run and offline repositories fail-soft — each spelled in full,
+    ``refs/remotes/origin/<base>`` and ``refs/heads/<base>``, because git resolves a short
+    name through ``refs/tags/`` first and a tag called ``main`` would otherwise stand in
+    for the branch. Three commands used
+    to spell this three ways — ``keel ship`` through here, ``keel run-gates`` with the
+    local branch, and ``_gather_branch_facts`` with a bare remote ref and no fallback —
+    and `_gate_runner` runs the **jury** on the resulting diff, so the same jury on the
+    same branch at the same head received different input depending on the entry point.
+    After a base merge, ``<base>...HEAD`` carries the commits that merge brought in;
+    ``origin/<base>...HEAD`` carries only the branch's own (#1184, #1174).
+
+    **keel does not fetch.** This prefers whatever the checkout already has, so a
+    worktree that has not fetched in a week prefers a week-old ref over a local branch
+    the operator may keep current. Keeping the ref fresh belongs to whatever drives
+    keel; a fetch here would put a network call inside a diff.
+    """
+    remote_ref = _remote_base_ref(base_branch)
+    # Asked of the exact ref: a missing tracking ref lets `rev-parse` answer with a local
+    # branch literally named `refs/remotes/origin/<base>` (#1223). When the exact ref
+    # exists, git's own lookup finds it first, so the name is safe to hand to `diff`.
+    return remote_ref if git.resolve_ref(remote_ref, cwd=root) else f"refs/heads/{base_branch}"
 
 
 def _cmd_ship(args: argparse.Namespace) -> int:
@@ -959,6 +1392,9 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         return 1
     except cfg.ConfigError as exc:
         print(str(exc), file=sys.stderr)
+        return 1
+
+    if wizardrun.run_option_wizard(args, config, command=command) != 0:
         return 1
 
     loaded, problems = load_extensions(config, args.root, strict=False)
@@ -983,8 +1419,22 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    mode = tdd.resolve_mode(config.knobs.implement_mode, flag=args.tdd)
+    loop_policy = loop.resolve(
+        config.knobs.loop,
+        flag=getattr(args, "loop", False),
+        implement_mode=mode.name,
+        # `keel plan` has no such flag, so ask rather than assume (#1173).
+        max_iterations=getattr(args, "max_iterations", None),
+    )
+    loop_problem = loop.iteration_problem(loop_policy, getattr(args, "loop_iteration", None) or ())
+    if loop_problem:
+        # The closure comment asserts these as evidence; a contradictory record is refused
+        # before the ledger says it happened.
+        print(f"--loop-iteration: {loop_problem}", file=sys.stderr)
+        return 2
     try:
-        plan = orch.build_plan(config, loaded)
+        plan = orch.build_plan(config, loaded, implement_mode=mode.name)
     except gates.GateError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -1012,6 +1462,26 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         issue_title=args.issue_title,
         issue_body=args.issue_body,
         issue_labels=_issue_labels(args),
+        role=args.role,
+        delegate=args.delegate,
+        review_delegates=tuple(args.review_delegate),
+        # The preflight contract is the only one an operator sees when the run halts
+        # before gates (a consent gap, a contradictory ledger flag pair). Built without
+        # these, a halted run printed a contract naming no team while a completed run
+        # printed one naming a team, from the identical command line.
+        effort=args.effort,
+        team_profile=args.team_profile,
+        host_agent=args.host_agent or agents.HOST_DEFAULT,
+        tdd_override=args.tdd,
+        loop_override=getattr(args, "loop", False),
+        loop_budget=getattr(args, "max_iterations", None),
+        # The preflight contract is built before s5 classifies, so its tier is
+        # unresolved and no tier's policy can be the panel yet; this probes only when
+        # a `review.default: jury` — or the `--team` profile's own `review` — makes the
+        # panel the review whatever the tier turns out to be (#1066).
+        jury_availability=providerprobe.jury_availability(
+            config, tier=None, profile=args.team_profile
+        ),
     )
     consent_ok, consent_message = consent.assert_operator_consent(contract["operator_consent"])
     if not consent_ok:
@@ -1063,7 +1533,13 @@ def _cmd_ship(args: argparse.Namespace) -> int:
             print(message, file=sys.stderr)
         return 1
 
-    changed_read = git.changed_files(config.base_branch, "HEAD", cwd=args.root)
+    # The local base branch may lag behind the remote after a branch merged the
+    # current base.  Use the fetched remote tip as the canonical comparison point
+    # so ledger/closure files describe this branch's net change, not the commits
+    # imported by that merge (#1174).  Keep the local ref as a fail-soft fallback
+    # for offline repositories that have no remote-tracking branch.
+    base_ref = _ship_base_ref(config.base_branch, args.root)
+    changed_read = git.changed_files(base_ref, "HEAD", cwd=args.root)
     # None means git could not be read. Classify fail-closed to the strictest tier
     # rather than letting an unreadable diff look like an empty one — an empty list
     # classifies as TIER-2 and would silently drop a reviewer and the gating jury.
@@ -1071,9 +1547,7 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     changed = changed_read or []
     # Same source as `changed`, so the tier is decided from one view of the change:
     # an unreadable diff yields {} and every path keeps the tier it already had.
-    artifacts_patches = classify.split_unified_diff(
-        git.diff(config.base_branch, "HEAD", cwd=args.root)
-    )
+    artifacts_patches = classify.split_unified_diff(git.diff(base_ref, "HEAD", cwd=args.root))
     tier = (
         classify.UNKNOWN_TIER
         if changed_unreadable
@@ -1094,15 +1568,20 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         jury=args.jury,
         no_jury=args.no_jury,
         jury_advisory=args.jury_advisory,
+        require_distinct_vendors=config.knobs.evidence_require_distinct_vendors,
+        # The jury gate runs off this contract's mode, so it has to see the same team
+        # the assessment below resolves — otherwise the gate runs gating on a project
+        # whose policy said advisory.
+        assignment=_review_assignment(config, args, tier=tier),
     )
     # unreachable: orch.build_plan() above already calls plan_gates and surfaces GateError.
     try:
-        specs = gates.plan_gates(config, loaded)
+        specs = gates.plan_gates(config, loaded, implement_mode=mode.name)
     except gates.GateError as exc:  # pragma: no cover - defensive duplicate of the build_plan guard
         print(str(exc), file=sys.stderr)
         return 1
-    diff_text = git.diff(config.base_branch, "HEAD", cwd=args.root)
-    outcomes = gates.run_gates(
+    diff_text = git.diff(base_ref, "HEAD", cwd=args.root)
+    outcomes, tdd_result = _run_planned_gates(
         specs,
         _gate_runner(
             args.root,
@@ -1110,6 +1589,8 @@ def _cmd_ship(args: argparse.Namespace) -> int:
             jury_mode=review_contract["jury"]["mode"],
             timeout=config.knobs.gate_timeout_s,
         ),
+        config=config,
+        root=args.root,
     )
     recorded_results = dict(getattr(args, "gate_result", None) or ())
     planned = {spec.id for spec in specs}
@@ -1137,6 +1618,10 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     # rollup reports "test (py3.13 / ubuntu-latest)".
     ci_wf_names = github.ci_workflow_names(args.pr, cwd=args.root) if read_ci else None
 
+    # #1155: the read side of capture. Measured here because it reads directories,
+    # and handed to `assess` the way `jury_availability` is — the assessment stays
+    # pure and the contract carries one section both briefs render.
+    retrieved_learnings = _retrieve_learnings(args, config, changed_read)
     a = ship.assess(
         # None-preserving on purpose: assess classifies an unreadable diff fail-closed,
         # and collapsing it to [] here is what made this whole guard inert.
@@ -1167,8 +1652,39 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         jury=args.jury,
         no_jury=args.no_jury,
         jury_advisory=args.jury_advisory,
+        team=config.knobs.team,
+        legacy_agents=agents.legacy_team_seats(config),
+        role=args.role,
+        delegate=args.delegate,
+        review_delegates=tuple(args.review_delegate),
+        team_profile=args.team_profile,
+        effort=args.effort,
+        # The same measurement `_review_assignment` took above, handed to the resolver
+        # that produces the *assessed* contract — the one the ledger, the closure comment
+        # and `evidence-verify` all read (#1066).
+        jury_availability=review_contract["jury"]["availability"],
+        host_agent=args.host_agent or agents.HOST_DEFAULT,
+        require_distinct_vendors=config.knobs.evidence_require_distinct_vendors,
+        learnings=retrieved_learnings,
     )
     contract["review_merge_contract"] = a.review_contract
+    # The same block at the top level, because the s4 implement brief is composed
+    # before any reviewer exists and must not have to read the review contract to
+    # find its own section.
+    contract["learnings"] = retrieved_learnings
+    # The tier is only known once the diff has been read, so the assignment the plan
+    # rendered against an unresolved tier is superseded by the one the assessment
+    # resolved against the real one.
+    contract["assignment"] = a.assignment
+    # …and so are the two blocks *derived* from the review contract. `evidence` and
+    # `step_verification` are built by `build_command_contract` at the unresolved tier;
+    # leaving them there published one JSON document holding `reviewers.count: 0` with a
+    # gating jury next to an evidence block demanding two review verdicts, and the
+    # adapters read the evidence block, not the reviewer count.
+    contract["evidence"] = evidence.contract_as_dict(a.review_contract, dry_run=not args.live)
+    contract["step_verification"] = stepverifier.contract_as_dict(
+        a.review_contract, dry_run=not args.live
+    )
     ledger_path = ledger.resolve_path(args.root, config)
     try:
         existing_ledger_records = ledger.read_records(ledger_path)
@@ -1186,6 +1702,57 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         run_control_events,
         max_work_units=args.max_rounds or runcontrols.DEFAULT_RUN_BUDGET,
     )
+    # The same events say *who* ran each round, which is what lets the closure comment
+    # name the seat an s9 escalation handed the fix to (#1016).
+    run_fix_attribution = runcontrols.fix_attribution(run_control_events)
+    # The built-in capture extension (#1154). `policy_pack.capture.learning.sink`
+    # names a directory of Markdown; keel renders the document and writes it, and
+    # the path becomes `capture.artifact` — which is already the field that makes
+    # an `applied` capture provable rather than asserted. An operator-supplied
+    # `--capture-artifact` is recorded as given, sink or no sink (see below).
+    # Resolved once, so the document the sink writes and the record the ledger
+    # appends fingerprint the same lesson.
+    capture_facts = _capture_issue_facts(args)
+    capture_changed = _capture_changed_files(args, config, changed_read)
+    # **Ask the clash first.** The append no-ops when this (PR, head) already
+    # carries a marker, and the write ran before that was known — so a retry whose
+    # fingerprint had moved (a `gh` outage on the first attempt, a label fetched on
+    # the second) scattered a second document into the sink, possibly a shared
+    # knowledge folder, that no ledger record would ever name.
+    capture_clash = (
+        ledger.capture_marker_for_head(
+            existing_ledger_records,
+            pr_number=args.ledger_pr or args.pr,
+            head_sha=args.head_sha,
+        )
+        if args.append_ledger and args.live
+        else None
+    )
+    # **A named artifact is recorded, not written again** (#1203). With an in-repo sink
+    # the lesson is written and landed on the pull request at s10 by `keel capture-land
+    # --write`, and s11 records it by passing that path. Writing here as well rendered a
+    # second copy into the primary checkout after the merge — untracked, so the next
+    # `git pull` bringing the landed one refuses to overwrite it, or, a day later, under
+    # a second filename that no landing would ever carry.
+    capture_write = (
+        None
+        if capture_clash is not None or args.capture_artifact
+        else _write_learning_sink(
+            args, config, capture_changed, existing_ledger_records, outcomes, capture_facts
+        )
+    )
+    capture_status_value = _resolved_capture_status(args.capture_status)
+    capture_reason_value = args.capture_reason
+    capture_artifact_value = args.capture_artifact
+    if capture_write is not None:
+        if capture_write["ok"]:
+            capture_artifact_value = capture_write["path"]
+        else:
+            # Fail-soft, as the capture contract requires: a sink that cannot be
+            # written does not touch the merge, it downgrades the claim.
+            capture_status_value = "skipped"
+            capture_reason_value = "capability-unavailable"
+            capture_artifact_value = None
     ledger_record = ledger.build_ship_run_record(
         command=command,
         base_branch=config.base_branch,
@@ -1203,21 +1770,50 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         pr_number=args.ledger_pr or args.pr,
         branch=args.branch,
         head_sha=args.head_sha,
-        capture_status=_resolved_capture_status(args.capture_status),
+        capture_status=capture_status_value,
         capture_not_run=args.capture_status == CAPTURE_STATUS_NOT_RUN,
-        capture_reason=args.capture_reason,
-        capture_artifact=args.capture_artifact,
-        issue_title=args.issue_title,
-        issue_labels=_issue_labels(args),
+        capture_reason=capture_reason_value,
+        capture_artifact=capture_artifact_value,
+        # The same list the document was written from, so the sink and the ledger
+        # fingerprint one lesson. They did not: the sink got the host's PR files
+        # while the record kept hashing the empty post-merge diff, and a second run
+        # then wrote a second file while recording it as a duplicate of the first.
+        capture_changed_files=capture_changed,
+        # What was surfaced, so a later run can tell a lesson nobody had from one
+        # that was put in front of the implementer and still not applied (#1155).
+        capture_retrieved=retrieved_learnings["fingerprints"],
+        issue_title=capture_facts[0],
+        issue_labels=capture_facts[2],
         existing_records=existing_ledger_records,
         config=config,
         implementer=args.implementer,
+        fix_attribution=run_fix_attribution,
         reviewer_agents=args.reviewer_agent,
         tester=args.tester,
         host_agent=args.host_agent,
         transport=args.transport or transport.name,
         profile=profile,
         jury_mode=a.review_contract["jury"]["mode"],
+        # …and, when the tier named a panel, what the availability probe found (#1066).
+        # The ledger is what the closure comment is rendered from, so recording it here
+        # is what lets the posted comment say the panel was unavailable and a host bench
+        # reviewed instead, rather than leaving a reader to infer it from a seat count.
+        jury_panel=a.review_contract["jury"]["availability"],
+        implement_mode=mode.name if mode.is_tdd else None,
+        implement_phases=tdd.phase_records(
+            tdd_result,
+            implementers=tdd.phase_implementers(
+                getattr(args, "phase_implementer", None) or (),
+                default=args.implementer,
+            ),
+        ),
+        # The s4 iteration loop (#1165): the policy this run resolved and the iterations
+        # the orchestrator reported, or `None` when it neither configured nor ran one.
+        implement_loop=loop.iteration_block(
+            loop_policy,
+            getattr(args, "loop_iteration", None) or (),
+            implementer=args.implementer,
+        ),
         consent_status=contract["operator_consent"]["status"],
         consent_scopes=contract["operator_consent"]["effective_approved_scope"],
         run_controls=run_control_report,
@@ -1251,10 +1847,15 @@ def _cmd_ship(args: argparse.Namespace) -> int:
         "path": str(ledger_path),
         "appended": False,
         "record": ledger_record,
-        "warnings": run_context_warnings,
+        "warnings": [
+            *run_context_warnings,
+            *_implementer_vocabulary_warnings(args, config),
+        ],
     }
     if args.append_ledger and args.live:
-        clash = ledger.existing_capture_marker(existing_ledger_records, ledger_record)
+        clash = capture_clash or ledger.existing_capture_marker(
+            existing_ledger_records, ledger_record
+        )
         if clash is None:
             ledger.append_record(ledger_path, ledger_record)
             ledger_result["appended"] = True
@@ -1322,13 +1923,13 @@ def _cmd_ship(args: argparse.Namespace) -> int:
     if args.append_ledger:
         if ledger_result.get("skipped") == "duplicate-capture-marker":
             print(
-                "  ledger append : skipped — PR already has a capture marker "
-                f"(run {ledger_result['existing_run_id']}); a second one would block "
-                "capture-verify with no automated repair"
+                "  ledger append : skipped — this head already has a capture marker "
+                f"(run {ledger_result['existing_run_id']}); a second one on the same "
+                "head would block capture-verify with no automated repair"
             )
         else:
             print(f"  ledger append : {'yes' if ledger_result['appended'] else 'dry-run/no-live'}")
-    for warning in run_context_warnings:
+    for warning in ledger_result["warnings"]:
         print(f"  run context   : warning: {warning}")
     if intake_record["questions"]:
         print(f"  questions     : {len(intake_record['questions'])}")
@@ -1386,6 +1987,577 @@ def _cmd_ledger(args: argparse.Namespace) -> int:
         print(f"  capture       : {payload['capture_health']['status']}")
         print(f"  capture gaps  : {payload['capture_health']['counts']['needs_reconcile']}")
     return 0
+
+
+def _land_learning_tree(root: str, path: str, base_sha: str, blob: str) -> str | None:
+    """Graft ``blob`` at ``path`` onto ``base_sha``'s tree; return the new root tree.
+
+    Walks the path's directories from the leaf upward, rewriting one tree object per
+    level, so the result shares every object it did not have to change. No checkout
+    and no index: the base branch is read as objects, which is the whole point — keel
+    runs s0-s12 inside a worktree while the primary checkout holds the base branch,
+    and any recipe that checks the base branch out there exits 128 (#1163).
+    """
+    parts = path.split("/")
+    entry = capture.TreeEntry(capture.TREE_MODE_BLOB, "blob", blob, parts[-1])
+    for depth in range(len(parts) - 1, 0, -1):
+        directory = "/".join(parts[:depth])
+        # `None` here is the ordinary first lesson: that directory does not exist on
+        # the base branch yet, so the level is composed from nothing rather than failing.
+        listing = git.ls_tree(f"{base_sha}:{directory}", cwd=root)
+        tree = git.mktree(capture.upsert_tree_entry(listing, entry), cwd=root)
+        if tree is None:
+            return None
+        entry = capture.TreeEntry(capture.TREE_MODE_TREE, "tree", tree, parts[depth - 1])
+    listing = git.ls_tree(base_sha, cwd=root)
+    return git.mktree(capture.upsert_tree_entry(listing, entry), cwd=root)
+
+
+def _contained_real_path(path: Path, root: str, sink: str) -> Path | None:
+    """``path``'s **real** location when it is inside the sink's, else ``None``.
+
+    Both ends are resolved, which does two jobs at once.
+
+    It follows symlinks on the way in: `git hash-object` follows them too, and the one
+    live safety check downstream counts *paths* in the finished commit, never where
+    their bytes came from — so a link named `.keel/learning/x.md` passed every test this
+    command made and published whatever it pointed at to the shared base branch under an
+    innocent name.
+
+    And it returns an **absolute** path for git to hash. A relative one is resolved
+    against the process directory here and against ``cwd=root`` again inside git, so
+    ``--root wt`` from the directory above applied the root twice and hashed nothing.
+
+    Containment is against the **sink**, not the checkout. Inside the repository is the
+    wrong boundary here for the same reason it was wrong for the recorded path: an
+    untracked `.env` beside the code is in the repository, and a link to it from inside
+    the sink satisfied a checkout-wide test. When the sink's own real path cannot be
+    resolved — it is a template component away from existing — nothing can be judged
+    against it, and the landing refuses rather than falling back to the wider boundary.
+    """
+    # No `sink is None` guard: a plan that reached the landing has a sink, because
+    # `learning_land_plan` refuses one it could not resolve — a branch no input can take
+    # is a claim about the data the tests cannot check.
+    try:
+        real, base = path.resolve(), Path(root).resolve()
+    except OSError:  # pragma: no cover - an unstattable path fails closed as uncontained
+        return None
+    if not real.is_relative_to(base):
+        return None
+    # **The same rule the plan applied, on the resolved path.** Resolving the sink to a
+    # directory instead looked equivalent and was not: `.keel/{date}/learning` is a
+    # template, so it names no directory on disk, and every project with a placeholder in
+    # its sink was `planned` by the pure layer and then refused here on every run.
+    # `path_under_sink` compares literal components, and the plan has already refused a
+    # sink it could not resolve — so the two layers are one answer rather than two that
+    # agree only sometimes.
+    relative = real.relative_to(base).as_posix()
+    return real if capture.path_under_sink(relative, sink) else None
+
+
+def _land_learning_attempt(args, plan: dict, *, expect_head: str | None = None) -> dict:
+    """One build-and-push attempt. Returns ``{"status", "detail", "commit", "base"}``.
+
+    ``status`` is ``landed``, ``already-landed``, ``contended`` (another ship pushed
+    first - the caller retries) or ``failed``. ``expect_head`` is the commit the target
+    branch must be at — the pull request head ``--write`` rendered the lesson for; anything
+    else is ``failed``.
+    """
+    root, path, remote = args.root, plan["path"], plan["remote"]
+    # **Checked, because the ref resolves either way.** s11 runs after s10 moved
+    # `<remote>/<base>`, and a failed fetch leaves the remote-tracking ref at the
+    # pre-merge tip — so the commit is built as a *sibling* of the merge, the push is a
+    # non-fast-forward, and that is genuine contention by every test we have. It is
+    # retried, the fetch fails the same way, and the budget is spent on a race with
+    # nobody. A fetch that could not run is the answer, not the symptom it produces.
+    # The branch the commit goes **to**, which is the pull request's own under #1203 —
+    # fetching the base instead would build the lesson on a remote-tracking ref that
+    # names the wrong branch entirely, or a stale copy of the right one.
+    target = plan.get("onto") or plan["base_branch"]
+    # **A configured remote, or nothing.** git reads an unconfigured name as a path, so with
+    # no remote called `origin` the fetch below read a directory of that name in the
+    # checkout — and the push ran that repository's hooks (#1223).
+    if git.remote_url(remote, cwd=root) is None:
+        return _land_result("failed", f"no remote named {remote!r} is configured", None, None)
+    fetched = git.fetch(remote, target, cwd=root)
+    if not fetched.ok:
+        return _land_result(
+            "failed",
+            f"cannot fetch {remote}/{target}: {fetched.output.strip()}",
+            None,
+            None,
+        )
+    # The exact ref the fetch just wrote: `rev-parse` falls back through `refs/tags/` and
+    # `refs/heads/` for a full name that is missing, `show-ref --verify` does not (#1223).
+    base_sha = git.resolve_ref(plan["remote_ref"], cwd=root)
+    if base_sha is None:
+        return _land_result("failed", f"cannot resolve {plan['remote_ref']}", None, None)
+    # **The pull request's head, or nothing is built.** `--onto` names a branch, and a
+    # branch is only a name: the lesson reports the gates-pass recorded for one head, and
+    # the head-pin exemption covers a landing on top of *that* commit. A tip that is
+    # anything else — a push since, or a commit that reached the ref some other way — was
+    # not what anyone checked, and building on it would push it along with the lesson.
+    if expect_head is not None and base_sha != expect_head:
+        return _land_result(
+            "failed",
+            f"{plan['remote_ref']} is at {base_sha}, not at {expect_head}, the head of pull "
+            f"request #{args.pr}; nothing was pushed",
+            None,
+            base_sha,
+        )
+    # `_recorded_artifact`, not `os.path.join(root, path)`: the join resolved against
+    # the *process* directory for `isfile` and then again against `root` inside git,
+    # so a relative root that is not `.` was applied twice. The repo fixed this exact
+    # bug once already, sixty lines away, and the comment there says so.
+    resolved = _recorded_artifact(path, root)
+    if resolved is None:
+        # **Gone locally because a landing already took it.** A successful landing removes
+        # the now-redundant working-tree copy, so a resumed or retried s11 finds no file —
+        # and reporting `failed` there would break the re-run guarantee the command makes.
+        # The path already on the target branch is the answer: the lesson is where it
+        # belongs. Only a path that is neither here nor there is a missing artifact.
+        if git.rev_parse(f"{base_sha}:{path}", cwd=root) is not None:
+            return _land_result(
+                "already-landed",
+                f"{path} is already on {plan['remote_ref']}; the local copy was removed "
+                "by the landing that put it there",
+                None,
+                base_sha,
+            )
+        return _land_result(
+            "failed", f"no such capture artifact: {_resolve_under_root(path, root)}", None, base_sha
+        )
+    # **Where the content came from, not only where the path points.** The safety check
+    # below counts *paths* in the finished commit, so a path inside the sink whose file
+    # is a symlink out of the checkout passed it while publishing someone else's file to
+    # the base branch — `git hash-object` follows the link. Resolving both ends and
+    # comparing them is the containment the docstrings already claim.
+    real = _contained_real_path(resolved, root, plan.get("sink"))
+    if real is None:
+        return _land_result(
+            "failed",
+            f"refusing to hash {path}: it resolves outside the learning sink ({resolved})",
+            None,
+            base_sha,
+        )
+    blob = git.hash_object(str(real), cwd=root)
+    if blob is None:
+        return _land_result("failed", f"cannot hash {real}", None, base_sha)
+    # **Asked before building, so a re-run is a no-op rather than an empty commit.**
+    # The s11 recipe is allowed to run twice (a resumed run, a retried session), and a
+    # landing that pushed a parentless-looking no-change commit each time would add a
+    # commit to the base branch for every retry.
+    if git.rev_parse(f"{base_sha}:{path}", cwd=root) == blob:
+        return _land_result(
+            "already-landed", f"{path} is already on {plan['remote_ref']}", None, base_sha
+        )
+    tree = _land_learning_tree(root, path, base_sha, blob)
+    if tree is None:
+        return _land_result("failed", f"cannot build a tree carrying {path}", None, base_sha)
+    commit = git.commit_tree(tree, parent=base_sha, message=plan["message"], cwd=root)
+    if commit is None:
+        return _land_result("failed", "cannot create the landing commit", None, base_sha)
+    # **The one live safety check.** Everything above composes trees from the base
+    # branch's own objects, so a composition bug is the only way this commit could
+    # carry something else - and the branch it would carry it to is the shared base.
+    # An unreadable diff fails closed: this must never push what it could not check.
+    touched = git.diff_names(base_sha, commit, cwd=root)
+    if touched != [path]:
+        return _land_result(
+            "failed",
+            f"refusing to push: the landing commit changes {touched}, not [{path!r}]",
+            commit,
+            base_sha,
+        )
+    pushed = git.push_commit(remote, commit, plan["ref"], cwd=root)
+    if pushed.ok:
+        return _land_result("landed", f"{path} landed on {plan['remote_ref']}", commit, base_sha)
+    detail = pushed.output.strip()
+    if capture.push_rejection_is_contention(detail):
+        return _land_result("contended", detail, commit, base_sha)
+    return _land_result("failed", detail, commit, base_sha)
+
+
+def _drop_landed_copy(root: str, path: str, landed: str | None) -> str:
+    """Remove the working-tree copy of a lesson now committed, when it is the same bytes.
+
+    **git will not pull over an untracked file, even one byte-identical to the file
+    arriving.** Measured: the writer puts the lesson in the checkout untracked, the landing
+    puts the same path on the branch, and the next `git pull` there aborts with *untracked
+    working tree files would be overwritten by merge* — until someone deletes a file keel
+    wrote. The landing is what made that copy redundant, so the landing removes it.
+
+    Only when it is provably redundant: the blob in the working tree must equal the blob
+    at that path in ``landed``. A lesson someone edited after it was written is kept, and
+    so is anything that cannot be read. Returns ``removed``, ``kept`` or ``absent``.
+
+    **Never a tracked file.** After the merge a `git pull` puts the lesson in the index, and
+    a re-run that finds it already landed would otherwise delete a file the checkout tracks
+    — same bytes, so every check above passes. ``:<path>`` asks the index literally, with no
+    pathspec globbing; measured on a tracked ``x*.md`` beside an untracked ``xy.md``.
+    """
+    local = _recorded_artifact(path, root)
+    if local is None:
+        return "absent"
+    committed = git.rev_parse(f"{landed}:{path}", cwd=root) if landed else None
+    current = git.hash_object(str(local.resolve()), cwd=root)
+    if committed is None or current != committed:
+        return "kept"
+    return _unlink_untracked(local, path, root)
+
+
+def _discard_unlanded_lesson(root: str, path: str) -> str:
+    """Remove the lesson ``--write`` wrote when it did not land: ``removed``, ``kept``, ``absent``.
+
+    A lesson that is not on the pull request is not durable, and left untracked in the
+    primary checkout it is the orphan #1203 exists to end — no record will name it, and a
+    later landing at the same path meets it in `git pull`. Re-running s10 writes it again.
+    """
+    local = _recorded_artifact(path, root)
+    if local is None:
+        return "absent"
+    return _unlink_untracked(local, path, root)
+
+
+def _unlink_untracked(local: Path, path: str, root: str) -> str:
+    """Delete ``local`` unless the checkout tracks ``path``; ``removed`` or ``kept``."""
+    if git.rev_parse(f":{path}", cwd=root) is not None:
+        return "kept"
+    try:
+        local.unlink()
+    except OSError:  # pragma: no cover - a file that vanished or is read-only stays as-is
+        return "kept"
+    return "removed"
+
+
+#: Landing outcomes that are not failures: the lesson is on the branch, or there was nothing
+#: to put there. `failed` is the one that is — and s10 still merges past it (fail-soft).
+_LAND_OK_STATUSES = (
+    "landed",
+    "already-landed",
+    "not-required",
+    "no-artifact",
+    "would-land",
+)
+
+
+def _land_result(status: str, detail: str, commit: str | None, base: str | None) -> dict:
+    return {"status": status, "detail": detail, "commit": commit, "base": base}
+
+
+def _lesson_write(
+    status: str,
+    path: str | None,
+    detail: str,
+    commit: str | None = None,
+    head: str | None = None,
+) -> dict:
+    """``head`` is the pull request head a ``written`` lesson was rendered for."""
+    return {"status": status, "path": path, "detail": detail, "commit": commit, "head": head}
+
+
+def _land_write_refusal(args: argparse.Namespace) -> str | None:
+    """Why ``capture-land --write`` cannot run as invoked, or ``None``."""
+    if args.pr is None:
+        return "--write needs --pr: the lesson is written from that pull request"
+    if args.artifact is not None:
+        return "--write and --artifact are exclusive: --write lands the lesson it writes"
+    if args.dry_run:
+        return "--write and --dry-run are exclusive: a dry run writes no lesson to land"
+    return None
+
+
+def _write_lesson_to_land(args: argparse.Namespace, config: cfg.ProjectConfig, records) -> dict:
+    """Write the lesson ``capture-land --write`` lands, or say why there is none (#1203).
+
+    s10 used to write it with ``keel ship --live --append-ledger``, and that is a ship-run
+    recorder: it appends a ledger row stamped with the pull request's head, capture marker
+    included, and a later row for the same (PR, head) is dropped — so a merge that then
+    failed could not be recorded as anything but the ``applied`` that row already claimed.
+    This writes the document and nothing else. The capture is recorded at s11, after the
+    merge, by the append that names this path.
+
+    The facts are the ones that append will carry, read the same way: the issue through
+    :func:`_capture_issue_facts`, the files through :func:`_capture_changed_files`, and the
+    writer handed a ``ship`` namespace parsed from the flags s11 passes. The gate words are
+    the gates-pass recorded for the head — s10 runs no gates, and a lesson that reported
+    none would be wrong about the one fact the merge rests on.
+
+    **One lesson per pull request.** A retried s10 — the merge window closed, and the run
+    resumes tomorrow — must not write a second document under tomorrow's date, so a lesson
+    a landing already put on this pull request, and that the pull request still carries, is
+    reported ``already-landed`` and nothing is written.
+
+    Returns ``{"status", "path", "detail", "commit"}``: ``written`` (a new document at
+    ``path``, to land), ``already-landed`` (``commit`` put ``path`` on the pull request),
+    ``no-artifact`` (the policy writes no document, or this one duplicates a lesson already
+    durable — the s11 append then records that one, as it always has), or ``failed``.
+    """
+    pr = args.pr
+    try:
+        owner_repo = _owner_repo(config)
+        pull = _gh_json(["repos", owner_repo, "pulls", str(pr)], cwd=args.root)
+    except ValueError as exc:
+        return _lesson_write("failed", None, f"cannot read pull request #{pr}: {exc}")
+    head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+    head_sha = head.get("sha") if isinstance(head.get("sha"), str) else None
+    if not head_sha:
+        return _lesson_write("failed", None, f"pull request #{pr} reports no head commit")
+    files = github.pr_files(pr, cwd=args.root)
+    if files is None:
+        return _lesson_write("failed", None, f"cannot read the files pull request #{pr} changed")
+    try:
+        landed = _landed_lesson(config, owner_repo, pr, files, cwd=args.root)
+    except ValueError as exc:
+        return _lesson_write("failed", None, f"cannot read pull request #{pr}'s commits: {exc}")
+    if landed is not None:
+        return _lesson_write(
+            "already-landed",
+            landed["path"],
+            f"{landed['path']} already rides pull request #{pr} (landed by {landed['sha']}); "
+            "no second lesson is written",
+            landed["sha"],
+        )
+    passed, record = ledger.gates_pass_for_head(records, pr, head_sha)
+    if not passed:
+        return _lesson_write(
+            "failed",
+            None,
+            f"no gates-pass is recorded for {head_sha} under {args.root}; the lesson reports "
+            "the gates that passed on the head it merges with, so they must have run",
+        )
+    flags = [
+        "ship",
+        args.path,
+        f"--root={args.root}",
+        "--live",
+        "--append-ledger",
+        "--capture-status=applied",
+        f"--pull-request={pr}",
+        f"--head-sha={head_sha}",
+    ]
+    if args.issue is not None:
+        flags.append(f"--issue={args.issue}")
+    ship_args = build_parser().parse_args(flags)
+    result = _write_learning_sink(
+        ship_args,
+        config,
+        _capture_changed_files(ship_args, config, files),
+        records,
+        _recorded_gate_outcomes(record),
+        _capture_issue_facts(ship_args),
+    )
+    if result is None:
+        return _lesson_write("no-artifact", None, "the capture policy writes no document here")
+    if not result["ok"]:
+        return _lesson_write("failed", None, f"cannot write the lesson: {result['error']}")
+    if result["reused"]:
+        return _lesson_write(
+            "no-artifact",
+            None,
+            f"this lesson duplicates {result['path']}, which is already durable; "
+            "the s11 append records that one",
+        )
+    return _lesson_write("written", result["path"], f"wrote {result['path']}", head=head_sha)
+
+
+def _recorded_gate_outcomes(record: dict) -> list[GateOutcome]:
+    """A gates-pass record's gates, as the outcomes the learning writer words them from.
+
+    Only what :func:`_gate_word` reads is restored. The record keeps a finding *count*, not
+    the findings, and no lesson sentence needs them. Called only on a record
+    :func:`keel.ledger.record_gates_passed` accepted, which is what makes ``gates`` a
+    non-empty list of mappings here.
+    """
+    return [
+        GateOutcome(
+            gate=str(item.get("gate")),
+            ok=item.get("ok") is True,
+            skipped=item.get("skipped") is True,
+            not_run=item.get("not_run") is True,
+        )
+        for item in record["gates"]
+    ]
+
+
+def _landed_lesson(
+    config: cfg.ProjectConfig,
+    owner_repo: str,
+    pr_number: int,
+    pr_files: list[str],
+    *,
+    cwd: str,
+) -> dict[str, str] | None:
+    """The lesson a landing already put on this pull request, newest first; ``None`` if none.
+
+    A commit counts when :func:`keel.capture.capture_only_descent` accepts it against its
+    own parent — the marker, one parent, one added or modified path inside the sink: the
+    test the head-pin exemption applies, so a stray commit that merely *says* it is a
+    landing is not one. And its path must still be among the files the pull request
+    changes; a lesson a later commit deleted is not riding it any more.
+
+    The commits are read from the pull request, not walked back from its head, on purpose:
+    a fix pushed after the landing leaves the lesson below the tip, and it is still this
+    pull request's lesson. Only commits carrying the marker are fetched, and at most
+    ``_COVERED_HEADS_LIMIT`` of them.
+    """
+    sink = capture.land_sink_root(config, pr_number=pr_number, base_branch=config.base_branch or "")
+    carried = set(pr_files)
+    commits = _gh_json_list(["repos", owner_repo, "pulls", str(pr_number), "commits"], cwd=cwd)
+    marked = [
+        item["sha"]
+        for item in reversed(commits)
+        if isinstance(item.get("sha"), str)
+        and isinstance(item.get("commit"), dict)
+        and capture.carries_landing_marker(item["commit"].get("message"))
+    ]
+    for sha in marked[:_COVERED_HEADS_LIMIT]:
+        facts = _commit_facts(owner_repo, sha, cwd=cwd)
+        parents = facts.get("parents") if facts else None
+        if not isinstance(parents, list) or len(parents) != 1:
+            continue
+        if not capture.capture_only_descent(parents[0], sha, [facts], sink=sink):
+            continue
+        if facts["files"][0] in carried:
+            return {"sha": sha, "path": facts["files"][0]}
+    return None
+
+
+def _cmd_capture_land(args: argparse.Namespace) -> int:
+    """Land one run's learning document on a branch (#1163, #1203).
+
+    With ``--write --onto`` — which is how `/keel:ship` runs it, at s10 before the evidence
+    gate — it writes the lesson itself (:func:`_write_lesson_to_land`) and lands it on the
+    pull request's own branch, so the lesson merges with the work it describes and
+    base-branch protection never sees the push. Without ``--write`` the artifact is
+    ``--artifact``, or the one the pull request's latest ``ship_run`` record names; without
+    ``--onto`` the branch is ``<remote>/<base_branch>``, which a base that requires pull
+    requests refuses.
+
+    This is **not** a merge path and does not touch one. It pushes a single commit carrying
+    a single file; `keel merge` at s10 remains the only way a pull request reaches the base.
+    Nor does it write the run ledger: the capture is recorded at s11, after the merge.
+    """
+    try:
+        config = cfg.load_config(args.path)
+    except FileNotFoundError:
+        print(f"no such config: {args.path}", file=sys.stderr)
+        return 1
+    except cfg.ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    refusal = _land_write_refusal(args) if args.write else None
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 1
+
+    artifact = args.artifact
+    written: dict | None = None
+    ledger_path = ledger.resolve_path(args.root, config)
+    if args.write or (artifact is None and args.pr is not None):
+        try:
+            records = ledger.read_records(ledger_path)
+        except ledger.LedgerError as exc:
+            print(f"invalid ledger {ledger_path}: {exc}", file=sys.stderr)
+            return 1
+        if args.write:
+            # Asked of the plan before anything is read or written: a sink outside the
+            # checkout (`not-required` — s11 writes that one, as before) or a remote or
+            # branch git cannot take (`failed`) must not cost a lesson on disk.
+            precheck = capture.learning_land_plan(
+                config, artifact=None, remote=args.remote, onto=args.onto
+            )
+            written = (
+                _write_lesson_to_land(args, config, records)
+                if precheck["status"] == "no-artifact"
+                else _lesson_write(precheck["status"], None, precheck["reason"])
+            )
+            artifact = written["path"]
+        else:
+            record = ledger.latest_ship_run_for_pr(records, args.pr)
+            capture_block = record.get("capture") if isinstance(record, dict) else None
+            if isinstance(capture_block, dict):
+                artifact = capture_block.get("artifact")
+
+    plan = capture.learning_land_plan(
+        config,
+        artifact=artifact,
+        pr_number=args.pr,
+        issue_number=args.issue,
+        remote=args.remote,
+        onto=args.onto,
+        attempts=args.attempts,
+    )
+    attempts: list[dict] = []
+    outcome = {"status": plan["status"], "detail": plan["reason"], "commit": None, "base": None}
+    if (
+        written is not None
+        and written["status"] != "written"
+        and plan["status"] in ("planned", "no-artifact")
+    ):
+        # The write already settled it: a lesson on the pull request, nothing to write, or
+        # a failure to read or write. A plan that refuses outright keeps its own answer.
+        outcome = _land_result(written["status"], written["detail"], written["commit"], None)
+    elif plan["status"] == "planned":
+        if args.dry_run:
+            outcome = _land_result("would-land", plan["reason"], None, None)
+        else:
+            # `--write --onto` rendered the lesson for the head it read, so the branch must
+            # still be at that head. Without `--onto` the target is the base branch, which
+            # is never a pull request's head; without `--write` no head was read. Asked of
+            # the flag, not the plan: `plan["onto"]` names the destination either way, the
+            # base branch included, so reading it pinned every base landing to the PR head.
+            expect_head = written["head"] if written is not None and args.onto else None
+            for _ in range(plan["attempts"]):
+                outcome = _land_learning_attempt(args, plan, expect_head=expect_head)
+                attempts.append(outcome)
+                if outcome["status"] != "contended":
+                    break
+            else:
+                # The last attempt's own detail is kept. Substituting a generic sentence
+                # here is what let three refusals be reported as a branch that "moved",
+                # printing a cause that had not happened over the server's actual reason.
+                last = attempts[-1]
+                outcome = _land_result(
+                    "failed",
+                    f"{plan['remote_ref']} moved under every one of "
+                    f"{plan['attempts']} attempt(s); the lesson was not landed. "
+                    f"Last push said: {last['detail']}",
+                    last["commit"],
+                    last["base"],
+                )
+
+    local_copy = None
+    if outcome["status"] == "landed":
+        local_copy = _drop_landed_copy(args.root, plan["path"], outcome["commit"])
+    elif outcome["status"] == "already-landed":
+        local_copy = _drop_landed_copy(
+            args.root, plan["path"], outcome["commit"] or outcome["base"]
+        )
+    elif written is not None and written["status"] == "written":
+        local_copy = _discard_unlanded_lesson(args.root, written["path"])
+    payload = {
+        "schema_version": capture.LEARNING_LAND_SCHEMA_VERSION,
+        "plan": plan,
+        "status": outcome["status"],
+        "detail": outcome["detail"],
+        "commit": outcome["commit"],
+        "base": outcome["base"],
+        "attempts": attempts,
+        "local_copy": local_copy,
+        "write": written,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"keel capture-land — {outcome['status']}  {outcome['detail']}")
+        if outcome["commit"] and outcome["status"] == "landed":
+            print(f"  commit  : {outcome['commit']}")
+    # `not-required` and `no-artifact` are answers, not failures: a project whose sink
+    # lives outside the checkout, and a run that captured nothing, both did the right
+    # thing and must not fail an s11 that has already merged.
+    return 0 if outcome["status"] in _LAND_OK_STATUSES else 1
 
 
 def _cmd_capture_verify(args: argparse.Namespace) -> int:
@@ -1459,6 +2631,11 @@ def _cmd_capture_verify(args: argparse.Namespace) -> int:
                 print(
                     f"  FAIL  reconcile PR #{finding['pr']}  {finding['type']}  {finding['reason']}"
                 )
+            # Notes are not failures, and a note nobody sees is not a report: without
+            # this loop `applied-elsewhere` existed only in `--json`, which is not the
+            # command operators read.
+            for note in reconcile_report.get("notes", ()):
+                print(f"  note  reconcile PR #{note['pr']}  {note['type']}  {note['message']}")
             if reconcile_report["ok"]:
                 print("  reconcile: ok")
     return 0 if payload["certified"] else 1
@@ -1933,8 +3110,24 @@ def _cmd_step_verify(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    # `step-verify` checks a supplied handoff against a supplied evidence report and
+    # builds the contract scaffold locally, so `--project` is optional. Supply it and the
+    # required evidence is derived from the same `knobs.team` the ship run resolved —
+    # without it a project whose tier-3 review is the jury would be verified against the
+    # tier-derived reviewer bench, which is the disagreement #1014 exists to close.
+    assignment, distinct_vendors = None, None
+    if args.project is not None:
+        try:
+            step_config = cfg.load_config(args.project)
+        except cfg.ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        assignment = _review_assignment(step_config, args, tier=args.review_tier)
+        distinct_vendors = step_config.knobs.evidence_require_distinct_vendors
     review_contract = ship.resolve_review_contract(
-        tier=None,
+        tier=args.review_tier,
+        assignment=assignment,
+        require_distinct_vendors=distinct_vendors,
         reviewer_override=args.reviewers,
         review_comments=args.review_comments,
         gates=(),
@@ -1993,12 +3186,14 @@ def _cmd_runcontrols(args: argparse.Namespace) -> int:
         identical_action_threshold=args.identical_action_threshold,
         alternating_diff_window=args.alternating_diff_window,
     )
+    attribution = runcontrols.fix_attribution(events)
     payload = {
         "contract": runcontrols.contract_as_dict(),
         "path": args.events_file,
         "appended": bool(event) and not args.dry_run,
         "event": event,
         "run_controls": report,
+        "fix_attribution": attribution,
     }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -2006,15 +3201,316 @@ def _cmd_runcontrols(args: argparse.Namespace) -> int:
         print(f"keel runcontrols — {report['status']}  {args.events_file}")
         print(f"  events        : {report['summary']['event_count']}")
         print(f"  work units    : {report['summary']['work_units']}")
+        print(f"  attribution   : {attribution['sentence']}")
         if report["reason"]:
             reason = report["reason"]
             print(f"  halt          : {reason['reason']} ({reason['scope']})")
     return 0 if report["status"] == "pass" else 1
 
 
+def _fixloop_config_path(args: argparse.Namespace) -> str:
+    return args.path or str(Path(args.root) / ".keel" / "project.yaml")
+
+
+def _fixloop_assignment(args: argparse.Namespace) -> tuple[dict[str, Any] | None, str | None]:
+    """``(assignment, error)`` — the resolved team for a fix round, or why there is none.
+
+    The same resolution every review-aware command reads (:func:`_review_assignment`),
+    because the fix seat *is* part of the review contract: ``team.fix`` defaults to the
+    alias ``implementer``, and the seat it resolves to is whoever s4 dispatched.
+
+    **An unreadable config is a refusal, not a default.** Falling back to an unconfigured
+    policy here answers "the host fixes" — silently, and identically to a project that
+    really has no policy. That is the failure #1016 exists to prevent, reached by a
+    missing file instead of by a decision: run the command one directory too high and a
+    delegate's findings land on the host with `warnings: []` and exit 0. An operator who
+    means it says so with ``--no-project``.
+    """
+    if args.no_project:
+        return (
+            team.resolve_assignment(
+                team.TeamPolicy(),
+                tier=args.tier,
+                role=args.role,
+                default_count=ship.reviewer_count(args.tier or 2),
+                delegate=args.delegate,
+                host_agent=args.host_agent or agents.HOST_DEFAULT,
+            ),
+            None,
+        )
+    try:
+        config = cfg.load_config(_fixloop_config_path(args))
+    except FileNotFoundError:
+        return None, "no such file"
+    except cfg.ConfigError as exc:
+        return None, str(exc)
+    return _review_assignment(config, args, tier=args.tier), None
+
+
+def _cmd_fixloop_brief(args: argparse.Namespace) -> int:
+    """Render the s9 fix brief and name the seat that fixes this round."""
+    try:
+        raw = json.loads(Path(args.findings).read_text(encoding="utf-8"))
+        parsed = fixloop.parse_findings(raw)
+    except OSError as exc:
+        print(f"cannot read --findings {args.findings}: {exc}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"--findings {args.findings} is not valid JSON: {exc}", file=sys.stderr)
+        return 1
+    except fixloop.FixloopError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    assignment, config_error = _fixloop_assignment(args)
+    if config_error is not None:
+        document = fixloop.no_config_document(
+            path=_fixloop_config_path(args), reason=config_error, round_number=args.round
+        )
+        if args.json:
+            print(json.dumps(document, indent=2, sort_keys=True))
+        print(document["next_action"], file=sys.stderr)
+        return 1
+    try:
+        document = fixloop.brief_document(
+            assignment=assignment,
+            findings=parsed,
+            pr_number=args.pr,
+            round_number=args.round,
+            budget=args.budget,
+            unavailable=tuple(args.unavailable),
+            host_agent=args.host_agent or agents.HOST_DEFAULT,
+            head_sha=args.head,
+            issue_number=args.issue,
+            fix_sha=args.fix_sha,
+            prompt_file=args.out or "-",
+            cwd=args.cwd,
+            timeout=args.timeout,
+            project=args.path,
+        )
+    except fixloop.FixloopError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(document["brief"], encoding="utf-8")
+    if args.json:
+        print(json.dumps(document, indent=2, sort_keys=True))
+    else:
+        print(document["brief"], end="")
+    for warning in document["warnings"]:
+        print(f"warning: {warning}", file=sys.stderr)
+    # Fail closed: a spent budget or an unreachable ladder is not a round to dispatch.
+    return 1 if document["blocked"] else 0
+
+
+_LOOP_OFF = "off"
+
+
+def _loop_policy(args: argparse.Namespace) -> tuple[loop.LoopPolicy | None, str, str | None]:
+    """``(policy, status, reason)`` — the loop policy for this run, or why there is none.
+
+    ``--max-iterations`` is an explicit budget and needs no config. Otherwise the project's
+    ``knobs.loop`` and the ``--loop`` flag resolve the policy exactly as ``keel ship``
+    resolved it — the same :func:`keel.loop.resolve`, so the published ``source`` is the
+    truth — and **a policy that is off is a refusal, not a default**, as an unreadable
+    config is, for the reason ``keel fixloop brief`` refuses: a loop whose budget came
+    from nowhere is a loop nobody bounded.
+    """
+    if args.max_iterations is not None:
+        return (
+            loop.LoopPolicy(
+                True,
+                args.max_iterations,
+                args.gate_output_max_bytes or loop.DEFAULT_GATE_OUTPUT_MAX_BYTES,
+                loop.SOURCE_BUDGET_FLAG,
+                loop.WRAPS_IMPLEMENTATION if args.tdd else loop.WRAPS_IMPLEMENT,
+            ),
+            "ok",
+            None,
+        )
+    try:
+        config = cfg.load_config(_fixloop_config_path(args))
+    except FileNotFoundError:
+        return None, "no-config", "no such file"
+    except cfg.ConfigError as exc:
+        return None, "no-config", str(exc)
+    mode = tdd.resolve_mode(config.knobs.implement_mode, flag=args.tdd)
+    policy = loop.resolve(config.knobs.loop, flag=args.loop, implement_mode=mode.name)
+    if not policy.enabled:
+        return None, _LOOP_OFF, "knobs.loop is absent or enabled: false, and --loop was not passed"
+    if args.gate_output_max_bytes:
+        policy = loop.LoopPolicy(
+            policy.enabled,
+            policy.max_iterations,
+            args.gate_output_max_bytes,
+            policy.source,
+            policy.wraps,
+        )
+    return policy, "ok", None
+
+
+def _print_text(text: str) -> None:
+    """Write text the console codec may not be able to encode, without dying.
+
+    Gate output carries whatever a test runner printed — ``✓``, ``→`` — and a Windows
+    pipe defaults to a codec that cannot encode them; a brief that was already written to
+    ``--out`` must not turn into a traceback on the way to stdout.
+    """
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        sys.stdout.write(text.encode(encoding, "backslashreplace").decode(encoding))
+
+
+def _cmd_loop_brief(args: argparse.Namespace) -> int:
+    """Decide iteration ``k``'s outcome and render iteration ``k+1``'s brief (#1165)."""
+    try:
+        base = Path(args.brief).read_text(encoding="utf-8")
+        gate_results = loop.parse_gates(json.loads(Path(args.gates).read_text(encoding="utf-8")))
+    except OSError as exc:
+        print(f"cannot read the loop inputs: {exc}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"--gates {args.gates} is not valid JSON: {exc}", file=sys.stderr)
+        return 1
+    except loop.LoopError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    policy, status, reason = _loop_policy(args)
+    if policy is None:
+        path = _fixloop_config_path(args)
+        next_action = (
+            f"the loop is off for {path} ({reason}); pass --loop to switch it on against "
+            "the project's numbers, or an explicit --max-iterations"
+            if status == _LOOP_OFF
+            else f"cannot read {path} ({reason}); knobs.loop is the budget, so this is a "
+            "refusal — name the project with --project/--root, or pass an explicit "
+            "--max-iterations"
+        )
+        document = {
+            "schema_version": loop.SCHEMA_VERSION,
+            "status": status,
+            "path": path,
+            "reason": reason,
+            "next_action": next_action,
+        }
+        if args.json:
+            print(json.dumps(document, indent=2, sort_keys=True))
+        print(document["next_action"], file=sys.stderr)
+        return 1
+    try:
+        document = loop.brief_document(
+            base,
+            iteration=args.iteration,
+            gates=gate_results,
+            policy=policy,
+            title=args.title,
+            prompt_file=args.out or "-",
+        )
+    except loop.LoopError as exc:
+        # An empty gate report, or a base brief that is already a rendered one.
+        print(str(exc), file=sys.stderr)
+        return 1
+    if args.out and document["brief"] is not None:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(document["brief"], encoding="utf-8")
+    if args.json:
+        print(json.dumps(document, indent=2, sort_keys=True))
+    elif document["brief"] is not None:
+        _print_text(document["brief"])
+    else:
+        print(document["next_action"])
+    # Fail closed: a spent budget is the blocked-issue path, not an iteration to run.
+    return 1 if document["decision"]["blocked"] else 0
+
+
+def _panel_payload(panel: jury.Panel) -> dict[str, Any]:
+    """The jury panel as machine-readable s9 input: ballots plus gating findings."""
+    return {
+        "size": panel.size,
+        "vendors": list(panel.vendors),
+        "ballots": [
+            {
+                "reviewer": ballot.reviewer,
+                "verdict": ballot.verdict,
+                "vendor": ballot.vendor,
+                "model": ballot.model,
+                "verified_count": ballot.verified_count,
+            }
+            for ballot in panel.ballots
+        ],
+        "findings": [
+            {
+                "severity": finding.severity,
+                "message": finding.message,
+                "source": finding.source,
+                "path": finding.path,
+                "line": finding.line,
+                "decision": fnd.decision_for(finding.severity),
+            }
+            for finding in jury.verified_findings(panel)
+        ],
+    }
+
+
+def _bundle_flag(args: argparse.Namespace) -> str:
+    """Which flag supplied the review bundle, for error messages."""
+    return "from-jury" if args.from_jury is not None else "reviews"
+
+
+def _bundle_path(args: argparse.Namespace) -> str:
+    return args.from_jury if args.from_jury is not None else args.reviews
+
+
+def _review_bundle(
+    args: argparse.Namespace,
+) -> tuple[tuple[review.ReviewItem, ...], dict[str, Any] | None, jury.Panel | None]:
+    """The verdicts to post, and the jury record that accompanies them (#1015).
+
+    Two sources, never both. ``--reviews`` is the host-supplied bundle: the host
+    ran the reviewers and hands keel their content. ``--from-jury`` is an ai-jury
+    JSON report, whose per-reviewer ballots *are* the review on a tier whose
+    ``knobs.team`` policy makes the jury the panel — one head-pinned verdict per
+    ballot, carrying the vendor and model that actually produced it, plus the
+    panel's own consensus record as the jury verdict. That is the point of the
+    mapping: the panel is dispatched once and its ballots become s7 evidence,
+    instead of paying for host reviewers *and* a panel over the same diff.
+    """
+    if args.from_jury is None:
+        raw = json.loads(Path(args.reviews).read_text(encoding="utf-8"))
+        return review.parse_reviews(raw), None, None
+    panel = jury.parse_panel(Path(args.from_jury).read_text(encoding="utf-8"))
+    if panel is None:
+        raise ValueError(
+            f"--from-jury {args.from_jury} is not an ai-jury report carrying per-reviewer "
+            "ballots; produce one with `jury --format json` (report schema 1.1+), or supply "
+            "the ballots directly with --reviews"
+        )
+    if not panel.ballots:
+        raise ValueError(
+            f"--from-jury {args.from_jury} carries no panelist ballot; the panel returned no "
+            "review to post, so there is no s7 evidence to map"
+        )
+    return (
+        review.parse_reviews([dict(item) for item in panel.reviews()]),
+        jury.jury_verdict(panel),
+        panel,
+    )
+
+
 def _cmd_review(args: argparse.Namespace) -> int:
     if args.dry_run and args.live:
         print("--dry-run and --live cannot be used together", file=sys.stderr)
+        return 1
+    if (args.reviews is None) == (args.from_jury is None):
+        print(
+            "exactly one of --reviews or --from-jury is required: the review bundle is "
+            "either the host's or the jury panel's, never both",
+            file=sys.stderr,
+        )
         return 1
     dry_run = not args.live
     try:
@@ -2035,15 +3531,16 @@ def _cmd_review(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        raw_reviews = json.loads(Path(args.reviews).read_text(encoding="utf-8"))
-        reviews = review.parse_reviews(raw_reviews)
+        reviews, jury_record, panel = _review_bundle(args)
     except OSError as exc:
-        print(f"cannot read --reviews {args.reviews}: {exc}", file=sys.stderr)
+        print(f"cannot read --{_bundle_flag(args)} {_bundle_path(args)}: {exc}", file=sys.stderr)
         return 1
     except json.JSONDecodeError as exc:
-        print(f"--reviews {args.reviews} is not valid JSON: {exc}", file=sys.stderr)
+        print(
+            f"--{_bundle_flag(args)} {_bundle_path(args)} is not valid JSON: {exc}", file=sys.stderr
+        )
         return 1
-    except review.ReviewError as exc:
+    except (review.ReviewError, jury.JuryReportError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -2124,6 +3621,32 @@ def _cmd_review(args: argparse.Namespace) -> int:
         reviewer_override=args.reviewers,
         gates=config.gates,
         policy_pack=config.policy_pack,
+        require_distinct_vendors=config.knobs.evidence_require_distinct_vendors,
+        assignment=_review_assignment(config, args, tier=tier),
+        # The same three flags every other review-aware surface accepts (#1043). They
+        # never move the bench — that is a pure function of config + tier + role +
+        # `--reviewers` / `--review-delegate` — but they own the jury line, and a
+        # surface that cannot hear them resolves a different one: on a plain tier-3
+        # config `keel review --verify` reported `jury-verdict` as required while the
+        # `keel ship --no-jury` run that produced the PR was told never to post it.
+        jury=args.jury,
+        no_jury=args.no_jury,
+        jury_advisory=args.jury_advisory,
+        # The panel that ran sizes the bench it has to fill: `--from-jury` knows how
+        # many ballots came back, so a jury-panel tier requires exactly those and the
+        # posting side cannot disagree with the gate that reads them back (#1015).
+        # Orthogonal to the flags above: `--from-jury` says where the verdicts come
+        # from, the flags say whether the contract requires a jury verdict at all, and
+        # a jury-panel tier outranks both (`ship.resolve_jury`).
+        jury_panel_size=None if panel is None else panel.size,
+        # …and the panel's vendor span travels with its size, for the same reason. The
+        # panel is right here, so this run can measure what `evidence-verify` will later
+        # recompute from the `vendors: N` line `jury_verdict` posts. Passing the size
+        # alone left the two disagreeing on a *non-panel* tier: a short panel's
+        # `jury-verdict` is downgraded gating -> advisory and dropped from the required
+        # evidence by the gate, while this surface — seeing no vendor count — kept
+        # resolving `gating` and reported a requirement the gate would not enforce.
+        jury_participating_vendors=None if panel is None else len(panel.vendors),
     )
     required_count = review_contract["reviewers"]["count"]
 
@@ -2137,6 +3660,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
             run_id=args.run_id,
             tier=tier,
             closure_record=closure_record,
+            jury_record=jury_record,
         )
     except review.ReviewError as exc:
         print(str(exc), file=sys.stderr)
@@ -2189,9 +3713,11 @@ def _cmd_review(args: argparse.Namespace) -> int:
                 root=args.root,
                 reviewers=args.reviewers,
                 review_comments="inline",
-                jury=False,
-                no_jury=False,
-                jury_advisory=False,
+                # What the operator typed, not a hardcoded false: the re-verification
+                # has to be the same contract this command just posted against (#1043).
+                jury=args.jury,
+                no_jury=args.no_jury,
+                jury_advisory=args.jury_advisory,
                 gate_label=None,
                 waiver_label=None,
             ),
@@ -2201,12 +3727,22 @@ def _cmd_review(args: argparse.Namespace) -> int:
 
     result_payload = {
         "schema_version": review.SCHEMA_VERSION,
+        # The contract this posting run resolved, published for the same reason `plan`
+        # and `ship` publish theirs: the six review-aware surfaces are only checkable
+        # against each other if each one says which contract it resolved (#1043).
+        "review_contract": review_contract,
         "plan": plan.as_dict(),
         "dry_run": dry_run,
         "transport": transport.name,
         "posted": posted,
         "consent": operator_consent["status"],
         "verification": verification,
+        # The panel's verified consensus findings, already in keel's severity
+        # vocabulary, so s9 consumes a jury panel's output exactly as it consumes a
+        # host reviewer's: critical/major block, minor is a gated suggestion, nit is
+        # advisory. Absent (`None`) on the host-bundle path, where the host already
+        # holds the findings it supplied.
+        "panel": None if panel is None else _panel_payload(panel),
     }
     if args.json:
         print(json.dumps(result_payload, indent=2, sort_keys=True))
@@ -2215,6 +3751,8 @@ def _cmd_review(args: argparse.Namespace) -> int:
         print(f"keel review — {mode}  PR #{args.pr}")
         print(f"  tier          : {tier if tier is not None else 'unresolved'}")
         print(f"  required      : {required_count}")
+        jury_line = review_contract["jury"]
+        print(f"  jury          : {jury_line['mode']} ({jury_line['reason']})")
         print(f"  supplied      : {plan.supplied_count}")
         print(f"  posts         : {len(plan.posts)}")
         if verification is not None:
@@ -2258,6 +3796,76 @@ def _cmd_review_cycle_summary(args: argparse.Namespace) -> int:
         )
     else:
         print(body, end="")
+    return 0
+
+
+def _cmd_attribution(args: argparse.Namespace) -> int:
+    """Print keel's own attribution labels for a vendor/model pair.
+
+    The one sanctioned way for an adapter to learn what to label a PR with (#1013).
+    Every branch here is a thin wrapper over :mod:`keel.agents`; the labels are never
+    composed in this function, so prose and CLI cannot drift apart.
+    """
+    config = None
+    if args.config is not None:
+        try:
+            config = cfg.load_config(args.config)
+        except FileNotFoundError:
+            print(f"no such config: {args.config}", file=sys.stderr)
+            return 1
+        except cfg.ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    vendor = args.vendor.strip().lower()
+    if config is not None and vendor not in agents.known_vendors(config):
+        # Only with a config in hand: without one keel cannot know which profiles
+        # this project defines, and the ledger carries values written by older runs.
+        known = ", ".join(sorted(agents.known_vendors(config)))
+        print(
+            f"unknown vendor {args.vendor!r}: not a built-in delegate vendor and not a "
+            f"configured delegate profile. Known: {known}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.profile is not None:
+        if config is None:
+            print("--profile requires --config to resolve the delegate profile", file=sys.stderr)
+            return 1
+        profile = agents.resolve_delegate_profile(config, args.profile)
+        if profile is None:
+            print(
+                f"no delegate profile named {args.profile!r} in knobs.delegate_profiles",
+                file=sys.stderr,
+            )
+            return 1
+        # Compared against `label_vendor()`, which is the vendor this profile's
+        # attribution reports — `vendor_label` when it declares one (#1129). Comparing
+        # against the raw `vendor` refused the only spelling that is ever written into a
+        # label, so `--vendor xai --profile grok` contradicted a profile whose own
+        # attribution says `agent:xai`.
+        if vendor != profile.label_vendor():
+            # A contradiction, not a preference: one of the two would silently lose,
+            # and attribution exists precisely to stop a guessed value being recorded.
+            print(
+                f"--vendor {args.vendor!r} contradicts profile {args.profile!r} "
+                f"(vendor: {profile.label_vendor()})",
+                file=sys.stderr,
+            )
+            return 1
+        record = agents.profile_attribution(args.profile, profile, args.model)
+    else:
+        record = agents.attribution(vendor, args.model)
+
+    if args.json:
+        print(json.dumps(record, indent=2, sort_keys=True))
+        return 0
+    print(f"agent_label   : {record['agent_label']}")
+    print(f"model_label   : {record['model_label'] or 'not recorded'}")
+    print(f"system        : {record['system']}")
+    if record.get("delegate_profile"):
+        print(f"delegate_profile: {record['delegate_profile']}")
     return 0
 
 
@@ -2333,6 +3941,17 @@ def _cmd_post_comment(args: argparse.Namespace) -> int:
         body = Path(args.body_file).read_text(encoding="utf-8")
     except OSError as exc:
         print(f"cannot read --body-file {args.body_file}: {exc}", file=sys.stderr)
+        return 1
+    except UnicodeDecodeError:
+        # Not an OSError, so without this it escaped as a traceback. keel's artifact
+        # bodies are UTF-8 (closure comments carry "—", "→", "⚓"), but a shell that
+        # redirected `keel ship --json` output on a non-UTF-8 locale writes something
+        # else. Say so, rather than crashing before the marker check even runs.
+        print(
+            f"--body-file {args.body_file} is not valid UTF-8; "
+            "re-render the artifact body as UTF-8",
+            file=sys.stderr,
+        )
         return 1
     if marker not in body:
         print(
@@ -2471,6 +4090,13 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
         if changed_files
         else None
     )
+    # Loaded before the contract, not after it: `run_context.jury_panel` is what pins the
+    # required evidence to the panel decision this pull request was *shipped* under (#1066).
+    try:
+        ledger_record = _evidence_ledger_record(args, config)
+    except ledger.LedgerError as exc:
+        print(f"invalid run ledger: {exc}", file=sys.stderr)
+        return 1
     review_contract = ship.resolve_review_contract(
         tier=tier,
         reviewer_override=args.reviewers,
@@ -2480,8 +4106,25 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
         jury=args.jury,
         no_jury=args.no_jury,
         jury_advisory=args.jury_advisory,
+        # The same team `keel ship` resolved. Without it a `review.by_tier."3": jury`
+        # project fails its own gate forever: ship publishes zero reviewer slots and
+        # this side demands review-verdict-1..3.
+        assignment=_review_assignment(
+            config,
+            args,
+            tier=tier,
+            # …and the same *panel decision* it resolved that team under. This surface
+            # verifies; it does not dispatch. Re-probing here answers "could this runner
+            # convene a panel", which silently rewrites the contract of a change juried
+            # somewhere else.
+            pinned=_shipped_jury_availability(artifacts, ledger_record),
+        ),
+        # `or None` keeps the knob tri-state: an unset knob and an unset flag leave the
+        # claim unmade, while --require-distinct-vendors forces it on.
         require_distinct_vendors=(
-            args.require_distinct_vendors or config.knobs.evidence_require_distinct_vendors
+            True
+            if args.require_distinct_vendors
+            else config.knobs.evidence_require_distinct_vendors
         ),
         # An explicit --jury-vendors wins; otherwise take the count a posted jury
         # verdict declared, so the downgrade works unattended in CI where neither
@@ -2493,7 +4136,18 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
                 artifacts["pr_comments"],
                 artifacts["pr_reviews"],
                 head_sha=artifacts["head_sha"],
+                covered_heads=artifacts.get("covered_heads", ()),
             )
+        ),
+        # The panel size the posted jury verdict declared. On a tier whose panel *is*
+        # the review this is the required verdict count, and it travels on the comment
+        # for the same reason the vendor count does: nothing under .keel/state/ is
+        # readable from a hosted runner (#1015).
+        jury_panel_size=evidence.jury_panel_size(
+            artifacts["pr_comments"],
+            artifacts["pr_reviews"],
+            head_sha=artifacts["head_sha"],
+            covered_heads=artifacts.get("covered_heads", ()),
         ),
     )
     gate_label = args.gate_label or config.knobs.evidence_gate_label
@@ -2507,11 +4161,6 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
         pr_reviews=artifacts["pr_reviews"],
     )
     enforced = gate["enforced"]
-    try:
-        ledger_record = _evidence_ledger_record(args, config)
-    except ledger.LedgerError as exc:
-        print(f"invalid run ledger: {exc}", file=sys.stderr)
-        return 1
     report = evidence.verify(
         review_contract,
         pr_comments=artifacts["pr_comments"],
@@ -2521,6 +4170,7 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
         pr_title=artifacts.get("pr_title", ""),
         pr_labels=artifacts["pr_labels"],
         head_sha=artifacts["head_sha"],
+        covered_heads=artifacts.get("covered_heads", ()),
         ledger_record=ledger_record,
         dry_run=args.dry_run,
         enforced=enforced,
@@ -2592,7 +4242,9 @@ def _cmd_evidence_verify(args: argparse.Namespace) -> int:
     return 1
 
 
-def _overtaking_prs(args: argparse.Namespace, timing: dict) -> tuple[dict, bool]:
+def _overtaking_prs(
+    args: argparse.Namespace, timing: dict, *, rest: bool = False
+) -> tuple[dict, bool]:
     """Paths changed by a PR merged after ``args.pr`` branched, and whether that
     list is complete (#561).
 
@@ -2612,9 +4264,8 @@ def _overtaking_prs(args: argparse.Namespace, timing: dict) -> tuple[dict, bool]
     that — which is the same rule ``judge_pins`` applies to unreachable repositories
     in ``tests/test_action_pins.py``.
     """
-    others = github.prs_merged_between(
-        timing["base"], timing["branched_at"], timing["merged_at"], cwd=args.root
-    )
+    reader = github.rest_prs_merged_between if rest else github.prs_merged_between
+    others = reader(timing["base"], timing["branched_at"], timing["merged_at"], cwd=args.root)
     if others is None:
         return {}, False
     overtaken: dict = {}
@@ -2622,7 +4273,11 @@ def _overtaking_prs(args: argparse.Namespace, timing: dict) -> tuple[dict, bool]
     for number in others:
         if number == args.pr:
             continue
-        files = github.pr_files(number, cwd=args.root)
+        files = (
+            github.rest_pr_files(number, cwd=args.root)
+            if rest
+            else github.pr_files(number, cwd=args.root)
+        )
         if files is None:
             complete = False
             continue
@@ -2631,7 +4286,14 @@ def _overtaking_prs(args: argparse.Namespace, timing: dict) -> tuple[dict, bool]
     return overtaken, complete
 
 
-def _merge_drift_report(args: argparse.Namespace) -> dict:
+#: The two transports `keel merge` and `keel verify-merge` can read GitHub through.
+TRANSPORT_GRAPHQL = "gh-graphql"
+TRANSPORT_REST = "gh-rest"
+#: What `--transport` accepts. `auto` probes once per run; the other two force.
+_TRANSPORT_CHOICES = ("auto", "graphql", "rest")
+
+
+def _merge_drift_report(args: argparse.Namespace, *, transport: str | None = None) -> dict:
     """Build the merge-drift report for ``args.pr``; pure judgement over GitHub reads.
 
     Extracted so the check has two callers instead of one: the ``verify-merge``
@@ -2644,7 +4306,8 @@ def _merge_drift_report(args: argparse.Namespace) -> dict:
     the report, so a caller running this *after* an irreversible merge still gets
     an answer it can print rather than a traceback over a landed commit.
     """
-    timing = github.pr_merge_window(args.pr, cwd=args.root)
+    transport, timing = _pr_timing(args, transport)
+    rest = transport == TRANSPORT_REST
     merge_sha = getattr(args, "merge_sha", None) or (timing or {}).get("merge_commit")
     if not merge_sha or not timing:
         report = mergeverify.verify_merge(None)
@@ -2656,9 +4319,15 @@ def _merge_drift_report(args: argparse.Namespace) -> dict:
         # A missing input silently downgrades a real check into a weaker one that
         # still prints `clean`: the drift signal needs the overtaking set, and the
         # out-of-scope signal needs the PR's own file list (#933).
+        # `commit_files` is already REST (`gh api …/commits/<sha>`), so it is the one
+        # read that needed nothing done to it.
         landed = github.commit_files(merge_sha, cwd=args.root)
-        overtaken, overtaken_complete = _overtaking_prs(args, timing)
-        intended = github.pr_files(args.pr, cwd=args.root)
+        overtaken, overtaken_complete = _overtaking_prs(args, timing, rest=rest)
+        intended = (
+            github.rest_pr_files(args.pr, cwd=args.root)
+            if rest
+            else github.pr_files(args.pr, cwd=args.root)
+        )
         # Each input answers a specific question, so an unreadable one leaves that
         # question open rather than the whole report meaningless. Saying "no
         # conclusion about drift is possible" when only the PR's own file list was
@@ -2705,6 +4374,9 @@ def _merge_drift_report(args: argparse.Namespace) -> dict:
                 )
     report["pull_request"] = args.pr
     report["merge_commit"] = merge_sha
+    # Recorded beside the verdict, not only in the merge payload: the drift check runs
+    # on its own too, and which wire answered it is part of reading the answer.
+    report["transport"] = transport
     return report
 
 
@@ -2841,7 +4513,7 @@ def _cmd_verify_branch(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         print(f"keel verify-branch — {report['status']}  PR #{args.pr}")
-        print(f"  base          : origin/{base_branch}")
+        print(f"  base          : {_remote_base_ref(base_branch)}")
         print(f"  verdict       : {report['verdict']}")
         ancestry = report["ancestry"]
         if ancestry["base_distance"] is not None:
@@ -2867,7 +4539,6 @@ def _gather_branch_facts(args: argparse.Namespace, base_branch: str) -> dict[str
     """
     head_sha = args.head_sha
     head_ref = args.head_ref
-    base_ref = f"origin/{base_branch}"
     if head_sha is None and not args.offline:
         owner_repo = _owner_repo_from_args(args)
         pr = _gh_json(["repos", owner_repo, "pulls", str(args.pr)], cwd=args.root)
@@ -2880,7 +4551,17 @@ def _gather_branch_facts(args: argparse.Namespace, base_branch: str) -> dict[str
     base_distance = args.base_distance
     if not args.offline:
         if base_tip_sha is None:
-            base_tip_sha = git.rev_parse(base_ref, cwd=args.root)
+            # **The remote ref or nothing**, never `_ship_base_ref`: the name is shared,
+            # the fallback is not. `docs/keel/cli.md` and `branchscope._check_ancestry`
+            # both promise that a fact which cannot be resolved becomes `None` and the
+            # check is skipped as advisory. Falling back to the local branch would answer
+            # the ancestry question against a ref that may be days behind while the summary
+            # still printed `origin/<base>` — a pass reported for an origin nobody observed.
+            # Resolved here, not hoisted: a caller supplying `--base-tip-sha` wants no live
+            # call, and hoisting turned that documented short-circuit into one lookup.
+            # Exact, not `rev-parse`: a missing tracking ref would let a local branch
+            # literally named `refs/remotes/origin/<base>` answer for it (#1223).
+            base_tip_sha = git.resolve_ref(_remote_base_ref(base_branch), cwd=args.root)
         if merge_base_sha is None and head_sha is not None and base_tip_sha is not None:
             merge_base_sha = git.merge_base(head_sha, base_tip_sha, cwd=args.root)
         if base_distance is None and merge_base_sha is not None and base_tip_sha is not None:
@@ -3364,6 +5045,17 @@ def _finish_merge(
         ci_payload = payload.get("ci")
         if isinstance(ci_payload, dict):
             print(f"  ci     : {ci_payload.get('state')}")
+        transport = payload.get("transport")
+        if transport == TRANSPORT_REST and getattr(args, "transport", "auto") == "auto":
+            # Named only when it is the unusual one. A run that went over GraphQL went
+            # the way every other run goes, and a line saying so on every merge is noise;
+            # a run that fell back did so because this host cannot reach an endpoint, and
+            # that is worth seeing without asking for `--json`.
+            # Only `auto` learned that, by asking. A forced `--transport rest` never
+            # probed, so saying so would state a fact the run did not establish.
+            print(f"  transport: {transport} (GraphQL is unreachable from this host)")
+        elif transport == TRANSPORT_REST:
+            print(f"  transport: {transport}")
         evidence_payload = payload.get("evidence")
         if isinstance(evidence_payload, dict):
             verification = evidence_payload.get("verification")
@@ -3394,7 +5086,120 @@ def _finish_merge(
     return code
 
 
-def _merge_snapshot(pr: int, *, cwd: str) -> dict[str, object]:
+def _forced_transport(args: argparse.Namespace) -> str:
+    """The transport to try first, from `--transport`. `auto` starts on GraphQL."""
+    return TRANSPORT_REST if getattr(args, "transport", "auto") == "rest" else TRANSPORT_GRAPHQL
+
+
+def _falls_back_to_rest(args: argparse.Namespace) -> bool:
+    """Did a GraphQL read fail **because the endpoint is unreachable**? (#1175)
+
+    Asked only after a read has already failed, and only under `--transport auto`.
+    Probing first would put an extra API call on every merge on every host to answer a
+    question nearly all of them answer the same way, and a host that can reach GraphQL
+    must cost exactly what it cost before this existed.
+
+    The probe is what makes the answer definite. A failed `gh pr view --json` says
+    nothing on its own — no such pull request, no auth, a rate limit and a blocked
+    endpoint all exit non-zero — and deciding between them by matching on `gh`'s
+    wording is the kind of guess that silently re-routes a merge. `gh api graphql` with
+    a trivial query asks the endpoint directly.
+
+    The answer is a fact about the **host**, so it is asked once and then governs the
+    merge as well as the reads. The merge is never the call that discovers it: by the
+    time anything is written the transport is already fixed, so no pull request can be
+    merged twice by being retried over a second wire.
+    """
+    return getattr(args, "transport", "auto") == "auto" and not github.graphql_available(
+        cwd=args.root
+    )
+
+
+class _SnapshotFailed(Exception):
+    """A snapshot read that failed, carrying the transport it failed **on**.
+
+    The refusal is recorded with a transport, and the one the run started on is not
+    always the one it ended on: a blocked endpoint moves the run to REST, and a REST
+    read that then fails for its own reason was reported as `gh-graphql` — naming a
+    wire the failing call never touched.
+    """
+
+    def __init__(self, transport: str, reason: str):
+        super().__init__(reason)
+        self.transport = transport
+
+
+def _merge_snapshot_over_best_transport(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
+    """``(transport, snapshot)`` — GraphQL first, REST when the endpoint is blocked."""
+    transport = _forced_transport(args)
+    try:
+        return transport, _merge_snapshot(args.pr, cwd=args.root, transport=transport)
+    except ValueError as exc:
+        if transport == TRANSPORT_REST or not _falls_back_to_rest(args):
+            raise _SnapshotFailed(transport, str(exc)) from exc
+    try:
+        return TRANSPORT_REST, _merge_snapshot(args.pr, cwd=args.root, transport=TRANSPORT_REST)
+    except ValueError as exc:
+        raise _SnapshotFailed(TRANSPORT_REST, str(exc)) from exc
+
+
+def _pr_timing(args: argparse.Namespace, transport: str | None) -> tuple[str, dict | None]:
+    """The merge-window read, and the transport that produced it.
+
+    ``verify-merge`` has no exception to catch — every failed read becomes ``unknown``
+    inside the report on purpose — so an unreadable window is what stands in for "the
+    read failed" here. It is also what a genuinely unmerged pull request looks like,
+    which is why the probe and not the symptom decides.
+    """
+    if transport is None:
+        transport = _forced_transport(args)
+    reader = github.rest_pr_merge_window if transport == TRANSPORT_REST else github.pr_merge_window
+    timing = reader(args.pr, cwd=args.root)
+    if timing is None and transport == TRANSPORT_GRAPHQL and _falls_back_to_rest(args):
+        return TRANSPORT_REST, github.rest_pr_merge_window(args.pr, cwd=args.root)
+    return transport, timing
+
+
+def _rest_snapshot(pr: int, *, cwd: str) -> dict[str, object]:
+    """:func:`_merge_snapshot`'s three fields, read over REST.
+
+    `mergeable_state` is REST's lower-case spelling of the same state machine
+    `mergeStateStatus` reports, so upper-casing it *is* the translation — the caller
+    compares against `CLEAN` / `HAS_HOOKS` / `UNKNOWN` and must keep comparing against
+    exactly those. REST has no rollup field, so the rollup is assembled from the two
+    endpoints that hold its halves and translated into the shape the reducer reads.
+    """
+    pull = github.rest_json(github.rest_pull(pr, cwd=cwd))
+    if not isinstance(pull, dict):
+        raise ValueError(f"unable to read PR merge snapshot: gh api pulls/{pr} returned no object")
+    head_sha = ((pull.get("head") or {}) if isinstance(pull.get("head"), dict) else {}).get("sha")
+    state = pull.get("mergeable_state")
+    rollup: list[object] = []
+    if isinstance(head_sha, str) and head_sha:
+        checks = github.rest_json(github.rest_check_runs(head_sha, cwd=cwd))
+        if checks is None:
+            # **Fail closed.** An empty rollup means "no check has reported", which the
+            # docs-only carve-out is allowed to merge through; a rollup that could not be
+            # read means nothing of the kind. Collapsing the two would let an unreachable
+            # endpoint stand in for a green head on any docs PR. The GraphQL path raises
+            # here for the same reason — a failed `gh pr view` is not an empty rollup.
+            raise ValueError(f"unable to read the check rollup for {head_sha}")
+        statuses = github.rest_json(github.rest_commit_statuses(head_sha, cwd=cwd))
+        if statuses is None:
+            # The same rule as the check runs above, and for the same reason: a half of
+            # the rollup that could not be read is not a half that is empty.
+            raise ValueError(f"unable to read the commit statuses for {head_sha}")
+        rollup = list(github.rest_rollup(checks, statuses))
+    return {
+        "head_sha": head_sha,
+        "merge_state": state.upper() if isinstance(state, str) and state else "UNKNOWN",
+        "ci": _ci_rollup_state(rollup),
+    }
+
+
+def _merge_snapshot(pr: int, *, cwd: str, transport: str = TRANSPORT_GRAPHQL) -> dict[str, object]:
+    if transport == TRANSPORT_REST:
+        return _rest_snapshot(pr, cwd=cwd)
     result = github.pr_merge_snapshot(pr, cwd=cwd)
     if not result.ok:
         raise ValueError(f"unable to read PR merge snapshot: {result.output.strip()}")
@@ -3414,6 +5219,41 @@ def _merge_snapshot(pr: int, *, cwd: str) -> dict[str, object]:
 _PENDING_CHECK_STATES = {"EXPECTED", "PENDING", "QUEUED", "REQUESTED", "WAITING", "IN_PROGRESS"}
 
 
+def _rollup_verdict(entry: dict) -> tuple[str, bool]:
+    """``(conclusion, pending)`` for one rollup entry, whichever shape it arrived in.
+
+    ``statusCheckRollup`` is a **union**. A ``CheckRun`` carries ``status`` and
+    ``conclusion``; a ``StatusContext`` — a commit status, which is how non-Actions CI
+    and most third-party integrations report — carries its whole verdict in ``state``:
+    ``SUCCESS`` / ``FAILURE`` / ``ERROR`` / ``PENDING`` / ``EXPECTED``.
+
+    Reading only the first pair meant a status arrived with no conclusion and no
+    recognised pending status, so it was neither a failure nor in flight — and was
+    therefore counted as a check that had *reported*. A **failing** Jenkins status scored
+    the head ``pass`` and did not block the merge. The one repository this is measured on
+    posts no commit statuses at all (29 check-runs, 0 statuses on `main` at `d432725`),
+    which is why it stayed invisible here and not for a consumer.
+
+    ``state`` is read only when neither of the other two is present, so a ``CheckRun``
+    cannot be re-judged by a field it does not own.
+    """
+    conclusion = _upper_or_empty(entry.get("conclusion"))
+    status = _upper_or_empty(entry.get("status"))
+    if conclusion or status:
+        return conclusion, not conclusion and status in _PENDING_CHECK_STATES
+    state = _upper_or_empty(entry.get("state"))
+    if state in _PENDING_CHECK_STATES:
+        return "", True
+    # An entry carrying none of the three keeps the behaviour it has always had: not a
+    # failure, not pending, still a check that reported. Changing that is a separate
+    # question about malformed payloads, not about commit statuses.
+    return state, False
+
+
+def _upper_or_empty(value: object) -> str:
+    return value.upper() if isinstance(value, str) else ""
+
+
 def _rollup_recency(entry: dict) -> tuple[bool, str]:
     """Sort key: a check genuinely still in flight is always a more recent
     attempt than any concluded entry for the same check — a new run cannot be
@@ -3427,9 +5267,7 @@ def _rollup_recency(entry: dict) -> tuple[bool, str]:
     outranking a concluded entry, so a genuine stale failure can never be
     masked by an unrecognized shape.
     """
-    status_value = entry.get("status")
-    status_value = status_value.upper() if isinstance(status_value, str) else ""
-    pending = not entry.get("conclusion") and status_value in _PENDING_CHECK_STATES
+    _, pending = _rollup_verdict(entry)
     stamp = entry.get("completedAt") or entry.get("startedAt") or ""
     return (pending, stamp)
 
@@ -3469,18 +5307,14 @@ def _ci_rollup_state(rollup: list[object]) -> dict[str, object]:
         "STALE",
         "TIMED_OUT",
     }
-    pending_states = _PENDING_CHECK_STATES
     saw_pending = False
     saw_check = False
     for item in _dedupe_rollup(rollup):
         saw_check = True
-        conclusion = item.get("conclusion")
-        conclusion = conclusion.upper() if isinstance(conclusion, str) else ""
-        status_value = item.get("status")
-        status_value = status_value.upper() if isinstance(status_value, str) else ""
+        conclusion, pending = _rollup_verdict(item)
         if conclusion in failures:
             return {"state": "fail", "reason": conclusion}
-        if not conclusion and status_value in pending_states:
+        if pending:
             saw_pending = True
     if saw_pending:
         return {"state": "pending", "reason": "check-pending"}
@@ -3541,6 +5375,25 @@ def _verify_merge_evidence(
         no_jury=args.no_jury,
         jury_advisory=args.jury_advisory,
         require_distinct_vendors=config.knobs.evidence_require_distinct_vendors,
+        # `keel merge` verifies the same evidence contract ship produced, so it resolves
+        # the same team — and, for the same reason, under the same panel decision that ship
+        # measured rather than one taken again here (#1066). A merge gate that disagreed
+        # with the ship contract about the reviewer bench, or about whether a panel sat,
+        # would refuse a PR that satisfied every requirement it was given.
+        assignment=_review_assignment(
+            config,
+            args,
+            tier=tier,
+            pinned=_shipped_jury_availability(artifacts, _merge_ledger_record(args, config)),
+        ),
+        # …and reads the panel size off the same posted jury verdict `evidence-verify`
+        # reads, so a jury-panel tier is held to the panel that actually ran (#1015).
+        jury_panel_size=evidence.jury_panel_size(
+            artifacts["pr_comments"],
+            artifacts["pr_reviews"],
+            head_sha=artifacts["head_sha"],
+            covered_heads=artifacts.get("covered_heads", ()),
+        ),
     )
     gate_label = args.gate_label or config.knobs.evidence_gate_label
     waiver_label = getattr(args, "waiver_label", None) or evidence.DEFAULT_WAIVER_LABEL
@@ -3562,6 +5415,7 @@ def _verify_merge_evidence(
         pr_title=artifacts.get("pr_title", ""),
         pr_labels=artifacts["pr_labels"],
         head_sha=artifacts["head_sha"],
+        covered_heads=artifacts.get("covered_heads", ()),
         enforced=enforced,
         phase=phase,
     )
@@ -3572,6 +5426,7 @@ def _verify_merge_evidence(
         "enforced": enforced,
         "verification": report,
         "head_sha": artifacts["head_sha"],
+        "covered_heads": list(artifacts.get("covered_heads", ())),
         "head_ref": artifacts.get("head_ref"),
         "changed_files": changed_files,
         "docs_only": docs_only,
@@ -3605,6 +5460,95 @@ def _issue_context_provided(args: argparse.Namespace) -> bool:
     )
 
 
+#: How many capture commits the head-pin walk will step back through before it stops.
+#: A ship adds one; a resumed or re-captured one might add a second. Past this bound the
+#: walk stops and covers what it has proven so far, rather than reading a long history.
+_COVERED_HEADS_LIMIT = 10
+
+
+def _commit_facts(owner_repo: str, sha: str, *, cwd: str) -> dict[str, object] | None:
+    """``{sha, parents, message, files}`` for one commit, or ``None`` when unreadable.
+
+    Read from the API rather than the checkout, so it answers the same on a CI runner
+    as in a worktree. A commit it cannot read is not a capture commit: the walk that
+    consumes this removes a requirement, so an unreadable step stops it.
+    """
+    try:
+        payload = _gh_json(["repos", owner_repo, "commits", sha], cwd=cwd)
+    except ValueError:
+        return None
+    commit = payload.get("commit")
+    parents = payload.get("parents")
+    files = payload.get("files")
+    entries = [f for f in files if isinstance(f, dict)] if isinstance(files, list) else None
+    return {
+        "sha": payload.get("sha"),
+        "parents": [
+            p.get("sha") for p in parents if isinstance(p, dict) and isinstance(p.get("sha"), str)
+        ]
+        if isinstance(parents, list)
+        else None,
+        "message": commit.get("message") if isinstance(commit, dict) else None,
+        # **Every path the commit touches, not only where each file ended up.** The API
+        # reports a rename as *one* entry — `status: renamed`, `filename` the new path,
+        # `previous_filename` the old — so a commit carrying the landing marker that
+        # renamed `src/keel/cli.py` into the sink read as exactly one path inside it,
+        # passed the exemption, and kept the review pins over a tree that had just lost a
+        # reviewed file. Counting the old path too makes that two paths, which it is.
+        "files": [
+            path
+            for entry in entries
+            for path in (entry.get("previous_filename"), entry.get("filename"))
+            if isinstance(path, str)
+        ]
+        if entries is not None
+        else None,
+        "statuses": [entry.get("status") for entry in entries] if entries is not None else None,
+    }
+
+
+def _covered_heads(
+    config: cfg.ProjectConfig,
+    owner_repo: str,
+    pr_number: int | None,
+    head_sha: str | None,
+    *,
+    cwd: str,
+) -> tuple[str, ...]:
+    """Heads that ``head_sha`` answers for because only capture commits separate them.
+
+    Walks back from the current head: while the tip is a capture commit on top of its one
+    parent — `capture.capture_only_descent` says so, the same predicate the gates read —
+    the parent is covered and the walk steps to it. The first commit that is anything
+    else ends it. A ship adds one capture commit, so this is ordinarily two reads.
+
+    Walking back rather than testing each head a verdict was pinned to is what keeps it
+    cheap: a pull request that went through eight review rounds has eight such heads,
+    most of them ancestors by *code* commits, and each would cost a compare and a read
+    per commit only to be refused.
+
+    Empty unless this project lands learnings into the repository at all. The exemption
+    exists for that mechanism; a project with no in-repo sink has no capture commits to
+    exempt, and granting it anyway would turn a marker and a path into a way past a pin.
+    """
+    if not head_sha or not capture.learning_sink_in_worktree(config):
+        return ()
+    sink = capture.land_sink_root(config, pr_number=pr_number, base_branch=config.base_branch or "")
+    covered: list[str] = []
+    current = head_sha
+    for _ in range(_COVERED_HEADS_LIMIT):
+        facts = _commit_facts(owner_repo, current, cwd=cwd)
+        parents = facts.get("parents") if facts else None
+        if not isinstance(parents, list) or len(parents) != 1:
+            break
+        parent = parents[0]
+        if not capture.capture_only_descent(parent, current, [facts], sink=sink):
+            break
+        covered.append(parent)
+        current = parent
+    return tuple(covered)
+
+
 def _load_evidence_artifacts(
     args: argparse.Namespace,
     config: cfg.ProjectConfig,
@@ -3619,6 +5563,7 @@ def _load_evidence_artifacts(
     # the path, which is the behaviour that existed before #794.
     patches: dict[str, str] = {}
     head_sha = args.head_sha
+    covered_heads: tuple[str, ...] = ()
     head_ref = getattr(args, "head_ref", None)
     issue_number = args.issue
     injected_labels = list(args.pr_label or ())
@@ -3641,6 +5586,7 @@ def _load_evidence_artifacts(
             "pr_reviews": [],
             "issue": issue_number,
             "head_sha": head_sha,
+            "covered_heads": (),
             "head_ref": head_ref,
             "changed_files": changed_files,
             "patches": {},
@@ -3671,6 +5617,7 @@ def _load_evidence_artifacts(
             issue_comments = _gh_json_list(
                 ["repos", owner_repo, "issues", str(issue_number), "comments"], cwd=args.root
             )
+        covered_heads = _covered_heads(config, owner_repo, args.pr, head_sha, cwd=args.root)
     elif issue_number is None:
         issue_number = _linked_issue_from_body(pr_body)
     return {
@@ -3681,6 +5628,10 @@ def _load_evidence_artifacts(
         "pr_reviews": pr_reviews,
         "issue": issue_number,
         "head_sha": head_sha,
+        # Offline fixtures never walk: a supplied `--head-sha` and supplied comments are a
+        # closed world, and reaching out to GitHub from one would make the result depend
+        # on a network the caller chose not to use.
+        "covered_heads": covered_heads,
         "head_ref": head_ref,
         "changed_files": changed_files,
         "patches": patches,
@@ -3704,6 +5655,24 @@ def _evidence_ledger_record(
     else:
         records = ledger.read_records(ledger.resolve_path(args.root, config))
     return ledger.latest_ship_run_for_pr(records, args.pr)
+
+
+def _merge_ledger_record(
+    args: argparse.Namespace,
+    config: cfg.ProjectConfig,
+) -> dict[str, object] | None:
+    """The same ship_run record, for the merge gate, and never fatal there (#1066).
+
+    ``keel merge`` reads the ledger only to learn which panel decision this pull request was
+    shipped under. That sharpens the contract when the record is readable and is nothing at
+    all when it is not — an unreadable or malformed ledger must not turn the merge gate into
+    a refusal, where ``evidence-verify`` (which reads the record as *evidence*) rightly
+    still fails on one.
+    """
+    try:
+        return _evidence_ledger_record(args, config)
+    except ledger.LedgerError:
+        return None
 
 
 def _label_names(labels: object) -> list[str]:
@@ -3735,6 +5704,38 @@ def _run_context_warnings(args: argparse.Namespace) -> list[str]:
     return warnings
 
 
+def _implementer_vocabulary_warnings(
+    args: argparse.Namespace,
+    config: cfg.ProjectConfig,
+) -> list[str]:
+    """Warn when ``actors.implementer`` names a vendor keel does not know (#1013).
+
+    A warning, deliberately, not a refusal: the live ledger already carries records
+    written before this check existed (``gemini:``), and hard-failing the append would
+    make the ledger *less* complete than the wrong value it is meant to flag. It is
+    also kept out of :func:`_run_context_warnings` so ``--strict-run-context`` does not
+    quietly promote it to a hard failure. ``evidence-verify``'s
+    ``attribution-vocabulary`` finding is the blocking half of this pair.
+    """
+    if not getattr(args, "live", False) or not getattr(args, "append_ledger", False):
+        return []
+    implementer = getattr(args, "implementer", None)
+    if not _nonblank(implementer):
+        return []
+    vendor, _ = agents.split_delegate(implementer.strip())
+    vendor = vendor.strip().lower()
+    known = agents.known_vendors(config)
+    if vendor in known:
+        return []
+    return [
+        (
+            f"implementer vendor {vendor!r} is not one of keel's delegate vendors "
+            f"({', '.join(sorted(known))}); the PR's agent:/model: labels will not match "
+            "what `keel attribution` produces"
+        )
+    ]
+
+
 def _nonblank(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
@@ -3749,6 +5750,7 @@ def _comment_artifact_marker(artifact: str) -> str:
         "extension-result": artifacts.EXTENSION_RESULT_MARKER,
         "step-handoff": artifacts.STEP_HANDOFF_MARKER,
         "run-control-halt": artifacts.RUN_CONTROL_HALT_MARKER,
+        "ship-provenance": evidence.SHIP_PROVENANCE_MARKER,
     }
     return markers[artifact]
 
@@ -3875,6 +5877,11 @@ def _event_from_args(args: argparse.Namespace) -> dict[str, object] | None:
             "output_fingerprint": args.output_fingerprint,
             "diff_fingerprint": args.diff_fingerprint,
             "work_units": args.work_units,
+            # Who ran the round, so `keel runcontrols` can answer "fixed by whom" (#1016).
+            "provider": args.provider,
+            "attribution": args.attribution,
+            "stage": args.stage,
+            "round": args.round,
         }
         event = {key: value for key, value in fields.items() if value not in (None, "")}
         if args.soft_failure:
@@ -3929,6 +5936,43 @@ def _gate_result_arg(value: str) -> tuple[str, str]:
             f"--gate-result verdict must be one of {', '.join(GATE_RESULTS)}"
         )
     return gate_id, verdict
+
+
+def _phase_implementer_arg(value: str) -> tuple[str, str]:
+    """Parse ``--phase-implementer PHASE=LABEL`` (PHASE one of the two s4 phases)."""
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("--phase-implementer must use PHASE=LABEL")
+    phase, _, label = value.partition("=")
+    phase, label = phase.strip().lower(), label.strip()
+    if phase not in tdd.PHASES:
+        raise argparse.ArgumentTypeError(
+            f"--phase-implementer phase must be one of {', '.join(tdd.PHASES)}"
+        )
+    if not label:
+        raise argparse.ArgumentTypeError("--phase-implementer requires an implementer label")
+    return phase, label
+
+
+def _loop_iteration_arg(value: str) -> tuple[int, str, bool]:
+    """Parse ``--loop-iteration K=SHA:pass|fail`` (#1165)."""
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("--loop-iteration must use K=SHA:pass|fail")
+    number, _, rest = value.partition("=")
+    sha, _, verdict = rest.partition(":")
+    try:
+        iteration = int(number.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError("--loop-iteration K must be an integer") from None
+    if iteration < 1:
+        raise argparse.ArgumentTypeError("--loop-iteration K is 1-based")
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha.strip()):
+        raise argparse.ArgumentTypeError(
+            "--loop-iteration requires the iteration's commit SHA (7-40 hex characters)"
+        )
+    if verdict.strip().lower() not in ("pass", "fail"):
+        raise argparse.ArgumentTypeError("--loop-iteration verdict must be pass or fail")
+    # Git spells a SHA in lowercase; the ledger and the closure record it as git would.
+    return iteration, sha.strip().lower(), verdict.strip().lower() == "pass"
 
 
 def _gh_json(args: list[str], *, cwd: str) -> dict[str, object]:
@@ -4104,6 +6148,21 @@ def _ask(prompt: str, default: str) -> str:  # pragma: no cover - interactive I/
     return raw or default
 
 
+def _warn(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def _wizard_catalog(_probe=None) -> wizard.Catalog:
+    """Probe this machine so the init wizard's team step offers only usable providers.
+
+    ``keel init`` runs before a config exists, so the probe sees the built-in vendors
+    and the machine-level registry — which is exactly the set an operator scaffolding a
+    new repository can actually staff a team from.
+    """
+    probe = _probe if _probe is not None else providerprobe.collect
+    return wizard.Catalog.from_report(probe(None))
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     root = Path(args.root)
     target = root / ".keel" / "project.yaml"
@@ -4129,7 +6188,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         elif args.wizard:
             stack = scaffold.detect_stack(root)
             print(f"keel init wizard — detected stack: {stack} (Enter accepts each default)")
-            text = scaffold.wizard(stack, _ask, repo=repo)
+            text = scaffold.wizard(stack, _ask, repo=repo, catalog=_wizard_catalog(), notify=_warn)
         else:
             stack = scaffold.detect_stack(root)
             text = scaffold.default_config(stack, repo=repo)
@@ -4153,7 +6212,10 @@ def _render_scaffolded_config(root: Path, *, wizard: bool) -> tuple[str, str]:
     repo = root.resolve().name
     if wizard:
         print(f"keel setup wizard — detected stack: {stack} (Enter accepts each default)")
-        return scaffold.wizard(stack, _ask, repo=repo), stack
+        return (
+            scaffold.wizard(stack, _ask, repo=repo, catalog=_wizard_catalog(), notify=_warn),
+            stack,
+        )
     return scaffold.default_config(stack, repo=repo), stack
 
 
@@ -4273,6 +6335,254 @@ def _doctor_checkout_root(root: str) -> str | None:
     return str(candidate) if marker.is_file() else None
 
 
+#: what a candidate interpreter is asked about itself — one JSON line on stdout,
+#: so nothing has to be parsed out of a version banner.
+_PYTHON_PROBE = (
+    "import json, sys\n"
+    "try:\n"
+    "    import yaml  # noqa: F401\n"
+    "    has_yaml = True\n"
+    "except Exception:\n"
+    "    has_yaml = False\n"
+    'print(json.dumps({"version": ".".join(map(str, sys.version_info[:3])),'
+    ' "yaml": has_yaml}))\n'
+)
+#: seconds for one interpreter probe / resolver run — both are local and instant.
+_PYTHON_PROBE_TIMEOUT_S = 30
+
+
+def _short(text: str, limit: int = 160) -> str:
+    """Collapse tool output to one short line for a check's summary."""
+    return " ".join(text.split())[:limit]
+
+
+def _no_interpreter(source: str, reason: str) -> dict[str, object]:
+    """The build gate has no interpreter to run on — facts for the pure check."""
+    return {
+        "interpreter": None,
+        "source": source,
+        "version": None,
+        "yaml": False,
+        "reason": reason,
+    }
+
+
+def _kw(_run):
+    """Pass ``_run`` through only when provided (so the default subprocess is used otherwise)."""
+    return {"_run": _run} if _run is not None else {}
+
+
+def _probe_python(interpreter: str, source: str, *, _run=None) -> dict[str, object]:
+    """Ask ``interpreter`` for its version and whether PyYAML imports there."""
+    if interpreter == sys.executable:
+        # No subprocess for the interpreter already running this command.
+        return {
+            "interpreter": interpreter,
+            "source": source,
+            "version": ".".join(str(part) for part in sys.version_info[:3]),
+            "yaml": importlib.util.find_spec("yaml") is not None,
+            "reason": "",
+        }
+    result = run_argv(
+        [interpreter, "-c", _PYTHON_PROBE], timeout=_PYTHON_PROBE_TIMEOUT_S, **_kw(_run)
+    )
+    try:
+        payload = json.loads(result.stdout) if result.ok else {}
+        version = str(payload["version"])
+        has_yaml = bool(payload["yaml"])
+    except (ValueError, KeyError, TypeError):
+        return {
+            "interpreter": interpreter,
+            "source": source,
+            "version": None,
+            "yaml": False,
+            "reason": f"probing {interpreter} failed: {_short(result.output)}",
+        }
+    return {
+        "interpreter": interpreter,
+        "source": source,
+        "version": version,
+        "yaml": has_yaml,
+        "reason": "",
+    }
+
+
+def _doctor_python_toolchain(
+    root: str,
+    config: cfg.ProjectConfig | None,
+    *,
+    _run=None,
+    _which=None,
+    _env=None,
+) -> dict[str, object]:
+    """Which interpreter will the configured build gate actually run on?
+
+    Thin I/O for the ``python_toolchain`` check — the classifier in
+    :mod:`keel.doctor` only reads the facts this gathers.
+
+    A gate that is not ``make`` runs in this process's world, so the answer is
+    ``sys.executable``. A ``make`` gate runs whatever the Makefile resolves: an
+    exported ``PY`` when the operator set one, else this repository's
+    ``scripts/find_python.sh``, else — a project whose Makefile has no resolver —
+    plain ``python3`` off PATH, which is exactly the interpreter #1022 is about.
+
+    Every boundary is injectable (``_run`` is the subprocess seam threaded into
+    :func:`~keel.runner.run_argv`, ``_which`` the PATH lookup, ``_env`` the
+    environment), so the check is unit-tested offline against stub interpreters.
+    """
+    which = shutil.which if _which is None else _which
+    env = os.environ if _env is None else _env
+    gate = config.knobs.build_gate_cmd if config is not None else ""
+    if gate.split()[:1] != ["make"]:
+        return _probe_python(sys.executable, "sys.executable", _run=_run)
+    override = env.get("PY", "").strip()
+    if override:
+        return _probe_python(override, "PY (environment)", _run=_run)
+    resolver = Path(root) / "scripts" / "find_python.sh"
+    if not resolver.is_file():
+        fallback = which("python3")
+        if not fallback:
+            return _no_interpreter("python3 on PATH", "no python3 on PATH for the make build gate")
+        return _probe_python(fallback, "python3 on PATH", _run=_run)
+    # Through `sh` rather than executed directly: a `.sh` is not a program on
+    # every platform, and the resolver is a POSIX script by design.
+    result = run_argv(
+        ["/bin/sh", str(resolver)], cwd=root, timeout=_PYTHON_PROBE_TIMEOUT_S, **_kw(_run)
+    )
+    lines = result.stdout.strip().splitlines()
+    if not result.ok or not lines:
+        return _no_interpreter(
+            "scripts/find_python.sh",
+            f"scripts/find_python.sh resolved none: {_short(result.output)}",
+        )
+    return _probe_python(lines[-1].strip(), "scripts/find_python.sh", _run=_run)
+
+
+def _doctor_policy_labels(
+    config: cfg.ProjectConfig | None,
+    *,
+    root: str = ".",
+    offline: bool = False,
+    _which=None,
+    _run=None,
+) -> dict[str, object] | None:
+    """Which declared labels exist on the project's repository (#1021)?
+
+    Thin I/O for the ``policy_labels`` check: :mod:`keel.doctor` derives the declared
+    set and the difference, this reads the repository's side of it through one
+    ``gh label list``. Fail-soft in every direction — no config, no ``owner``/``repo``,
+    ``--offline``, no ``gh`` on PATH, an unauthenticated or unreachable GitHub — each
+    returns facts carrying a ``reason`` and ``available: False``, which the pure check
+    reports as ``skipped``. It never raises and never fails a run.
+
+    ``_which`` and ``_run`` are the injectable seams, so the whole path is unit-tested
+    offline against a stubbed ``gh``.
+    """
+    if config is None:
+        return None
+    declared = doctor.declared_labels(
+        config.policy_pack, attribution=agents.attribution_labels(config)
+    )
+    repo = f"{config.owner}/{config.repo}" if config.owner and config.repo else None
+    facts: dict[str, object] = {
+        "repo": repo,
+        "declared": list(declared),
+        "existing": [],
+        "missing": [],
+        "commands": [],
+        "available": False,
+        "reason": "",
+    }
+    if repo is None:
+        facts["reason"] = "project config names no owner/repo — labels not checked"
+        return facts
+    if offline:
+        facts["reason"] = f"--offline: labels on {repo} not read"
+        return facts
+    which = shutil.which if _which is None else _which
+    if not which("gh"):
+        facts["reason"] = f"gh not found on PATH — labels on {repo} not read"
+        return facts
+    result = github.list_labels(repo=repo, cwd=root, **_kw(_run))
+    if not result.ok:
+        facts["reason"] = f"gh label list failed: {_short(result.output)}"
+        return facts
+    try:
+        existing = [str(row["name"]) for row in json.loads(result.stdout)]
+    except (ValueError, TypeError, KeyError, AttributeError):
+        facts["reason"] = f"gh label list returned unreadable JSON: {_short(result.stdout)}"
+        return facts
+    missing = doctor.missing_labels(declared, existing)
+    facts.update(
+        {
+            "available": True,
+            "existing": sorted(existing),
+            "missing": list(missing),
+            "commands": [shlex.join(github.label_create_argv(name, repo)) for name in missing],
+        }
+    )
+    return facts
+
+
+def _doctor_fix_labels(
+    args: argparse.Namespace,
+    config: cfg.ProjectConfig | None,
+    facts: dict[str, object] | None,
+    *,
+    _run=None,
+) -> int:
+    """``keel doctor --fix``: create the declared labels the repository lacks.
+
+    The one mutation ``doctor`` performs, and it is gated exactly like every other live
+    keel mutation — ``consent.build_consent_contract`` over the ``labels`` side effect,
+    refused unless the operator approved the ``github`` scope. Each label is created by
+    the same ``gh label create`` command the warning printed; a failure is reported per
+    label and makes the command exit non-zero, without stopping the rest.
+    """
+    stream = sys.stderr if args.json else sys.stdout
+    if config is None or facts is None:
+        print("--fix needs a project.yaml naming the labels to create", file=sys.stderr)
+        return 1
+    if not facts.get("available"):
+        print(f"--fix cannot read the repository's labels: {facts.get('reason')}", file=sys.stderr)
+        return 1
+    missing = [str(name) for name in facts.get("missing") or ()]
+    if not missing:
+        print(f"nothing to fix: every declared label exists on {facts.get('repo')}", file=stream)
+        return 0
+    args.live = True
+    try:
+        approved_scopes, approval_source, approval_operator, consent_mode = _approved_consent(
+            args, config, True
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    operator_consent = consent.build_consent_contract(
+        command="doctor",
+        side_effects=("labels",),
+        dry_run=False,
+        approved_scopes=approved_scopes,
+        approval_source=approval_source,
+        mode=consent_mode,
+        operator=approval_operator,
+        target=f"{facts['repo']} labels",
+    )
+    consent_ok, consent_message = consent.assert_operator_consent(operator_consent)
+    if not consent_ok:
+        print(consent_message, file=sys.stderr)
+        return 1
+    failed = 0
+    for name in missing:
+        result = github.create_label(name, repo=str(facts["repo"]), **_kw(_run))
+        if result.ok:
+            print(f"  created  {name}", file=stream)
+        else:
+            failed += 1
+            print(f"  FAILED   {name} — {_short(result.output)}", file=sys.stderr)
+    return 1 if failed else 0
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     config = None
     core_version = None
@@ -4290,6 +6600,26 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         state_paths = _doctor_state_paths(args.root, config)
 
     latest = None if args.offline else _fetch_latest_pypi_version()
+    # Probed only under --providers: one PATH lookup and one `--version` call per CLI
+    # vendor, plus a single loopback request for Ollama. Cheap enough to ask for,
+    # too expensive to run on every `keel doctor`.
+    # `--registry` only means anything with `--providers`: the registry is read by
+    # the probe and by nothing else. Before the flag existed, `doctor --registry X`
+    # was an argparse error; accepting it and reading nothing would be the same
+    # quiet mismatch #1130 is about, one flag further out — so it is said out loud.
+    # On **stderr**: under `--json` this stream carries one JSON document and nothing
+    # else, and the first cut printed the note to stdout, so
+    # `keel doctor --registry X --json | jq` died on a note about a flag it did not
+    # pass. A diagnostic that breaks the machine-readable output is a worse bug than
+    # the one it warns about.
+    if args.registry and not args.providers:
+        _warn("note: --registry applies only with --providers; no registry was read")
+    providers = (
+        providerprobe.collect(config, registry_path=args.registry) if args.providers else None
+    )
+    # One `gh label list` per run, and only with a config: the labels to check are the
+    # ones that config declares. `--offline` skips it like every other network read.
+    policy_labels = _doctor_policy_labels(config, root=args.root, offline=args.offline)
     report = doctor.run_doctor(
         installed_version=__version__,
         latest_version=latest,
@@ -4299,13 +6629,221 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         state_paths=state_paths,
         module_path=str(Path(__file__).resolve().parent),
         checkout_root=_doctor_checkout_root(args.root),
+        python_toolchain=_doctor_python_toolchain(args.root, config),
+        policy_labels=policy_labels,
+        providers=providers,
     )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(doctor.render_report(report))
+        if providers is not None:
+            print()
+            print(doctor.render_providers(providers))
+    fixed = _doctor_fix_labels(args, config, policy_labels) if args.fix else 0
     if args.strict and report["status"] == "fail":
         return 1
+    return fixed
+
+
+def _delegate_config(args: argparse.Namespace):
+    """The project config a delegate run needs, or ``None``.
+
+    Only ``knobs.delegate_profiles`` matters here, so an absent or unreadable config is
+    not fatal: the built-in vendors and the machine-level registry still resolve. A
+    profile name simply will not be found, and the run fails with ``unknown-provider``
+    naming what *is* known — which is the message an operator can act on.
+    """
+    path = args.path or str(Path(args.root) / ".keel" / "project.yaml")
+    try:
+        return cfg.load_config(path)
+    except (FileNotFoundError, cfg.ConfigError):
+        return None
+
+
+def _delegate_plan(args: argparse.Namespace):
+    """``(plan, failure)`` — exactly one of the two is ``None``."""
+    registry = providers_mod.load_registry(args.registry)
+    # Resolved here rather than in the planner, which is pure and whose output is a frozen
+    # document: `abspath` reads this process's working directory, which is a property of
+    # the invocation, not of the plan. It matters because a delegate may be *given* the
+    # directory as an argument as well as started in it — agy's `--add-dir` — and a
+    # relative path means something different to a child that is already inside it
+    # (#1134).
+    cwd = os.path.abspath(args.cwd) if args.cwd else args.cwd
+    try:
+        resolution = delegate.resolve_provider(_delegate_config(args), registry, args.provider)
+        plan = delegate.plan_run(
+            resolution.provider,
+            args.role,
+            args.prompt_file,
+            cwd,
+            args.timeout,
+            args.effort,
+            args.model or resolution.model,
+            profile=resolution.profile,
+        )
+    except delegate.DelegateError as exc:
+        failure = delegaterun.planning_failure(
+            args.provider, args.role, code=exc.code, message=exc.message
+        )
+        return None, failure
+    return plan, None
+
+
+def _delegate_child_argv(args: argparse.Namespace, run_id: str) -> list[str]:
+    """The command line the detached child runs — this same command, plus ``--_child``.
+
+    ``sys.executable -m keel`` rather than a bare ``keel``: the child must be the *same*
+    keel the parent is running, which for a source checkout or a virtualenv is not
+    whatever the PATH resolves to.
+    """
+    argv = [
+        sys.executable,
+        "-m",
+        "keel",
+        "delegate",
+        "run",
+        "--provider",
+        args.provider,
+        "--role",
+        args.role,
+        "--prompt-file",
+        args.prompt_file,
+        "--root",
+        args.root,
+        "--run-id",
+        run_id,
+        "--timeout",
+        str(args.timeout),
+        "--_child",
+    ]
+    for flag, value in (
+        ("--cwd", args.cwd),
+        ("--effort", args.effort),
+        ("--model", args.model),
+        ("--project", args.path),
+        ("--registry", args.registry),
+    ):
+        if value:
+            argv += [flag, str(value)]
+    return argv
+
+
+def _cmd_delegate_run(args: argparse.Namespace) -> int:
+    # Checked before anything runs: --_child names the state file the finished result is
+    # written to, so without --run-id the delegate would do its whole (billable) job and
+    # then raise on the way to recording it.
+    if args.child and not args.run_id:
+        print(
+            json.dumps(
+                _delegate_bad_run_id(args, "--_child requires --run-id"),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 1
+    plan, failure = _delegate_plan(args)
+    if failure is not None:
+        print(json.dumps(failure, indent=2, sort_keys=True))
+        return 1
+    if args.detach:
+        run_id = args.run_id or delegaterun.new_run_id()
+        try:
+            delegaterun.check_run_id(run_id)
+        except delegaterun.RunIdError as exc:
+            print(json.dumps(_delegate_bad_run_id(args, str(exc)), indent=2, sort_keys=True))
+            return 1
+        record = delegaterun.start_detached(
+            _delegate_child_argv(args, run_id),
+            root=args.root,
+            run_id=run_id,
+            timeout=args.timeout,
+            provider=args.provider,
+            role=args.role,
+        )
+        print(json.dumps(record, indent=2, sort_keys=True))
+        return 0 if record["status"] == "running" else 1
+    result = delegaterun.execute(plan)
+    if args.child:
+        # The parent already wrote the `running` record; this is the authoritative
+        # overwrite that `keel delegate wait` is blocking on.
+        delegaterun.finish_detached(args.root, args.run_id, result)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["ok"] else 1
+
+
+def _delegate_bad_run_id(args: argparse.Namespace, message: str) -> dict:
+    return delegaterun.planning_failure(
+        args.provider, args.role, code="bad-run-id", message=message
+    )
+
+
+def _cmd_delegate_wait(args: argparse.Namespace) -> int:
+    result, error = delegaterun.wait(args.root, args.run_id, timeout=args.timeout)
+    if error == "lost":
+        # The run vanished; `wait` recorded why in the state file, so print that document
+        # rather than a second, thinner story about the same event.
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 1
+    if error is not None:
+        print(
+            json.dumps(
+                {
+                    "schema_version": delegaterun.SCHEMA_VERSION,
+                    "ok": False,
+                    "run_id": args.run_id,
+                    "error_code": error,
+                    "error": (
+                        f"no delegate run {args.run_id!r} under {delegaterun.state_dir(args.root)}"
+                        if error == "unknown-run"
+                        else f"run {args.run_id!r} did not finish within {args.timeout}s"
+                    ),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if isinstance(result, dict) and result.get("ok") else 1
+
+
+def _cmd_delegate_status(args: argparse.Namespace) -> int:
+    # Status reaps too, on the same liveness + deadline test `wait` uses. Otherwise the
+    # one view an operator opens *because* they are not waiting is the one that keeps
+    # reporting a killed child as running.
+    delegaterun.reap_abandoned(args.root)
+    records = delegaterun.list_runs(args.root)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema_version": delegaterun.SCHEMA_VERSION,
+                    "state_dir": str(delegaterun.state_dir(args.root)),
+                    "runs": records,
+                    "total": len(records),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not records:
+        print(f"no delegate runs under {delegaterun.state_dir(args.root)}")
+        return 0
+    for record in records:
+        result = record.get("result") or {}
+        if record.get("status") == "done":
+            verdict = " ok" if result.get("ok") else " failed"
+        elif record.get("status") == "crashed":
+            verdict = f" {result.get('error_code', 'lost')}"
+        else:
+            verdict = ""
+        print(
+            f"{record.get('run_id')}  {record.get('status')}{verdict}  "
+            f"pid={record.get('pid')}  started={record.get('started_at')}"
+        )
     return 0
 
 
@@ -4318,13 +6856,22 @@ def _cmd_install_adapter(args: argparse.Namespace) -> int:
             "install via /plugin marketplace add berkayturanci/keel; /plugin install keel"
         )
         return 0
+    if args.agent == "site":
+        installed, skipped = install.install_site_params(args.root, force=args.force)
+        _report_install("site", installed, skipped)
+        print(
+            f"{len(installed)} site file(s) written — "
+            f"{install.SITE_PARAMS_PATH} now matches the adapter frontmatter"
+        )
+        return 0
     if args.agent == "all":
         results = install.install_all(args.root, force=args.force)
     elif args.agent in install.TARGETS:
         results = {args.agent: install.install(args.agent, args.root, force=args.force)}
     else:
         print(
-            f"unknown target {args.agent!r}; valid: all, plugin, {', '.join(install.TARGETS)}",
+            f"unknown target {args.agent!r}; "
+            f"valid: all, plugin, site, {', '.join(install.TARGETS)}",
             file=sys.stderr,
         )
         return 1
@@ -4546,6 +7093,22 @@ def _capability_requirement(
     return runtime.build_capability_requirement(command, config, loaded, pr=pr)
 
 
+def _swarm_overrides(args: argparse.Namespace) -> swarm.AssignmentOverrides:
+    """The per-run staffing every swarm subcommand resolves its clusters with.
+
+    Read the same way in all three, so ``swarm-plan`` shows the team ``swarm-run`` will
+    actually dispatch and ``swarm-land`` verifies the same one.
+    """
+    return swarm.AssignmentOverrides(
+        delegate=getattr(args, "delegate", None),
+        review_delegates=tuple(getattr(args, "review_delegate", None) or ()),
+        effort=getattr(args, "effort", None),
+        team_profile=getattr(args, "team_profile", None),
+        reviewers=getattr(args, "reviewers", None),
+        host_agent=getattr(args, "host_agent", None) or agents.HOST_DEFAULT,
+    )
+
+
 def _cmd_swarm_plan(args: argparse.Namespace) -> int:
     try:
         config = cfg.load_config(args.path)
@@ -4599,7 +7162,22 @@ def _cmd_swarm_plan(args: argparse.Namespace) -> int:
             )
         )
 
-    plan = swarm.build_swarm_plan(scopes, swarm_id=args.swarm_id, config=config)
+    overrides = _swarm_overrides(args)
+    plan = swarm.build_swarm_plan(
+        scopes,
+        swarm_id=args.swarm_id,
+        config=config,
+        overrides=overrides,
+        # The seventh resolver (#1066). A swarm scores each cluster's tier *and* its
+        # difficulty band while it partitions, so neither can be named before the plan
+        # exists — but every cluster in it resolves a bench, and without this a panel
+        # project's tier-3 cluster published `review_panel: jury` while the child `keel
+        # ship` launched on the same machine seated three host reviewers. The `--team`
+        # profile is known, and carries its own `review`, so it goes with the question.
+        jury_availability=providerprobe.jury_availability_for_any_tier(
+            config, profile=overrides.team_profile
+        ),
+    )
 
     if args.json:
         print(json.dumps(plan.to_dict(), indent=2))
@@ -4694,7 +7272,22 @@ def _cmd_swarm_run(args: argparse.Namespace) -> int:
             )
         )
 
-    plan = swarm.build_swarm_plan(scopes, swarm_id=args.swarm_id, config=config)
+    overrides = _swarm_overrides(args)
+    plan = swarm.build_swarm_plan(
+        scopes,
+        swarm_id=args.swarm_id,
+        config=config,
+        overrides=overrides,
+        # The seventh resolver (#1066). A swarm scores each cluster's tier *and* its
+        # difficulty band while it partitions, so neither can be named before the plan
+        # exists — but every cluster in it resolves a bench, and without this a panel
+        # project's tier-3 cluster published `review_panel: jury` while the child `keel
+        # ship` launched on the same machine seated three host reviewers. The `--team`
+        # profile is known, and carries its own `review`, so it goes with the question.
+        jury_availability=providerprobe.jury_availability_for_any_tier(
+            config, profile=overrides.team_profile
+        ),
+    )
 
     from . import swarm_runtime
 
@@ -4905,7 +7498,16 @@ def _cmd_swarm_land(args: argparse.Namespace) -> int:
             )
         )
 
-    plan = swarm.build_swarm_plan(scopes, swarm_id=swarm_id, config=config)
+    overrides = _swarm_overrides(args)
+    plan = swarm.build_swarm_plan(
+        scopes,
+        swarm_id=swarm_id,
+        config=config,
+        overrides=overrides,
+        jury_availability=providerprobe.jury_availability_for_any_tier(
+            config, profile=overrides.team_profile
+        ),
+    )
 
     from . import swarm_landing
 
@@ -5043,6 +7645,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="workflow profile for ship command contracts",
     )
     p_plan.add_argument(
+        "--tdd",
+        action="store_true",
+        help=_TDD_FLAG_HELP,
+    )
+    p_plan.add_argument(
+        "--loop",
+        action="store_true",
+        help=_LOOP_FLAG_HELP,
+    )
+    p_plan.add_argument(
         "--live",
         action="store_true",
         help="render a live preflight contract and fail if consent is missing",
@@ -5084,6 +7696,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="issue label for intake/readiness; repeat or comma-separate",
     )
     p_plan.add_argument(
+        "--declared-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="expected repo-relative file for learning retrieval; repeat per file",
+    )
+    p_plan.add_argument(
+        "--role",
+        default=None,
+        help="issue role label used to resolve knobs.team.implement.by_role",
+    )
+    p_plan.add_argument(
+        "--delegate",
+        default=None,
+        help="per-run implementer override (provider or provider:model); "
+        "wins over knobs.team.implement",
+    )
+    p_plan.add_argument(
+        "--review-delegate",
+        action="append",
+        default=[],
+        metavar="PROVIDER",
+        help="per-run reviewer override, positional per slot: the first flag is slot A, "
+        "the second slot B; repeatable",
+    )
+    _add_bench_args(p_plan)
+    p_plan.add_argument(
+        "--tier",
+        dest="review_tier",
+        type=int,
+        choices=(1, 2, 3),
+        default=None,
+        help="risk tier to resolve the review contract and team assignment against",
+    )
+    p_plan.add_argument(
         "--review-comments",
         choices=("inline", "summary"),
         default="inline",
@@ -5096,12 +7743,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the resolved reviewer count",
     )
-    p_plan.add_argument("--jury", action="store_true", help="enable the cross-vendor jury contract")
-    p_plan.add_argument(
-        "--no-jury", action="store_true", help="disable the cross-vendor jury contract"
-    )
-    p_plan.add_argument(
-        "--jury-advisory", action="store_true", help="run jury in advisory mode when enabled"
+    _add_jury_flags(
+        p_plan,
+        noun="the cross-vendor jury contract",
+        advisory_help="run jury in advisory mode when enabled",
     )
     p_plan.add_argument(
         "--run-id",
@@ -5154,6 +7799,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=None,
         help="pull request number to record on the activity stamp",
+    )
+    p_run.add_argument(
+        "--tdd",
+        action="store_true",
+        help="add the tdd-order gate to this run, as implement_mode: tdd would",
+    )
+    p_run.add_argument(
+        "--phases",
+        default=None,
+        help="comma-separated backbone phases to execute (guard, test, pre-merge); a gate "
+        "outside the scope is reported not_run, exactly as --defer-jury reports the jury. "
+        "The s4 loop passes `--phases guard,test`, which is what it judges (#1172)",
+    )
+    p_run.add_argument(
+        "--defer-jury",
+        action="store_true",
+        help="report the jury built-in not_run — deferred to the phase that convenes it — "
+        "instead of dispatching a panel: the s4 loop's per-iteration gate run (#1165)",
+    )
+    p_run.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the machine report — the plan beside the outcomes — that keel loop "
+        "brief --gates reads; the exit code is unchanged",
     )
     p_run.set_defaults(func=_cmd_run_gates)
 
@@ -5243,6 +7912,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_merge.add_argument("--dry-run", action="store_true", help="verify only; do not merge")
     p_merge.add_argument(
+        "--transport",
+        choices=_TRANSPORT_CHOICES,
+        default="auto",
+        help="how to reach GitHub: auto probes GraphQL once, rest forces the REST API",
+    )
+    p_merge.add_argument(
         "--approve-scope",
         action="append",
         default=[],
@@ -5299,12 +7974,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override required reviewer count",
     )
-    p_merge.add_argument("--jury", action="store_true", help="enable jury evidence")
-    p_merge.add_argument("--no-jury", action="store_true", help="disable jury evidence")
-    p_merge.add_argument(
-        "--jury-advisory", action="store_true", help="make jury advisory for evidence verification"
+    _add_jury_flags(
+        p_merge,
+        noun="jury evidence",
+        advisory_help="make jury advisory for evidence verification",
     )
     p_merge.add_argument("--gate-label", default=None, help="override evidence gate label")
+    _add_bench_args(p_merge)
     p_merge.add_argument("--json", action="store_true", help="emit structured JSON")
     p_merge.set_defaults(func=_cmd_merge)
 
@@ -5367,6 +8043,55 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_capture.add_argument("--json", action="store_true", help="emit structured JSON")
     p_capture.set_defaults(func=_cmd_capture_verify)
+
+    p_land = sub.add_parser(
+        "capture-land",
+        help="land this run's learning document on a branch — the pull request's own with "
+        "--onto, else the base branch (no checkout, no merge)",
+    )
+    p_land.add_argument("path", help="path to project.yaml")
+    p_land.add_argument("--root", default=".", help="repo root the sink path resolves against")
+    p_land.add_argument(
+        "--pr",
+        type=_positive_int,
+        default=None,
+        help="pull request the lesson came from; also how the artifact is read from the ledger",
+    )
+    p_land.add_argument(
+        "--issue",
+        type=_positive_int,
+        default=None,
+        help="issue the lesson came from; recorded in the commit's marker line",
+    )
+    p_land.add_argument(
+        "--artifact",
+        default=None,
+        help="repo-relative path to land (default: capture.artifact of the PR's ship_run record)",
+    )
+    p_land.add_argument("--remote", default="origin", help="remote holding the base branch")
+    p_land.add_argument(
+        "--onto",
+        default=None,
+        help="land on this branch instead of the base branch — the pull request's own, so "
+        "the lesson merges with the work it describes",
+    )
+    p_land.add_argument(
+        "--write",
+        action="store_true",
+        help="write the lesson first — from the pull request, its issue and the gates-pass "
+        "recorded for its head — then land it; a lesson already on the pull request is reused",
+    )
+    p_land.add_argument(
+        "--attempts",
+        type=_positive_int,
+        default=capture.LEARNING_LAND_ATTEMPTS,
+        help="rebuild-and-retry budget when a concurrent ship pushes first",
+    )
+    p_land.add_argument(
+        "--dry-run", action="store_true", help="report what would be landed, push nothing"
+    )
+    p_land.add_argument("--json", action="store_true", help="emit structured JSON")
+    p_land.set_defaults(func=_cmd_capture_land)
 
     p_consent = sub.add_parser(
         "consent-verify",
@@ -5512,6 +8237,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="verify a persisted step handoff against the evidence report",
     )
     p_step.add_argument("--step", required=True, help="backbone step id, e.g. s7")
+    p_step.add_argument(
+        "--project",
+        default=None,
+        help="path to project.yaml, so the required evidence is derived from the same "
+        "knobs.team the ship run resolved; without it the tier-derived bench is used",
+    )
+    p_step.add_argument(
+        "--tier",
+        dest="review_tier",
+        type=int,
+        choices=(1, 2, 3),
+        default=None,
+        help="risk tier the review contract is resolved against (needs --project)",
+    )
     p_step.add_argument("--handoff-file", required=True, help="JSON step handoff file")
     p_step.add_argument(
         "--evidence-report",
@@ -5531,16 +8270,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the required reviewer verdict count",
     )
-    p_step.add_argument(
-        "--jury", action="store_true", help="enable the cross-vendor jury requirement"
-    )
-    p_step.add_argument(
-        "--no-jury", action="store_true", help="disable the cross-vendor jury requirement"
-    )
-    p_step.add_argument(
-        "--jury-advisory",
-        action="store_true",
-        help="make an enabled jury advisory instead of required",
+    _add_jury_flags(
+        p_step,
+        noun="the cross-vendor jury requirement",
+        advisory_help="make an enabled jury advisory instead of required",
     )
     p_step.add_argument(
         "--dry-run", action="store_true", help="verify with dry-run evidence requirements"
@@ -5548,6 +8281,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_step.add_argument(
         "--not-enforced", action="store_true", help="verify with evidence requirements disabled"
     )
+    _add_bench_args(p_step)
     p_step.add_argument("--json", action="store_true", help="emit structured JSON")
     p_step.set_defaults(func=_cmd_step_verify)
 
@@ -5564,6 +8298,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_rc.add_argument("--diff-fingerprint", default=None, help="event diff fingerprint")
     p_rc.add_argument("--work-units", type=int, default=None, help="event work-unit count")
     p_rc.add_argument("--soft-failure", action="store_true", help="mark event as soft failure")
+    p_rc.add_argument(
+        "--provider", default=None, help="provider that ran the event (s4 implement, s9 fix)"
+    )
+    p_rc.add_argument(
+        "--attribution",
+        default=None,
+        help="attribution label for that provider, as keel delegate run computed it",
+    )
+    p_rc.add_argument("--stage", default=None, help="fix-ladder stage: implementer, gate or host")
+    p_rc.add_argument("--round", type=int, default=None, help="fix round this event records")
     p_rc.add_argument(
         "--max-work-units",
         type=int,
@@ -5598,6 +8342,120 @@ def build_parser() -> argparse.ArgumentParser:
     p_rc.add_argument("--json", action="store_true", help="emit structured JSON")
     p_rc.set_defaults(func=_cmd_runcontrols)
 
+    p_fix = sub.add_parser(
+        "fixloop",
+        help="route review findings back to a fixer (s9)",
+    )
+    p_fix_sub = p_fix.add_subparsers(dest="fixloop_command", metavar="<subcommand>")
+    p_fb = p_fix_sub.add_parser("brief", help="render one round's fix brief and name its fixer")
+    p_fb.add_argument("--pr", type=int, default=None, help="pull request the findings are on")
+    p_fb.add_argument("--findings", required=True, help="JSON findings file (array or envelope)")
+    p_fb.add_argument("--round", type=int, default=1, help="fix round (1-based)")
+    p_fb.add_argument(
+        "--budget",
+        type=int,
+        default=fixloop.DEFAULT_ROUND_BUDGET,
+        help=f"review-fix round budget (default {fixloop.DEFAULT_ROUND_BUDGET})",
+    )
+    p_fb.add_argument(
+        "--unavailable",
+        action="append",
+        default=[],
+        help="provider that cannot take this round; repeatable, skipped on the ladder",
+    )
+    p_fb.add_argument("--issue", type=int, default=None, help="issue the change closes")
+    p_fb.add_argument("--head", default=None, help="current PR head SHA")
+    p_fb.add_argument("--fix-sha", default=None, help="fix commit SHA, once it exists")
+    p_fb.add_argument("--tier", type=int, default=None, help="risk tier resolved at s5")
+    p_fb.add_argument("--role", default=None, help="issue role label selecting the team seat")
+    p_fb.add_argument("--delegate", default=None, help="implementer override, as ship's")
+    p_fb.add_argument("--host-agent", default=None, help="host agent driving this run")
+    p_fb.add_argument("--out", default=None, help="write the brief here (a delegate prompt file)")
+    p_fb.add_argument("--cwd", default=None, help="worktree the fix runs in, for the dispatch")
+    p_fb.add_argument("--timeout", type=int, default=None, help="dispatch timeout in seconds")
+    p_fb.add_argument("--root", default=".", help="project root")
+    p_fb.add_argument(
+        "--project", dest="path", default=None, help="project.yaml holding knobs.team"
+    )
+    p_fb.add_argument(
+        "--no-project",
+        action="store_true",
+        help="deliberately resolve without a team policy: no knobs.team, so the host "
+        "agent fixes. Without it an unreadable config is a refusal, not a default",
+    )
+    p_fb.add_argument("--json", action="store_true", help="emit the structured document")
+    p_fb.set_defaults(func=_cmd_fixloop_brief)
+
+    p_loop = sub.add_parser(
+        "loop",
+        help="the bounded, gate-verified s4 iteration loop (#1165)",
+    )
+    p_loop_sub = p_loop.add_subparsers(dest="loop_command", metavar="<subcommand>")
+    p_lb = p_loop_sub.add_parser(
+        "brief", help="decide one iteration's outcome and render the next iteration's brief"
+    )
+    p_lb.add_argument(
+        "--iteration", type=_positive_int, required=True, help="the iteration that just ran"
+    )
+    p_lb.add_argument("--brief", required=True, help="the base implement brief (a file)")
+    p_lb.add_argument(
+        "--gates",
+        required=True,
+        help="that iteration's gate outcomes: a keel run-gates --json report, a keel ship "
+        "--json document, a {gate_outcomes: [...]} envelope, or a bare list",
+    )
+    p_lb.add_argument(
+        "--title", default=None, help="issue title, for the iteration's commit subject"
+    )
+    p_lb.add_argument(
+        "--out", default=None, help="write the next brief here (a delegate prompt file)"
+    )
+    p_lb.add_argument(
+        "--loop",
+        action="store_true",
+        help="the run was started with --loop: switch the loop on for a project whose "
+        "knobs.loop is absent or disabled, against its numbers",
+    )
+    p_lb.add_argument(
+        "--max-iterations",
+        type=_bounded_int(loop.MIN_ITERATIONS, loop.MAX_ITERATIONS_LIMIT),
+        default=None,
+        help="explicit budget for this run (1..10); without it knobs.loop is the policy",
+    )
+    p_lb.add_argument(
+        "--gate-output-max-bytes",
+        type=_bounded_int(loop.MIN_GATE_OUTPUT_BYTES),
+        default=None,
+        help="cap on each gate's quoted output (at least 256); defaults to "
+        "knobs.loop.gate_output_max_bytes",
+    )
+    p_lb.add_argument("--tdd", action="store_true", help="the run is in implement_mode: tdd")
+    p_lb.add_argument("--root", default=".", help="project root")
+    p_lb.add_argument(
+        "--project", dest="path", default=None, help="project.yaml holding knobs.loop"
+    )
+    p_lb.add_argument("--json", action="store_true", help="emit the structured document")
+    p_lb.set_defaults(func=_cmd_loop_brief)
+
+    p_attr = sub.add_parser(
+        "attribution",
+        help="print keel's attribution labels for a delegate vendor/model",
+    )
+    p_attr.add_argument("--vendor", required=True, help="delegate vendor, e.g. agy or codex")
+    p_attr.add_argument("--model", default=None, help="effective model id, when known")
+    p_attr.add_argument(
+        "--profile",
+        default=None,
+        help="knobs.delegate_profiles entry that ran (requires --config)",
+    )
+    p_attr.add_argument(
+        "--config",
+        default=None,
+        help="path to project.yaml; enables vendor/profile validation",
+    )
+    p_attr.add_argument("--json", action="store_true", help="emit the attribution record as JSON")
+    p_attr.set_defaults(func=_cmd_attribution)
+
     p_post = sub.add_parser(
         "post-comment",
         help="post or update a deterministic GitHub issue/PR artifact comment",
@@ -5617,6 +8475,7 @@ def build_parser() -> argparse.ArgumentParser:
             "extension-result",
             "step-handoff",
             "run-control-halt",
+            "ship-provenance",
         ),
         help="artifact contract expected in --body-file",
     )
@@ -5641,8 +8500,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_review.add_argument(
         "--reviews",
-        required=True,
+        default=None,
         help="JSON array of reviewer verdict objects supplied by the host",
+    )
+    p_review.add_argument(
+        "--from-jury",
+        default=None,
+        help=(
+            "ai-jury JSON report whose per-reviewer ballots are the review: posts one "
+            "head-pinned verdict per panelist with vendor provenance, plus the jury verdict"
+        ),
     )
     p_review.add_argument(
         "--issue",
@@ -5661,6 +8528,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(1, 2, 3),
         default=None,
         help="override the required reviewer verdict count",
+    )
+    _add_jury_flags(
+        p_review,
+        noun="the cross-vendor jury requirement",
+        advisory_help="make an enabled jury advisory instead of required",
     )
     p_review.add_argument(
         "--head-sha", default=None, help="offline PR head SHA used to pin verdict evidence"
@@ -5702,6 +8574,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the project consent mode for this run",
     )
+    _add_bench_args(p_review)
     p_review.add_argument("--json", action="store_true", help="emit structured JSON")
     p_review.set_defaults(func=_cmd_review)
 
@@ -5767,16 +8640,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the required reviewer verdict count",
     )
-    p_evidence.add_argument(
-        "--jury", action="store_true", help="enable the cross-vendor jury requirement"
-    )
-    p_evidence.add_argument(
-        "--no-jury", action="store_true", help="disable the cross-vendor jury requirement"
-    )
-    p_evidence.add_argument(
-        "--jury-advisory",
-        action="store_true",
-        help="make an enabled jury advisory instead of required",
+    _add_jury_flags(
+        p_evidence,
+        noun="the cross-vendor jury requirement",
+        advisory_help="make an enabled jury advisory instead of required",
     )
     p_evidence.add_argument(
         "--jury-vendors",
@@ -5863,6 +8730,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_evidence.add_argument(
         "--waiver-label", default=None, help="override the operator-applied evidence waiver label"
     )
+    _add_bench_args(p_evidence)
     p_evidence.add_argument("--json", action="store_true", help="emit structured JSON")
     p_evidence.set_defaults(func=_cmd_evidence_verify)
 
@@ -5877,6 +8745,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_vm.add_argument(
         "--merge-sha", default=None, help="merge commit SHA; read from the PR when omitted"
+    )
+    p_vm.add_argument(
+        "--transport",
+        choices=_TRANSPORT_CHOICES,
+        default="auto",
+        help="how to reach GitHub: auto probes GraphQL once, rest forces the REST API",
     )
     p_vm.add_argument("--json", action="store_true", help="emit structured JSON")
     p_vm.set_defaults(func=_cmd_verify_merge)
@@ -6396,6 +9270,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="reviewer override for ship handoff contracts",
     )
+    _add_staffing_args(p_work_block)
     p_work_block.add_argument(
         "--target", default=None, help="target text to include in the work-block contract"
     )
@@ -6422,6 +9297,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="operator consent mode: explicit, standing, or agent",
     )
+    _add_wizard_arguments(p_work_block)
     p_work_block.add_argument("--json", action="store_true", help="emit structured JSON")
     p_work_block.set_defaults(func=_cmd_standalone, standalone_command="work-block")
 
@@ -6454,6 +9330,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="reviewer override for ship handoff contracts",
     )
+    _add_staffing_args(p_overnight)
     p_overnight.add_argument(
         "--target", default=None, help="target text to include in the overnight contract"
     )
@@ -6587,7 +9464,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser(
         "doctor",
-        help="read-only diagnostics: CLI/adapter version drift, orphans, core_version, state",
+        help="read-only diagnostics: CLI/adapter drift, orphans, core_version, state, "
+        "policy labels (--fix creates missing labels)",
     )
     p_doctor.add_argument(
         "path",
@@ -6606,8 +9484,120 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit non-zero when any check fails (default: advisory, exit 0)",
     )
+    p_doctor.add_argument(
+        "--providers",
+        action="store_true",
+        help="probe every provider keel can dispatch to (agent CLIs, hosted APIs, "
+        "local models, delegate profiles, and ~/.keel/providers.yaml)",
+    )
+    # Same flag, same precedence, same wording as `delegate run` (#1130). Without it
+    # `doctor --providers` read the default path whatever the operator passed, so a
+    # registry at a scratch path reported as an empty one — the check that answers
+    # "can this machine reach the provider I just configured?" answering about a
+    # different file, with nothing to say so.
+    p_doctor.add_argument(
+        "--registry", default=None, help="provider registry path (default $KEEL_PROVIDERS)"
+    )
+    p_doctor.add_argument(
+        "--fix",
+        action="store_true",
+        help="create the declared labels missing from the repository (consent-gated)",
+    )
+    p_doctor.add_argument(
+        "--approve-scope",
+        action="append",
+        default=[],
+        help="approve a consent scope for --fix; repeat or comma-separate",
+    )
+    p_doctor.add_argument(
+        "--operator",
+        default=None,
+        help="operator identifier to include in an approved consent record",
+    )
+    p_doctor.add_argument(
+        "--consent-mode",
+        choices=consent.CONSENT_MODES,
+        default=None,
+        help="operator consent mode: explicit, standing, or agent",
+    )
     p_doctor.add_argument("--json", action="store_true", help="emit structured JSON")
     p_doctor.set_defaults(func=_cmd_doctor)
+
+    p_delegate = sub.add_parser(
+        "delegate",
+        help="dispatch a delegate run (one executor for every transport)",
+    )
+    p_delegate_sub = p_delegate.add_subparsers(dest="delegate_command", metavar="<subcommand>")
+
+    p_dr = p_delegate_sub.add_parser("run", help="run one delegate and print the JSON contract")
+    p_dr.add_argument(
+        "--provider",
+        required=True,
+        help="provider token: a name, or vendor:model (e.g. agy:gemini-3.8-flash, "
+        "anthropic-api:claude-opus-4-5, a delegate_profiles entry, a registry entry)",
+    )
+    p_dr.add_argument(
+        "--role",
+        required=True,
+        choices=delegate.ROLES,
+        help="review/gate/chair run read-only; implement/fix run tool-enabled",
+    )
+    p_dr.add_argument("--prompt-file", required=True, help="file holding the delegate's brief")
+    p_dr.add_argument("--cwd", default=None, help="working directory for the delegate")
+    p_dr.add_argument(
+        "--timeout",
+        type=_positive_int,
+        default=delegate.DEFAULT_TIMEOUT_S,
+        help=f"wall-clock seconds (default {delegate.DEFAULT_TIMEOUT_S})",
+    )
+    p_dr.add_argument(
+        "--effort",
+        choices=delegate.EFFORTS,
+        default=None,
+        help="reasoning effort, mapped per vendor; a vendor that cannot express it "
+        "reports effort_applied: false with a warning",
+    )
+    p_dr.add_argument("--model", default=None, help="model override (wins over provider:model)")
+    p_dr.add_argument("--root", default=".", help="project root holding .keel/state/")
+    p_dr.add_argument(
+        "--project", dest="path", default=None, help="project.yaml holding delegate_profiles"
+    )
+    p_dr.add_argument(
+        "--registry", default=None, help="provider registry path (default $KEEL_PROVIDERS)"
+    )
+    p_dr.add_argument("--run-id", default=None, help="stable id for a detached run")
+    p_dr.add_argument(
+        "--detach",
+        action="store_true",
+        help="start the run in the background and return immediately; collect it with "
+        "keel delegate wait <run-id>",
+    )
+    p_dr.add_argument(
+        "--json",
+        action="store_true",
+        help="accepted for symmetry; the run contract is JSON either way",
+    )
+    p_dr.add_argument("--_child", dest="child", action="store_true", help=argparse.SUPPRESS)
+    p_dr.set_defaults(func=_cmd_delegate_run)
+
+    p_dw = p_delegate_sub.add_parser("wait", help="block until a detached run finishes")
+    p_dw.add_argument("run_id", help="the run id printed by --detach")
+    p_dw.add_argument("--root", default=".", help="project root holding .keel/state/")
+    p_dw.add_argument(
+        "--timeout",
+        type=_positive_int,
+        default=None,
+        help="give up after N seconds (default: wait indefinitely)",
+    )
+    p_dw.add_argument(
+        "--json", action="store_true", help="accepted for symmetry; the result is JSON either way"
+    )
+    p_dw.set_defaults(func=_cmd_delegate_wait)
+
+    p_ds = p_delegate_sub.add_parser("status", help="list detached delegate runs")
+    p_ds.add_argument("--root", default=".", help="project root holding .keel/state/")
+    p_ds.add_argument("--json", action="store_true", help="emit structured JSON")
+    p_ds.set_defaults(func=_cmd_delegate_status)
 
     p_proj = sub.add_parser(
         "project-commands", help="list project-provided commands declared by policy"
@@ -6645,7 +9635,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_setup.set_defaults(func=_cmd_setup)
 
     p_ia = sub.add_parser("install-adapter", help="install the /keel:<command> adapters")
-    p_ia.add_argument("agent", help=f"'all', 'plugin', or one of: {', '.join(install.TARGETS)}")
+    p_ia.add_argument(
+        "agent", help=f"'all', 'plugin', 'site', or one of: {', '.join(install.TARGETS)}"
+    )
     p_ia.add_argument("--root", default=".", help="project root to install into")
     p_ia.add_argument("--force", action="store_true", help="overwrite existing adapters")
     p_ia.set_defaults(func=_cmd_install_adapter)
@@ -6716,6 +9708,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="render conflict-free DAG waves and clusters for a swarm of issues",
     )
     p_sp.add_argument("path", help="path to project.yaml")
+    # Accepted for parity with every sibling that takes a `path`, and because the
+    # published Action builds one argv shape for all of them — `<config> --root .`
+    # plus the command's own flags. `swarm-plan` was the only subcommand whose
+    # parser refused it, so `command: swarm-plan` exited 2 with
+    # `unrecognized arguments: --root .` (#1153). The plan itself is pure: it reads
+    # the config it is given and renders waves, so nothing here resolves against a
+    # root. The flag is part of the interface, not an input to the planning.
+    p_sp.add_argument("--root", default=".", help="repo root, for interface parity")
     p_sp.add_argument(
         "--issues", default=None, help="comma-separated issue numbers (e.g. 101,102,103)"
     )
@@ -6738,6 +9738,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--issue-label", action="append", default=[], help="issue label; repeat or comma-separate"
     )
     p_sp.add_argument("--swarm-id", default=None, help="custom swarm ID")
+    _add_staffing_args(p_sp, reviewers=True)
     p_sp.add_argument("--tree", action="store_true", help="render visual ASCII/Unicode DAG tree")
     p_sp.add_argument("--json", action="store_true", help="emit structured JSON")
     p_sp.set_defaults(func=_cmd_swarm_plan)
@@ -6780,6 +9781,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--issue-label", action="append", default=[], help="issue label; repeat or comma-separate"
     )
     p_sr.add_argument("--swarm-id", default=None, help="custom swarm ID")
+    _add_staffing_args(p_sr, reviewers=True)
     p_sr.add_argument(
         "--max-workers", type=_positive_int, default=4, help="maximum parallel workers (default: 4)"
     )
@@ -6819,6 +9821,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--issue-label", action="append", default=[], help="issue label; repeat or comma-separate"
     )
     p_sl.add_argument("--swarm-id", default=None, help="custom swarm ID")
+    _add_staffing_args(p_sl, reviewers=True)
     p_sl.add_argument("--live", action="store_true", help="run live mutating git landing")
     p_sl.add_argument("--json", action="store_true", help="emit structured JSON")
     p_sl.set_defaults(func=_cmd_swarm_land)
@@ -6859,6 +9862,82 @@ def build_parser() -> argparse.ArgumentParser:
     p_cost.set_defaults(func=_cmd_cost_report)
 
     return parser
+
+
+def _add_jury_flags(parser: argparse.ArgumentParser, *, noun: str, advisory_help: str) -> None:
+    """Define the one jury flag group every review-aware surface accepts (#1043).
+
+    ``--jury`` / ``--no-jury`` / ``--jury-advisory`` are read by
+    :func:`ship.resolve_jury` through :func:`_review_assignment`, and a surface that
+    does not define them resolves the jury line of the review contract from defaults
+    instead of from what the operator typed. That was the last residual asymmetry left
+    by #1014/#1039: ``keel review`` had no jury flags, so its ``--verify`` report could
+    require a ``jury-verdict`` that the ``keel ship --no-jury`` run which produced the PR
+    was told never to produce. Defining the group once means a *new* review-aware
+    subcommand cannot pick up two of the three, or spell one of them differently.
+
+    ``noun`` and ``advisory_help`` keep each surface's existing wording — the jury is an
+    "evidence" requirement to ``keel merge`` and a "gate" to ``keel ship`` — while the
+    flag names, actions and defaults come from here.
+    """
+    parser.add_argument("--jury", action="store_true", help=f"enable {noun}")
+    parser.add_argument("--no-jury", action="store_true", help=f"disable {noun}")
+    parser.add_argument("--jury-advisory", action="store_true", help=advisory_help)
+
+
+def _add_bench_args(parser: argparse.ArgumentParser) -> None:
+    """``--effort`` and ``--team`` — the two per-run overrides that pick a bench (#1017).
+
+    Defined once and added to the batch commands **and** to ``ship``/``plan``, because a
+    batch hands these down verbatim. When only the parents accepted them, the published
+    ``child_args`` named two flags the child's own parser rejected, so every propagated
+    handoff died on ``unrecognized arguments`` — the promise was in the contract and the
+    parser could not keep it.
+    """
+    parser.add_argument(
+        "--effort",
+        choices=delegate.EFFORTS,
+        default=None,
+        help="reasoning effort for the implementer seat; wins over the seat's own and "
+        "over knobs.team.by_difficulty",
+    )
+    parser.add_argument(
+        "--team",
+        dest="team_profile",
+        default=None,
+        metavar="PROFILE",
+        help="knobs.team.profiles entry that staffs this run; outranks team.by_difficulty",
+    )
+
+
+def _add_staffing_args(parser: argparse.ArgumentParser, *, reviewers: bool = False) -> None:
+    """The staffing flags a batch runner accepts and hands to every child ship (#1017).
+
+    One definition for every batch command, because these are propagated verbatim: a
+    command that spelled ``--team`` differently would hand its children a flag the child
+    does not have, and the failure would look like the child ignoring the operator.
+    """
+    parser.add_argument(
+        "--delegate",
+        default=None,
+        help="per-run implementer override (provider or provider:model) for every child ship",
+    )
+    parser.add_argument(
+        "--review-delegate",
+        action="append",
+        default=[],
+        metavar="PROVIDER",
+        help="per-run reviewer override, positional per slot; repeatable",
+    )
+    _add_bench_args(parser)
+    if reviewers:
+        parser.add_argument(
+            "--reviewers",
+            type=int,
+            choices=(1, 2, 3),
+            default=None,
+            help="override the risk-derived reviewer count for every child ship",
+        )
 
 
 def _add_ship_parser(parser: argparse.ArgumentParser, *, command: str) -> None:
@@ -6930,7 +10009,10 @@ def _add_ship_parser(parser: argparse.ArgumentParser, *, command: str) -> None:
         "--branch", default=None, help="branch name to store in the run ledger record"
     )
     parser.add_argument(
-        "--head-sha", default=None, help="head commit SHA to store in the run ledger record"
+        "--head-sha",
+        default=None,
+        help="head commit SHA to store in the run ledger record; a learning sink outside "
+        "the checkout links each changed file on GitHub at it (#1166)",
     )
     parser.add_argument(
         "--declared-file",
@@ -6970,6 +10052,24 @@ def _add_ship_parser(parser: argparse.ArgumentParser, *, command: str) -> None:
     )
     parser.add_argument(
         "--implementer", default=None, help="effective implementer codename or vendor/model label"
+    )
+    parser.add_argument(
+        "--phase-implementer",
+        action="append",
+        default=[],
+        type=_phase_implementer_arg,
+        metavar="PHASE=LABEL",
+        help="effective implementer for one implement_mode: tdd phase "
+        "(tests|implementation); defaults to --implementer for both; repeatable",
+    )
+    parser.add_argument(
+        "--loop-iteration",
+        action="append",
+        default=[],
+        type=_loop_iteration_arg,
+        metavar="K=SHA:pass|fail",
+        help="one s4 loop iteration to record (#1165): its 1-based number, the commit it "
+        "ended with, and whether the gates passed after it; repeatable",
     )
     parser.add_argument(
         "--reviewer-agent",
@@ -7014,6 +10114,26 @@ def _add_ship_parser(parser: argparse.ArgumentParser, *, command: str) -> None:
         help="issue label for intake/readiness; repeat or comma-separate",
     )
     parser.add_argument(
+        "--role",
+        default=None,
+        help="issue role label used to resolve knobs.team.implement.by_role",
+    )
+    parser.add_argument(
+        "--delegate",
+        default=None,
+        help="per-run implementer override (provider or provider:model); "
+        "wins over knobs.team.implement",
+    )
+    parser.add_argument(
+        "--review-delegate",
+        action="append",
+        default=[],
+        metavar="PROVIDER",
+        help="per-run reviewer override, positional per slot: the first flag is slot A, "
+        "the second slot B; repeatable",
+    )
+    _add_bench_args(parser)
+    parser.add_argument(
         "--review-comments",
         choices=("inline", "summary"),
         default="inline",
@@ -7026,12 +10146,10 @@ def _add_ship_parser(parser: argparse.ArgumentParser, *, command: str) -> None:
         default=None,
         help="override the risk-derived reviewer count",
     )
-    parser.add_argument("--jury", action="store_true", help="enable the cross-vendor jury gate")
-    parser.add_argument("--no-jury", action="store_true", help="disable the cross-vendor jury gate")
-    parser.add_argument(
-        "--jury-advisory",
-        action="store_true",
-        help="make an enabled jury advisory instead of merge-gating",
+    _add_jury_flags(
+        parser,
+        noun="the cross-vendor jury gate",
+        advisory_help="make an enabled jury advisory instead of merge-gating",
     )
     parser.add_argument(
         "--profile",
@@ -7044,8 +10162,49 @@ def _add_ship_parser(parser: argparse.ArgumentParser, *, command: str) -> None:
         action="store_true",
         help="select the compound workflow profile (alias for --profile compound)",
     )
+    parser.add_argument(
+        "--tdd",
+        action="store_true",
+        help=_TDD_FLAG_HELP,
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help=_LOOP_FLAG_HELP,
+    )
+    # `keel loop brief` has always taken an explicit budget; ship had no counterpart, so a
+    # run that looped four times under `--max-iterations 4` was refused at s11 — "iteration
+    # 4 exceeds the budget of 3" — against a policy it never used, after the work was done
+    # (#1173). Same bound as `loop brief`'s, so one budget cannot be legal to run and
+    # illegal to record.
+    parser.add_argument(
+        "--max-iterations",
+        type=_bounded_int(loop.MIN_ITERATIONS, loop.MAX_ITERATIONS_LIMIT),
+        default=None,
+        help="explicit loop budget for this run (1..10), recorded as its source; "
+        "without it knobs.loop and --loop are the policy",
+    )
+    _add_wizard_arguments(parser)
     parser.add_argument("--json", action="store_true", help="emit structured JSON")
     parser.set_defaults(func=_cmd_ship, ship_command=command)
+
+
+def _add_wizard_arguments(parser: argparse.ArgumentParser) -> None:
+    """The `--wizard` pair every command with a provider picker shares (#1018)."""
+    parser.add_argument(
+        "--wizard",
+        action="store_true",
+        help="interactive pre-s1 picker for implementer/gate/reviewer seats, built "
+        "from the `keel doctor --providers` probe; a logged no-op with no terminal",
+    )
+    parser.add_argument(
+        "--wizard-answer",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="pre-answer one wizard question without prompting (repeatable, or "
+        "semicolon-separated); makes a wizard run reproducible and offline",
+    )
 
 
 def _positive_int(value: str) -> int:
@@ -7053,6 +10212,19 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
+
+
+def _bounded_int(low: int, high: int | None = None):
+    """An argparse type holding a flag to the bounds the schema holds the knob to."""
+
+    def integer(value: str) -> int:
+        parsed = int(value)
+        if parsed < low or (high is not None and parsed > high):
+            bounds = f"{low}..{high}" if high is not None else f"at least {low}"
+            raise argparse.ArgumentTypeError(f"must be an integer in {bounds}")
+        return parsed
+
+    return integer
 
 
 def _nonnegative_int(value: str) -> int:
@@ -7072,6 +10244,448 @@ def _parse_pr_issue_mapping(value: str) -> tuple[int, int]:
     except (argparse.ArgumentTypeError, ValueError) as exc:
         raise argparse.ArgumentTypeError("linked issue mapping must be PR=ISSUE") from exc
     return pr, issue
+
+
+def _today() -> str:
+    """Today's UTC date, as the sink's `{date}` placeholder and frontmatter field.
+
+    Here rather than in `capture`: the pure core takes no wall clock, so the date is
+    read at the one edge that is allowed to and passed in.
+    """
+    import datetime
+
+    return datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d")
+
+
+def _retrieve_learnings(args, config, changed_files) -> dict:
+    """Read this project's learning directories and rank them against this task.
+
+    The I/O half of #1155, here rather than in `capture` for the same reason
+    `_write_learning_sink` is: `capture.retrieve_relevant_learnings` reads a
+    directory, everything that *decides* anything is pure beside it, and `assess`
+    takes the result as an argument the way it takes `jury_availability`.
+
+    Always returns a block, even when there is nothing to retrieve. A project with
+    no learnings gets empty `hits` and an empty `section`, and an empty section is
+    what the briefs render nothing from — so a directory that is missing, empty or
+    unreadable costs a `Path.is_dir()` and changes no brief.
+    """
+    labels = _issue_labels(args)
+    # **Declared files first, and they are the point.** Retrieval runs at s3, before
+    # s4 has written a line, so the diff is empty on exactly the run that most needs
+    # a lesson. `--declared-file` is what the run *states* it will touch, which is
+    # the only file list that exists that early; the read diff joins it for a
+    # re-run on an implemented branch. Not deduped either: the query is tokenised
+    # into a set and the path match is a set intersection, so a file named twice is
+    # a file named once.
+    # Commands without a declared scope still retrieve by title and labels.
+    changed = [*(getattr(args, "declared_file", None) or ()), *(changed_files or ())]
+    sources = capture.learning_source_dirs(
+        config,
+        values={
+            "owner": config.owner or "",
+            "repo": config.repo or "",
+            "base_branch": config.base_branch or "",
+        },
+    )
+    query = capture.learning_query_text(
+        title=args.issue_title,
+        labels=labels,
+        changed_files=changed,
+    )
+    hits: list[dict] = []
+    for source in sources:
+        # Relative to `--root`, through the same resolver the sink writes with: the
+        # default `.keel/learning` otherwise reads wherever keel was launched from,
+        # which on a CI runner is not the repository.
+        hits.extend(
+            capture.retrieve_relevant_learnings(
+                query,
+                _resolve_under_root(source, args.root),
+                max_results=capture.DEFAULT_LEARNING_RETRIEVAL_LIMIT,
+                labels=labels,
+                changed_files=changed,
+            )
+        )
+    # Re-rank across directories: each one returned its own top-k, and a shared
+    # folder's best lesson must be able to outrank a repo-local weak one.
+    # The same key `retrieve_relevant_learnings` sorts by, including `declared`:
+    # re-sorting on the score alone here undid the rule that an exact declaration
+    # outranks any amount of prose, for every project that reads two directories.
+    hits.sort(key=lambda hit: (-hit["declared"], -hit["score"], hit["file"]))
+    return capture.learning_retrieval_as_dict(
+        sources=[str(source) for source in sources],
+        hits=capture.dedupe_learning_hits(hits)[: capture.DEFAULT_LEARNING_RETRIEVAL_LIMIT],
+    )
+
+
+def _capture_changed_files(args, config, changed_files) -> list[str]:
+    """The files this capture is about.
+
+    **The local diff is empty on the path that matters.** s11 runs after s10 has
+    squash-merged, so `--root .` is the primary checkout sitting on `base_branch`
+    and `git diff --name-only main...HEAD` reports nothing — measured. The document
+    then records `changed_files: []` and, worse, `learning_fingerprint` hashes an
+    empty file list, so the field the sink filename exists to distinguish two
+    lessons by stops distinguishing anything.
+
+    `--pull-request` names the PR whose files those were, so they are read from the
+    host when the local diff has none. Fail-soft, like the issue facts beside it:
+    offline, the empty list stands and the lesson is scored on its title alone.
+
+    Either list is then read without the sink's own documents
+    (:func:`keel.capture.lesson_changed_files`): once a lesson has landed on the pull
+    request, the host lists it among that pull request's files, and the document written
+    before the landing and the record appended after the merge must hash the same list.
+    """
+    local = list(changed_files or ())
+    # `args.ledger_pr or args.pr`, the same pair the sink resolves its `{pr}` from:
+    # `--pull-request` lands on `ledger_pr`, and reading only `args.pr` asked the
+    # host about nothing on the very command this exists for.
+    pr = getattr(args, "ledger_pr", None) or getattr(args, "pr", None)
+    if not local and pr is not None:
+        local = github.pr_files(pr, cwd=args.root) or []
+    return capture.lesson_changed_files(
+        config, local, pr_number=pr, base_branch=config.base_branch or ""
+    )
+
+
+def _capture_issue_facts(args) -> tuple[str, str, tuple[str, ...]]:
+    """The issue's title, body and labels for the learning document.
+
+    **The adapter's s11 command does not pass them.** `--issue-title` and
+    `--issue-body` are `keel plan` flags at the start of a run; the ship that
+    records capture is `keel ship … --live --append-ledger --issue <N>
+    --pull-request <PR> --capture-status applied`, and a later invocation inherits
+    nothing. Measured on exactly that command: one file titled `Learning`, an empty
+    description, a `learning` slug and `_Not recorded._` under every heading — the
+    empty-document failure this feature was already once burned on, on the only path
+    keel dogfoods.
+
+    So when `--issue` names one and the flags are empty, the facts are read from the
+    host. Fail-soft, like :func:`_gather_issue_facts`, which does the same for the
+    blocker gate: offline, the flags stand and the document says what it can.
+    """
+    title = args.issue_title or ""
+    body = args.issue_body or ""
+    labels = _issue_labels(args)
+    issue = getattr(args, "issue", None)
+    if issue is None or (title and body and labels):
+        return title, body, labels
+    result = github.issue_facts(issue, cwd=args.root, fields="title,body,labels")
+    if not result.ok:
+        return title, body, labels
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return title, body, labels
+    if not isinstance(data, dict):
+        return title, body, labels
+    if not title and isinstance(data.get("title"), str):
+        title = data["title"]
+    if not body and isinstance(data.get("body"), str):
+        body = data["body"]
+    if not labels and isinstance(data.get("labels"), list):
+        labels = tuple(
+            str(item["name"])
+            for item in data["labels"]
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        )
+    return title, body, labels
+
+
+def _gate_word(outcome) -> str:
+    """What a gate outcome says in a learning document."""
+    if outcome.skipped:
+        return "skipped"
+    if outcome.not_run:
+        return "not run"
+    return "ok" if outcome.ok else "failed"
+
+
+def _learning_sections(args, outcomes, body: str) -> tuple[str, str, str, str]:
+    """The document's prose: description, and the three contracted sections.
+
+    Built from what the run already carries — the issue body and the gate outcomes
+    — rather than from a model. The extension "fills them from the run ledger and
+    the closure summary; it does not call any model itself", and a document whose
+    three sections all read `_Not recorded._` is a file with a filename and nothing
+    else in it.
+    """
+    body = (body or "").strip()
+    # **Not the first line — the first line that says something.** A keel issue opens
+    # with `## Deliverable` or `## Problem`, so the first non-empty line is a heading,
+    # and the front matter carried it as the lesson's one-line summary. The reader
+    # already skips headings when it falls back to the body; the writer was feeding
+    # one through the field that bypasses that.
+    description = next(
+        (
+            line.strip()[:200]
+            for line in body.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ),
+        "",
+    )
+    files = ", ".join(sorted(changed)) if (changed := list(args.declared_file or ())) else ""
+    what_changed = body or "_Not recorded._"
+    if files:
+        what_changed = f"{what_changed}\n\nDeclared files: {files}"
+    # `not_run` before `ok`: an agentic gate reaches the command runner as
+    # `ok=True, not_run=True` so a soft gate does not spuriously fail the run, and
+    # a document that recorded it as `ok` would teach the next run that a gate
+    # nobody executed had passed — inside the artifact that makes `applied`
+    # provable. `gates.record_gates_passed` refuses exactly this certification.
+    gates = [f"{outcome.gate}: {_gate_word(outcome)}" for outcome in outcomes or ()]
+    what_we_learned = "Gates on the merged head — " + (", ".join(gates) if gates else "none run")
+    do_differently = (
+        "Recorded automatically from the run. Edit this file to say what the next "
+        "run should do differently; the read path scores on its text."
+    )
+    return description, what_changed, what_we_learned, do_differently
+
+
+def _write_learning_sink(
+    args, config, changed_files, existing_records, outcomes, facts
+) -> dict | None:
+    """Write this run's learning document, or `None` when there is nothing to write.
+
+    The plan is pure (:func:`keel.capture.learning_sink_plan`); this is the thin I/O
+    around it, which is why it lives here and not in `capture`. It returns
+    ``{"ok": bool, "path": str | None, "error": str | None, "reused": bool}`` so the
+    caller can decide what the record says — a writer that reached into the record
+    itself would put policy in the I/O layer.
+
+    ``reused`` marks the one result that wrote nothing: a `duplicate` decision, whose
+    artifact is the file the run it duplicates already wrote (see
+    :func:`_duplicate_learning_artifact`).
+
+    Fail-soft by contract: any `OSError` becomes ``ok: False`` and the caller
+    downgrades the capture to ``skipped:capability-unavailable``. A capture that
+    could not be written must not fail a merge that already happened.
+    """
+    # A dry run must write nothing. And neither must a run that will record
+    # nothing: the artifact exists to be *named by a ledger record*, so writing one
+    # without `--append-ledger` leaves the same orphan in a knowledge folder that
+    # asking the clash first was added to prevent — reachable by dropping one flag
+    # the adapter happens to pass.
+    if not (args.live and args.append_ledger):
+        return None
+    # **Redact the values, then render.** Sanitizing the finished document put the
+    # replacement *inside* a front-matter scalar the quoter had already decided was
+    # safe: `ghp_AAA…` is plain YAML (letters, digits, underscore), so it went in
+    # bare, and `[REDACTED:github-token]` in its place makes a real parser read a
+    # list where a title should be. A redacted value is quoted like any other value
+    # when it goes through `_yaml_scalar` — and the filename, built from the title,
+    # stops carrying most of the token through `_slugify`.
+    status = _resolved_capture_status(args.capture_status)
+    title, body, labels = facts
+    decision = capture.learning_decision(
+        # The *unredacted* title and labels, and the same ones the ledger's own
+        # `record_marker` is given: this is the dedupe fingerprint, and a sink that
+        # fingerprinted the host's title while the record fingerprinted an empty flag
+        # would dedupe against a value nothing else computes.
+        title=title,
+        labels=labels,
+        changed_files=changed_files or (),
+        capture_status=status,
+        capture_reason=args.capture_reason,
+        # The records the dedupe needs. Without them `learning_decision` can
+        # never answer `duplicate`, so the skip this feature documents was
+        # unreachable on the only path that writes.
+        existing_records=existing_records or (),
+        config=config,
+    )
+    # Asked before anything expensive happens. Reading the redaction policy on a run
+    # that writes nothing raised an invalid `capture_redaction` pattern from here,
+    # past the handler `_cmd_ship` has for exactly that failure.
+    if not capture.learning_sink_writes(config=config, decision=decision, capture_status=status):
+        return _duplicate_learning_artifact(config, decision, status, existing_records, args.root)
+    # **Redact the values, then render.** Sanitizing the finished document put the
+    # replacement *inside* a front-matter scalar the quoter had already decided was
+    # safe: `ghp_AAA…` is plain YAML (letters, digits, underscore), so it went in
+    # bare, and `[REDACTED:github-token]` in its place makes a real parser read a
+    # list where a title should be. A redacted value is quoted like any other when
+    # it goes through `_yaml_scalar` — and the filename, built from the title, stops
+    # carrying most of the token through `_slugify`.
+    try:
+        policy = redaction.policy_from_config(config)
+    except redaction.RedactionError as exc:
+        # Fail-soft, like an unwritable directory: an invalid `capture_redaction`
+        # pattern must not kill a run whose merge already happened. `_cmd_ship`
+        # reports the policy properly when the *ledger* is sanitized; raising from
+        # here reached no handler at all and ended the command in a traceback.
+        return {"ok": False, "path": None, "error": str(exc), "reused": False}
+    fields = redaction.sanitize(
+        {
+            # **Every value the document is rendered from**, not the ones a secret
+            # is most likely to be in. A `changed_files` path or a label that *is* a
+            # token — `ghp_…` and nothing else — is plain YAML, so it went in bare
+            # and the document pass put the replacement inside it: the same break as
+            # the title, one field over, twice. This is the whole set.
+            "title": title,
+            "labels": labels,
+            "changed_files": changed_files or (),
+            "sections": _learning_sections(args, outcomes, body),
+        },
+        policy,
+    ).value
+    description, what_changed, what_we_learned, do_differently = fields["sections"]
+    # Not `None` by construction: `learning_sink_writes` above is the same gate this
+    # consults, which is why it exists as its own function.
+    plan = capture.learning_sink_plan(
+        config=config,
+        decision=decision,
+        capture_status=status,
+        owner=config.owner,
+        repo=config.repo,
+        base_branch=config.base_branch,
+        date=_today(),
+        pr_number=args.ledger_pr or args.pr,
+        title=fields["title"],
+        issue_number=args.issue,
+        labels=fields["labels"],
+        changed_files=fields["changed_files"],
+        description=description,
+        what_changed=what_changed,
+        what_we_learned=what_we_learned,
+        do_differently=do_differently,
+        # The **Files** section links each path on GitHub at this head when the
+        # sink is outside the checkout (#1166); an in-repo sink links relatively
+        # and never reads it.
+        head_sha=args.head_sha,
+    )
+    # **Absolute, so the recorded path means one thing.** `--root` is whatever the
+    # operator typed: `.`, an absolute path, or a relative `repo`. Recording the
+    # joined-but-still-relative result made the artifact mean "relative to the
+    # directory that run happened to be launched from", and reading it back through
+    # the same join then prefixed the root twice (`repo/repo/learnings/…`), found
+    # nothing, and recorded `applied` with no artifact — the finding this whole
+    # reuse exists to close.
+    directory = _resolve_under_root(plan["directory"], args.root)
+    # Anchored somewhere this host cannot write: `C:/knowledge` is a *relative* path
+    # to POSIX, so resolving it here would put a `C:` directory next to whatever the
+    # process happened to be standing in. Fail-soft, as an unwritable directory does
+    # — the machine, not the config, is what cannot honour it.
+    #
+    # `pragma: no cover` on the branch, not the body, and for a measured reason: a
+    # path anchored on *another* platform is what triggers this, and on the Windows
+    # legs a rooted path is native too, so the condition cannot be made true there.
+    # The ubuntu and macos legs cover it through
+    # `test_a_sink_this_platform_cannot_write_fails_soft`, and
+    # `learning_sink_in_worktree`'s pure test pins both anchors on every platform.
+    if (  # pragma: no cover - only reachable where a foreign anchor is not a native one
+        workspace.is_root_anchored(plan["directory"]) and not directory.is_absolute()
+    ):
+        return {
+            "ok": False,
+            "path": None,
+            "error": f"sink path {plan['directory']!r} is not writable on this platform",
+            "reused": False,
+        }
+    target = directory / plan["filename"]
+    # A second pass over the finished document. Redaction before durability is the
+    # capture contract's own rule — `contract_as_dict` declares
+    # `durable_artifacts.requires_redaction` and the ledger sanitizes every record
+    # it writes — and this catches anything the renderer itself carried in. A no-op
+    # on values already sanitized above.
+    result = redaction.sanitize(plan["content"], policy)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        workspace.write_text_atomic(target, result.value)
+    except OSError as exc:
+        return {"ok": False, "path": None, "error": str(exc), "reused": False}
+    return {
+        "ok": True,
+        "path": _recordable_artifact(target, args.root),
+        "error": None,
+        "reused": False,
+    }
+
+
+def _duplicate_learning_artifact(
+    config, decision, capture_status, existing_records, root
+) -> dict | None:
+    """Point a deduped run at the file the run it duplicates already wrote.
+
+    The path is only claimed when it is still there. A record can name a file
+    that has since been deleted, or one written on another machine into a shared
+    knowledge folder this checkout cannot see, and an `artifact` that resolves to
+    nothing is a worse answer than no artifact at all: `capture-verify` would
+    report a clean session while the proof it names does not exist.
+
+    This is where the `machine` scope is *acted on*, and deliberately not in
+    `capture.duplicate_learning_artifact` (#1185). Dropping such a path in the pure
+    layer looks right and is not: on the host that wrote the file it is readable, and
+    refusing it there records `applied` with no artifact — the finding this reuse
+    exists to prevent, raised on the one machine where the artifact is real.
+    """
+    recorded = capture.duplicate_learning_artifact(
+        config=config,
+        decision=decision,
+        capture_status=capture_status,
+        existing_records=existing_records or (),
+    )
+    if recorded is None:
+        return None
+    if _recorded_artifact(recorded, root) is None:
+        return None
+    return {"ok": True, "path": recorded, "error": None, "reused": True}
+
+
+def _recordable_artifact(target: Path, root: str) -> str:
+    """The artifact path to store: **relative to `--root` when it is inside it.**
+
+    Neither obvious answer survives alone, and both were shipped. The join of
+    whatever `--root` happened to be meant "relative to the directory *that* run
+    was launched from", so a relative `--root repo` prefixed the root twice reading
+    its own file back. Made absolute instead, it named a filesystem location — and
+    the file is *committed*, so the next worktree (s2 cuts it from
+    `origin/<base_branch>`) and every CI runner hold the same lesson at a different
+    absolute path, where the duplicate reuse could no longer find it.
+
+    A path inside the checkout is recorded the way the repository names it and
+    resolves against whatever root reads it later; one outside — a shared knowledge
+    folder — stays absolute, because nothing else can name it.
+    """
+    # Normalised on both sides: `Path(".").absolute()` keeps the `.` component, so
+    # `--root .` — the default, and the shape the adapter uses — never matched its
+    # own root and every record came out absolute again.
+    absolute = Path(os.path.normpath(target.absolute()))
+    base = Path(os.path.normpath(Path(root).absolute()))
+    try:
+        # **`as_posix()`, not `str()`.** A relative record is written on one
+        # machine and read on another — that is the whole reason it is relative —
+        # and `str(PurePath)` gives `\` on Windows, which a POSIX reader takes as
+        # one filename rather than three components. The tree already uses
+        # `as_posix()` for exactly this in `install.py`.
+        return absolute.relative_to(base).as_posix()
+    except ValueError:
+        return str(absolute)
+
+
+def _recorded_artifact(recorded: str, root: str) -> Path | None:
+    """The recorded artifact on this machine, or `None` when it is not there."""
+    path = _resolve_under_root(recorded, root)
+    return path if path.is_file() else None
+
+
+def _resolve_under_root(recorded: str, root: str) -> Path:
+    """Where a recorded artifact path actually is on this machine.
+
+    The same rule the write path applies, and it has to be: `--root` defaults to
+    `.`, so a live run from the repository records a **relative**
+    `.keel/learning/…md`. Resolved against the process directory instead, a later
+    run launched from anywhere else — a CI runner, a worktree, a cron shell — would
+    find nothing and record `applied` with no artifact, which is the finding this
+    reuse exists to prevent.
+    """
+    # `workspace.is_root_anchored`, not this host's `is_absolute()`: the predicate
+    # that decides whether the sink is in-repo already asks it that way, and the
+    # writer asking differently is the two halves of one question disagreeing —
+    # `C:/knowledge/learnings` was joined under the root on macOS, producing a `C:`
+    # directory *inside* the working tree that the adapter is told not to commit.
+    path = Path(recorded).expanduser()
+    return path if workspace.is_root_anchored(str(path)) else Path(root) / path
 
 
 def _resolved_capture_status(value: str | None) -> str | None:
@@ -7109,4 +10723,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except checkpoint.CheckpointError as exc:
         print(f"invalid checkpoint path: {exc}", file=sys.stderr)
+        return 1
+    except juryavail.JuryUnavailableError as exc:
+        # `knobs.team.jury.on_unavailable: block` and the panel cannot be staffed here
+        # (#1066). Raised at the probe — the only place the measurement is taken — and
+        # caught once here, so every review-aware surface refuses identically. Six
+        # near-copies of the same check would drift, and a surface that missed it would
+        # review a jury tier with a bench the project's policy refused.
+        print(str(exc), file=sys.stderr)
         return 1

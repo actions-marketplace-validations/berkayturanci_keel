@@ -4,33 +4,98 @@ The ship adapter is agentic, but the artifacts it must leave behind are not:
 reviewer verdict comments/reviews, the optional jury verdict, and the stable
 closure comment marker. This module keeps the check pure so CI can enforce it
 without trusting prose in an agent prompt.
+
+Classification is **header-anchored**: :func:`marker_in_header` decides what a
+comment is from its first non-empty line and nothing else, so a marker a reviewer
+quotes in prose is content rather than a classification signal (#1026). The ship
+assessment heading is anchored the same way, from its own header line (#1035).
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from . import agents, closure
+from . import agents, closure, juryavail
+from . import team as team_policy
 
 SCHEMA_VERSION = "keel.evidence.v1"
+#: ``reviewers.panel`` when the cross-vendor jury *is* the review for this tier
+#: (``knobs.team``'s ``review.by_tier.<n>: jury``), and the minimum distinct
+#: vendors such a panel must span. Both come from :mod:`keel.team`, the leaf
+#: module that owns the team vocabulary, so the gate and the policy cannot drift.
+JURY_PANEL = team_policy.JURY_PANEL
+DEFAULT_MINIMUM_JURY_VENDORS = team_policy.DEFAULT_MIN_VENDORS
 AGENT_LABEL_PREFIX = "agent:"
+MODEL_LABEL_PREFIX = "model:"
 REVIEW_VERDICT_MARKER = "keel.review-verdict.v1"
 JURY_VERDICT_MARKER = "keel.jury-verdict.v1"
+#: The comment a live ship run posts on its PR right after creating it (#1013). It is
+#: the *primary* arming signal for the evidence gate: unlike the branch name it is
+#: written by the run itself, so a run that named its branch something else — or whose
+#: ledger lives in a per-run worktree CI cannot read — still identifies as a keel ship
+#: run. See :func:`gate_decision` for the full arming order.
+SHIP_PROVENANCE_MARKER = "keel.ship-provenance.v1"
+#: The marker the ship adapter tells a host to post when a finding is deferred rather
+#: than fixed. keel core never counts a deferral as evidence; it is listed among the
+#: classification markers so a deferral comment reads as *one* artifact instead of
+#: being classified by whichever marker its prose happens to name.
+DEFERRAL_MARKER = "keel.deferral.v1"
 SHIP_ASSESSMENT_HEADING = "### \U0001f6a2 keel ship"
+#: The banner the ``keel ship`` CLI prints above its own summary. An assessment pasted
+#: raw — without the workflow's Markdown heading — leads with this line instead, so both
+#: forms identify the comment. See :func:`_is_ship_assessment`.
+SHIP_ASSESSMENT_BANNER = "keel ship \u2014"
 DEFAULT_WAIVER_LABEL = "keel:evidence-waived"
 TRUSTED_AUTHOR_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 TRUSTED_SHIP_ASSESSMENT_BOTS = frozenset({"github-actions", "github-actions[bot]"})
 
+#: Every marker that *classifies* an evidence comment. Order is the order findings
+#: report them in, so a malformed-header message is byte-stable.
+CLASSIFICATION_MARKERS: tuple[str, ...] = (
+    REVIEW_VERDICT_MARKER,
+    JURY_VERDICT_MARKER,
+    SHIP_PROVENANCE_MARKER,
+    closure.CLOSURE_SCHEMA_VERSION,
+    DEFERRAL_MARKER,
+)
+
+#: Membership view of :data:`CLASSIFICATION_MARKERS`, which is a tuple because its **order**
+#: is the order markers are rendered in. Asking a tuple `x in ...` is a linear scan, and the
+#: two places below only ask whether every token is a known marker — a set answers that
+#: question by its type rather than by walking. The tuple stays where order matters.
+_CLASSIFICATION_MARKERS_SET = frozenset(CLASSIFICATION_MARKERS)
+
+#: The finding raised for a comment whose header names more than one marker.
+MALFORMED_MARKER_FINDING = "malformed-evidence-comment"
+
+#: The header fields keel reads off an evidence comment. Closed by design: an
+#: unlisted ``key: value`` line is prose, and prose ends the header block (#932).
+#: ``panelists`` joins ``vendors`` as a jury-verdict field, because the size of a
+#: panel that *is* the review sets the required verdict count (#1015).
 _FIELD_RE = re.compile(
-    r"^\s*(?P<key>reviewer|head|vendor|model|vendors)\s*:\s*(?P<value>\S+)\s*$",
+    r"^\s*(?P<key>reviewer|head|vendor|model|vendors|panelists)\s*:\s*(?P<value>\S+)\s*$",
     re.IGNORECASE,
 )
 _HEADER_LINE_RE = re.compile(r"^[A-Za-z0-9_-]+\s*:")
 _SHIP_BRANCH_RE = re.compile(r"^(feature|fix|chore|docs|test)/issue-\d+(?:-|$)")
+#: The exact wrapper a marker line may wear. Every keel renderer emits its marker as
+#: the whole first line, in one of exactly two shapes: bare
+#: (``artifacts.render_review_verdict`` / ``render_jury_verdict`` /
+#: ``render_ship_provenance``) or wrapped in an HTML comment so it renders invisibly
+#: (``closure.render_closure_comment``).
+#:
+#: These are matched literally, never with a regex. A pattern that treats ``-->`` as
+#: *the* comment terminator is wrong about HTML — a browser also ends a comment at
+#: ``--!>`` — and a classifier that disagrees with the renderer about where a comment
+#: ends is exactly the confusion this module exists to remove (CodeQL
+#: ``py/bad-tag-filter``). keel does not need to parse HTML: it needs to recognise the
+#: one shape it writes, and refuse everything else.
+_HTML_COMMENT_OPEN = "<!--"
+_HTML_COMMENT_CLOSE = "-->"
 
 STATUS_PASS = "pass"
 STATUS_WAITING = "waiting"
@@ -91,12 +156,32 @@ def gate_decision(
     Ship provenance arms the gate by default. The only disarm path is an explicit
     waiver label applied by an operator; the legacy gate label remains an
     additional arming signal for already-installed workflows.
+
+    The signals are consulted in this order, and the order is part of the contract
+    (documented in ``docs/keel/evidence.md``):
+
+    1. ``operator-waiver-label`` — the one sanctioned disarm, checked first so an
+       explicit waiver is never shadowed by an arming signal.
+    2. ``gate-label`` — the legacy opt-in label.
+    3. ``ship-provenance-comment`` — a trusted PR comment carrying
+       :data:`SHIP_PROVENANCE_MARKER`, which a live ship run posts as soon as the PR
+       exists. **Ahead of the branch regex on purpose** (#1013): the marker is written
+       by the run, the branch name is written by whoever typed it, and a ship run that
+       named its branch ``fix/2467-slug`` used to read as a non-keel PR.
+    4. ``ship-branch`` — the legacy branch-name fallback for runs that predate the
+       marker. Kept, but it is no longer the signal keel relies on.
+    5. ``ship-assessment-comment`` / ``review-verdict-marker`` / ``ship-run-ledger`` —
+       the remaining after-the-fact traces, unchanged.
+
+    Nothing was removed: every path that armed the gate before still arms it.
     """
     label_set = set(labels or ())
     if waiver_label and waiver_label in label_set:
         return _gate_decision(False, "operator-waiver-label", waiver_label, waived=True)
     if gate_active(labels, gate_label):
         return _gate_decision(True, "gate-label", gate_label)
+    if _has_trusted_ship_provenance(pr_comments or []):
+        return _gate_decision(True, "ship-provenance-comment", SHIP_PROVENANCE_MARKER)
     if head_ref and _SHIP_BRANCH_RE.search(head_ref):
         return _gate_decision(True, "ship-branch", head_ref)
     if _has_trusted_ship_assessment(pr_comments or []):
@@ -122,6 +207,20 @@ def _gate_decision(
         "reason": reason,
         "source": source,
     }
+
+
+def _has_trusted_ship_provenance(items: list[dict[str, Any]]) -> bool:
+    """True when a trusted PR comment carries the ship-provenance marker.
+
+    Trust is the same fail-closed ``author_association`` check every other evidence
+    source uses: an anonymous drive-by comment must not be able to arm — or, more to
+    the point, to *look* like it armed — the gate.
+    """
+    return any(
+        _is_trusted_source(item, enforced=True)
+        and marker_in_header(_body(item)) == SHIP_PROVENANCE_MARKER
+        for item in items
+    )
 
 
 def _has_trusted_ship_assessment(items: list[dict[str, Any]]) -> bool:
@@ -224,13 +323,23 @@ def required_items(
             PHASE_POST_MERGE,
         ),
     ]
+    # A jury panel's verdicts are panelist ballots mapped onto s7 evidence by
+    # `keel review --from-jury` (#1015): same marker, same head binding, same
+    # requirement. The description names the panel that produced them so a
+    # missing one sends the operator to the jury run rather than to a host
+    # reviewer that was never dispatched.
+    review_description = (
+        "Distinct posted ai-jury panelist verdict for the current PR"
+        if review_panel(review_contract) == JURY_PANEL
+        else "Distinct posted s7 reviewer verdict for the current PR"
+    )
     for index in range(1, reviewer_count + 1):
         items.append(
             EvidenceItem(
                 f"review-verdict-{index}",
                 "review",
                 True,
-                "Distinct posted s7 reviewer verdict for the current PR",
+                review_description,
                 PHASE_PRE_MERGE,
             )
         )
@@ -259,6 +368,7 @@ def verify(
     pr_title: str = "",
     pr_labels: Sequence[str] | None = None,
     head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
     ledger_record: dict[str, Any] | None = None,
     dry_run: bool = False,
     enforced: bool = True,
@@ -284,10 +394,18 @@ def verify(
     only counts when its content matches the canonical render of that record
     (closure-comment fidelity). Without a record the marker-only behavior holds.
 
+    Every comment is classified by :func:`marker_in_header` — the marker on its
+    header line, never one quoted in its prose. A header naming two markers is
+    malformed: it is excluded from every count and reported as an advisory
+    ``malformed-evidence-comment`` finding.
+
     When the gate is active, ``pr_labels`` are additionally checked for the
     mandatory ``agent:<vendor>`` attribution label (and cross-checked against the
     ledger implementer vendor when a record is present); see
-    :func:`attribution_check`.
+    :func:`attribution_check`. The labels are separately checked against keel's own
+    vocabulary — what :func:`keel.agents.attribution` produces from the ledger's
+    ``actors.implementer`` — by :func:`attribution_vocabulary_check`, which catches a
+    hand-composed label that happens to agree with a hand-written ledger value.
     """
     del pr_body  # Explicitly not accepted as evidence.
     items = required_items(review_contract, dry_run=dry_run, enforced=enforced, phase=phase)
@@ -297,6 +415,7 @@ def verify(
         issue_comments=issue_comments or [],
         pr_reviews=pr_reviews or [],
         head_sha=head_sha,
+        covered_heads=covered_heads,
         enforced=enforced,
         ledger_record=ledger_record,
     )
@@ -336,6 +455,7 @@ def verify(
         pr_comments=pr_comments or [],
         pr_reviews=pr_reviews or [],
         head_sha=head_sha,
+        covered_heads=covered_heads,
         enforced=enforced,
     )
     if distinct is not None:
@@ -343,10 +463,18 @@ def verify(
     substance = _verdict_substance_findings(
         [*(pr_comments or []), *(pr_reviews or [])],
         head_sha=head_sha,
+        covered_heads=covered_heads,
         enforced=enforced,
         pr_title=pr_title,
     )
     findings = [*findings, *substance]
+    findings = [
+        *findings,
+        *_malformed_marker_findings(
+            [*(pr_comments or []), *(issue_comments or []), *(pr_reviews or [])],
+            enforced=enforced,
+        ),
+    ]
     attribution = _attribution_finding(
         pr_labels=pr_labels,
         enforced=enforced and not dry_run,
@@ -354,6 +482,13 @@ def verify(
     )
     if attribution is not None:
         findings = [*findings, attribution]
+    vocabulary = _attribution_vocabulary_finding(
+        pr_labels=pr_labels,
+        enforced=enforced and not dry_run,
+        ledger_record=ledger_record,
+    )
+    if vocabulary is not None:
+        findings = [*findings, vocabulary]
     unarmed = _unarmed_finding(
         enforced=enforced,
         dry_run=dry_run,
@@ -389,10 +524,31 @@ def _require_distinct_vendors(review_contract: dict[str, Any]) -> bool:
     return bool(reviewers.get("require_distinct_vendors")) if isinstance(reviewers, dict) else False
 
 
+def review_panel(review_contract: dict[str, Any]) -> str:
+    """Who the reviewers are on this contract: ``reviewers`` or ``jury`` (#1015).
+
+    A missing or malformed ``reviewers`` block reads as the host bench, which is
+    the stricter of the two answers everywhere this is asked.
+    """
+    reviewers = review_contract.get("reviewers")
+    panel = reviewers.get("panel") if isinstance(reviewers, dict) else None
+    return panel if isinstance(panel, str) and panel else "reviewers"
+
+
+def _minimum_jury_vendors(review_contract: dict[str, Any]) -> int:
+    """``jury.minimum_vendors`` from the contract, with the schema floor as fallback."""
+    jury = review_contract.get("jury")
+    minimum = jury.get("minimum_vendors") if isinstance(jury, dict) else None
+    if isinstance(minimum, int) and not isinstance(minimum, bool) and minimum > 0:
+        return minimum
+    return DEFAULT_MINIMUM_JURY_VENDORS
+
+
 def _verdict_substance_findings(
     items: list[dict[str, Any]],
     *,
     head_sha: str | None,
+    covered_heads: Collection[str] = (),
     enforced: bool,
     pr_title: str,
 ) -> list[dict[str, Any]]:
@@ -407,7 +563,7 @@ def _verdict_substance_findings(
     findings: an advisory run should say what it saw without failing.
     """
     _, rejected = _review_evidence_keys_and_rejections(
-        items, head_sha=head_sha, enforced=enforced, pr_title=pr_title
+        items, head_sha=head_sha, covered_heads=covered_heads, enforced=enforced, pr_title=pr_title
     )
     return [
         {
@@ -420,6 +576,43 @@ def _verdict_substance_findings(
     ]
 
 
+def _malformed_marker_findings(
+    items: list[dict[str, Any]],
+    *,
+    enforced: bool,
+) -> list[dict[str, Any]]:
+    """One finding per trusted comment whose header names more than one marker.
+
+    Such a header does not say which artifact the comment is, so
+    :func:`marker_in_header` refuses to classify it and the comment counts toward
+    nothing. Excluding it silently would reproduce the failure #926 named — a
+    comment sitting right there on the PR, reported as missing evidence — so the
+    exclusion is stated instead of inferred.
+
+    ``minor``, never blocking: the comment is malformed, not fraudulent, and the
+    requirement it failed to satisfy already fails on its own.
+    """
+    findings: list[dict[str, Any]] = []
+    for item in items:
+        if not _is_trusted_source(item, enforced=enforced):
+            continue
+        markers = header_markers(_body(item))
+        if len(markers) < 2:
+            continue
+        findings.append(
+            {
+                "id": MALFORMED_MARKER_FINDING,
+                "severity": "minor",
+                "kind": "evidence",
+                "message": (
+                    "Comment header carries more than one keel marker "
+                    f"({', '.join(markers)}); it is excluded from evidence."
+                ),
+            }
+        )
+    return findings
+
+
 def _distinct_vendor_finding(
     review_contract: dict[str, Any],
     *,
@@ -428,6 +621,7 @@ def _distinct_vendor_finding(
     pr_comments: list[dict[str, Any]],
     pr_reviews: list[dict[str, Any]],
     head_sha: str | None,
+    covered_heads: Collection[str] = (),
     enforced: bool,
 ) -> dict[str, Any] | None:
     """Return a blocking finding when the optional vendor-distinctness check fails.
@@ -446,9 +640,17 @@ def _distinct_vendor_finding(
     provenance = _review_vendor_provenance(
         [*pr_comments, *pr_reviews],
         head_sha=head_sha,
+        covered_heads=covered_heads,
         enforced=enforced,
     )
-    result = distinct_vendor_check(list(provenance.values()), required_count=required)
+    if review_panel(review_contract) == JURY_PANEL:
+        result = panel_vendor_check(
+            list(provenance.values()),
+            required_count=required,
+            minimum_vendors=_minimum_jury_vendors(review_contract),
+        )
+    else:
+        result = distinct_vendor_check(list(provenance.values()), required_count=required)
     if result["ok"]:
         return None
     return {
@@ -506,12 +708,14 @@ def _evidence_counts(
     issue_comments: list[dict[str, Any]],
     pr_reviews: list[dict[str, Any]],
     head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
     enforced: bool = True,
     ledger_record: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     review_keys = _review_evidence_keys(
         [*pr_comments, *pr_reviews],
         head_sha=head_sha,
+        covered_heads=covered_heads,
         enforced=enforced,
     )
     return {
@@ -525,7 +729,9 @@ def _evidence_counts(
         ),
         "review_verdict": len(review_keys),
         "jury_verdict": sum(
-            _is_jury_verdict(comment, head_sha=head_sha, enforced=enforced)
+            _is_jury_verdict(
+                comment, head_sha=head_sha, covered_heads=covered_heads, enforced=enforced
+            )
             for comment in pr_comments
         ),
     }
@@ -549,8 +755,81 @@ def _body(item: dict[str, Any]) -> str:
     return body if isinstance(body, str) else ""
 
 
+def _header_line(body: str) -> str:
+    """``body``'s header line: its first *non-empty* line, stripped.
+
+    Leading blank lines are skipped rather than treated as the end, for the same
+    reason :func:`_fields` skips them — a GitHub comment body routinely begins
+    with a newline. Everything after that line is prose.
+    """
+    for raw_line in (body or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        return line
+    return ""
+
+
+def _unwrap_html_comment(line: str) -> str:
+    """Strip one literal ``<!-- … -->`` wrapper from ``line``, or return it unchanged.
+
+    Deliberately not a regex and deliberately not an HTML parser: the only
+    wrapper keel has to recognise is the one
+    :func:`keel.closure.render_closure_comment` writes. Anything else — an
+    unterminated ``<!--``, a ``--!>`` close, a second wrapper on the same line —
+    is left intact, so the marker check below sees the delimiters as tokens and
+    refuses to classify the comment. Failing to recognise a hand-rolled wrapper
+    costs a comment its classification; guessing at one would let a body render
+    as an invisible comment while counting as evidence.
+    """
+    if (
+        line.startswith(_HTML_COMMENT_OPEN)
+        and line.endswith(_HTML_COMMENT_CLOSE)
+        and len(line) >= len(_HTML_COMMENT_OPEN) + len(_HTML_COMMENT_CLOSE)
+    ):
+        return line[len(_HTML_COMMENT_OPEN) : -len(_HTML_COMMENT_CLOSE)].strip()
+    return line
+
+
+def header_markers(body: str) -> tuple[str, ...]:
+    """Return the distinct :data:`CLASSIFICATION_MARKERS` ``body``'s header carries.
+
+    The header line, once unwrapped, must consist of markers and nothing else —
+    that is exactly what every renderer emits, and it is what separates a marker
+    line from a sentence that happens to name one. So this is empty for an
+    ordinary comment (including one whose first line *mentions* a marker in
+    prose, and one wearing a wrapper keel does not write), one entry for a
+    well-formed artifact, and two or more for a malformed one, which
+    :func:`marker_in_header` refuses to classify and
+    :func:`_malformed_marker_findings` reports.
+    """
+    tokens = _unwrap_html_comment(_header_line(body)).split()
+    if not tokens or not _CLASSIFICATION_MARKERS_SET.issuperset(tokens):
+        return ()
+    return tuple(marker for marker in CLASSIFICATION_MARKERS if marker in tokens)
+
+
+def marker_in_header(body: str) -> str | None:
+    """Return the single keel marker ``body`` is anchored to, or ``None`` (#1026).
+
+    **The header block is the only place a marker classifies a comment.** A marker
+    further down is prose — a reviewer writing "I checked the jury-verdict marker
+    handling" is quoting a string, not filing a jury verdict. Testing
+    ``MARKER in body`` could not tell the two apart: two `keel.review-verdict.v1`
+    comments whose scope mentioned ``keel.jury-verdict.v1`` were counted as
+    ``jury_verdict: 2, review_verdict: 0``, and the review that happened was
+    invisible to the gate.
+
+    ``None`` for a comment that carries no marker *and* for one whose header
+    carries several: a header naming two artifacts does not say which one it is,
+    so it is excluded rather than counted for either.
+    """
+    markers = header_markers(body)
+    return markers[0] if len(markers) == 1 else None
+
+
 def _has_closure_marker(body: str) -> bool:
-    return closure.COMMENT_MARKER in body
+    return marker_in_header(body) == closure.CLOSURE_SCHEMA_VERSION
 
 
 #: The idempotency marker ``keel post-comment`` appends to a posted body so a re-post
@@ -680,7 +959,23 @@ def _is_trusted_source(item: dict[str, Any], *, enforced: bool = True) -> bool:
 
 
 def _is_ship_assessment(body: str) -> bool:
-    return SHIP_ASSESSMENT_HEADING in body or "keel ship \u2014" in body
+    """Whether ``body`` is a ship assessment comment, decided by its header (#1035).
+
+    Header-anchored for the same reason markers are (#1026): this is consulted as an
+    *exclusion* by :func:`_is_review_verdict_body` and :func:`_is_jury_verdict`, so a
+    whole-body substring test let a reviewer disarm their own verdict by quoting the
+    heading while describing what they reviewed ("the ``### \U0001f6a2 keel ship``
+    comment claims the gates passed, but…"). The verdict was then silently uncounted
+    and ``evidence-verify`` reported it missing from a PR it was sitting on.
+
+    The heading is a Markdown heading rather than a versioned ``keel.*.v1`` marker, so
+    it cannot join :data:`CLASSIFICATION_MARKERS`; it gets the same anchoring instead.
+    A real assessment leads with the heading (the workflow writes it first) or with the
+    CLI's own banner, so nothing that armed the gate through a genuine assessment
+    comment stops arming it.
+    """
+    header = _header_line(body)
+    return header.startswith(SHIP_ASSESSMENT_HEADING) or header.startswith(SHIP_ASSESSMENT_BANNER)
 
 
 def count_review_verdicts(
@@ -688,6 +983,7 @@ def count_review_verdicts(
     pr_reviews: list[dict[str, Any]] | None = None,
     *,
     head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
     enforced: bool = True,
     pr_title: str = "",
 ) -> int:
@@ -701,6 +997,7 @@ def count_review_verdicts(
     keys = _review_evidence_keys(
         [*(pr_comments or []), *(pr_reviews or [])],
         head_sha=head_sha,
+        covered_heads=covered_heads,
         enforced=enforced,
         pr_title=pr_title,
     )
@@ -711,11 +1008,12 @@ def _review_evidence_keys(
     items: list[dict[str, Any]],
     *,
     head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
     enforced: bool = True,
     pr_title: str = "",
 ) -> set[str]:
     keys, _ = _review_evidence_keys_and_rejections(
-        items, head_sha=head_sha, enforced=enforced, pr_title=pr_title
+        items, head_sha=head_sha, covered_heads=covered_heads, enforced=enforced, pr_title=pr_title
     )
     return keys
 
@@ -724,6 +1022,7 @@ def _review_evidence_keys_and_rejections(
     items: list[dict[str, Any]],
     *,
     head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
     enforced: bool = True,
     pr_title: str = "",
 ) -> tuple[set[str], list[tuple[str, str]]]:
@@ -742,7 +1041,7 @@ def _review_evidence_keys_and_rejections(
         body = _body(item)
         if not _is_review_verdict_body(body):
             continue
-        if not _matches_head(item, body, head_sha):
+        if not _matches_head(item, body, head_sha, covered_heads):
             continue
         key = _reviewer_key(item, body)
         ok, reason = verdict_substance(body, pr_title=pr_title)
@@ -760,6 +1059,7 @@ def _review_vendor_provenance(
     items: list[dict[str, Any]],
     *,
     head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
     enforced: bool = True,
 ) -> dict[str, str | None]:
     """Map each accepted review-verdict reviewer-key to its declared vendor.
@@ -776,7 +1076,7 @@ def _review_vendor_provenance(
         body = _body(item)
         if not _is_review_verdict_body(body):
             continue
-        if not _matches_head(item, body, head_sha):
+        if not _matches_head(item, body, head_sha, covered_heads):
             continue
         key = _reviewer_key(item, body)
         if key in provenance:
@@ -830,6 +1130,69 @@ def distinct_vendor_check(
     return {"ok": True, "reason": None, "duplicated": [], "missing_provenance": missing}
 
 
+def panel_vendor_check(
+    vendors: Sequence[str | None],
+    *,
+    required_count: int,
+    minimum_vendors: int,
+) -> dict[str, Any]:
+    """Cross-vendor check for a **jury panel**, whose size the panel sets (#1015).
+
+    :func:`distinct_vendor_check` asks for one distinct vendor per required
+    verdict, which is the right question for a bench keel staffs: keel chose the
+    seats, so keel can insist each one is a different vendor. It is the wrong
+    question for a panel, where the *panel* chose the seats and three ballots from
+    two vendors is a legitimate cross-vendor review — the same shape
+    :data:`keel.ship.MINIMUM_JURY_VENDORS` already accepts as a gating jury.
+
+    So the panel is held to the jury's own rule instead: every required ballot
+    must declare a vendor, and the ballots together must span at least
+    ``minimum_vendors`` distinct ones. A whole panel from one vendor is one
+    opinion N times and fails, which is precisely what the strict check would
+    have caught — the relaxation is only in *how many* distinct vendors are
+    demanded, never in whether provenance is required at all.
+
+    Returns the same ``{ok, reason, duplicated, missing_provenance}`` shape as
+    :func:`distinct_vendor_check`, so a caller renders one finding either way.
+    """
+    if required_count <= 0:
+        return {"ok": True, "reason": None, "duplicated": [], "missing_provenance": 0}
+    present = [vendor for vendor in vendors if vendor]
+    missing = len(vendors) - len(present)
+    distinct = sorted(set(present))
+    duplicated = sorted({vendor for vendor in present if present.count(vendor) > 1})
+    if len(present) < required_count:
+        return {
+            "ok": False,
+            "reason": "missing vendor provenance on required review verdict(s)",
+            "duplicated": duplicated,
+            "missing_provenance": missing,
+        }
+    if len(distinct) < minimum_vendors:
+        return {
+            "ok": False,
+            "reason": (
+                f"jury panel of {len(present)} ballot(s) spans "
+                f"{len(distinct)} distinct vendor(s), below the minimum of {minimum_vendors}"
+            ),
+            "duplicated": duplicated,
+            "missing_provenance": missing,
+        }
+    return {"ok": True, "reason": None, "duplicated": duplicated, "missing_provenance": missing}
+
+
+def _label_values(labels: Sequence[str] | None, prefix: str) -> list[str]:
+    """Lower-cased values of every ``<prefix><value>`` label, blanks dropped."""
+    values: list[str] = []
+    for label in labels or ():
+        if not isinstance(label, str) or not label.startswith(prefix):
+            continue
+        value = label[len(prefix) :].strip().lower()
+        if value:
+            values.append(value)
+    return values
+
+
 def agent_label_vendors(labels: Sequence[str] | None) -> list[str]:
     """Return the lower-cased vendor slugs from every ``agent:<vendor>`` label.
 
@@ -837,14 +1200,32 @@ def agent_label_vendors(labels: Sequence[str] | None) -> list[str]:
     duplicates are kept so callers can reason about the raw label set; this is a
     pure helper with no I/O.
     """
-    vendors: list[str] = []
-    for label in labels or ():
-        if not isinstance(label, str) or not label.startswith(AGENT_LABEL_PREFIX):
-            continue
-        vendor = label[len(AGENT_LABEL_PREFIX) :].strip().lower()
-        if vendor:
-            vendors.append(vendor)
-    return vendors
+    return _label_values(labels, AGENT_LABEL_PREFIX)
+
+
+def model_label_bases(labels: Sequence[str] | None) -> list[str]:
+    """Return the lower-cased base slugs from every ``model:<base>`` label.
+
+    The mirror of :func:`agent_label_vendors` for the second half of keel's
+    attribution vocabulary. Same conventions: blanks dropped, order and duplicates
+    preserved, no I/O.
+    """
+    return _label_values(labels, MODEL_LABEL_PREFIX)
+
+
+def ledger_implementer(ledger_record: dict[str, Any] | None) -> str | None:
+    """Return the raw ``actors.implementer`` string from a ship_run record, or ``None``.
+
+    The full ``vendor`` / ``vendor:model`` value, not just the vendor half — the
+    vocabulary check needs the model too. Blank/absent reads as ``None``. Pure.
+    """
+    if not isinstance(ledger_record, dict):
+        return None
+    actors = ledger_record.get("actors")
+    implementer = actors.get("implementer") if isinstance(actors, dict) else None
+    if not isinstance(implementer, str) or not implementer.strip():
+        return None
+    return implementer.strip()
 
 
 def ledger_implementer_vendor(ledger_record: dict[str, Any] | None) -> str | None:
@@ -855,13 +1236,10 @@ def ledger_implementer_vendor(ledger_record: dict[str, Any] | None) -> str | Non
     ``:``. Returns ``None`` when no record, no implementer, or a blank implementer
     is recorded so the cross-check can degrade to presence-only. Pure — no I/O.
     """
-    if not isinstance(ledger_record, dict):
+    implementer = ledger_implementer(ledger_record)
+    if implementer is None:
         return None
-    actors = ledger_record.get("actors")
-    implementer = actors.get("implementer") if isinstance(actors, dict) else None
-    if not isinstance(implementer, str) or not implementer.strip():
-        return None
-    vendor, _ = agents.split_delegate(implementer.strip())
+    vendor, _ = agents.split_delegate(implementer)
     vendor = vendor.strip().lower()
     return vendor or None
 
@@ -909,6 +1287,111 @@ def attribution_check(
     }
 
 
+def attribution_vocabulary_check(
+    labels: Sequence[str] | None,
+    *,
+    implementer: str | None,
+) -> dict[str, Any]:
+    """Check a PR's attribution labels against keel's own vocabulary (#1013).
+
+    :func:`attribution_check` compares the label's *vendor* with the ledger's
+    *vendor*. That is a comparison of two hand-written strings: when the host wrote
+    ``agent:gemini`` on the PR **and** ``gemini:gemini-3.8-flash-high`` into the
+    ledger, the two agreed and the gate passed — while keel's own vocabulary for that
+    run is ``agent:agy`` / ``model:gemini-3``. This check closes that hole by deriving
+    the expected labels from :func:`keel.agents.attribution` instead of comparing the
+    prose to itself.
+
+    Only labels the PR actually carries are judged: a missing ``agent:`` label is
+    :func:`attribution_check`'s ``missing-label`` finding and is not repeated here,
+    and a ledger implementer with no model (``claude``) yields no expected
+    ``model:`` label, so ``model:`` labels are left alone in that case.
+
+    Returns ``{ok, checked, reason, expected, actual, implementer}``. ``checked`` is
+    ``False`` when there was nothing to compare against — no ledger record, no
+    recorded implementer — so a caller can tell "agrees" from "could not tell".
+    Pure — no I/O.
+    """
+    expected = agents.attribution_from_implementer(implementer)
+    actual = {
+        "agent_labels": agent_label_vendors(labels),
+        "model_labels": model_label_bases(labels),
+    }
+    if expected is None:
+        return {
+            "ok": True,
+            "checked": False,
+            "reason": "no-implementer",
+            "expected": None,
+            "actual": actual,
+            "implementer": None,
+        }
+    recorded = implementer.strip() if isinstance(implementer, str) else None
+    result = {
+        "ok": True,
+        "checked": True,
+        "reason": None,
+        "expected": dict(expected),
+        "actual": actual,
+        "implementer": recorded,
+    }
+    expected_agent = expected["agent_label"][len(AGENT_LABEL_PREFIX) :]
+    expected_model = expected["model_label"]
+    if actual["agent_labels"] and expected_agent not in actual["agent_labels"]:
+        result["ok"] = False
+        result["reason"] = "agent-label"
+        return result
+    if expected_model is not None:
+        base = expected_model[len(MODEL_LABEL_PREFIX) :]
+        if actual["model_labels"] and base not in actual["model_labels"]:
+            result["ok"] = False
+            result["reason"] = "model-label"
+    return result
+
+
+def _attribution_vocabulary_finding(
+    *,
+    pr_labels: Sequence[str] | None,
+    enforced: bool,
+    ledger_record: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the blocking ``attribution-vocabulary`` finding, or ``None``.
+
+    Skips — never fails — when the gate is inactive, when labels were not fetched, or
+    when no ledger record named an implementer: the check needs a recorded implementer
+    to derive the expected labels from, and refusing a PR because keel could not read
+    its own ledger would be a fail-closed rule with nothing behind it.
+    """
+    if not enforced or pr_labels is None:
+        return None
+    result = attribution_vocabulary_check(
+        pr_labels,
+        implementer=ledger_implementer(ledger_record),
+    )
+    if result["ok"]:
+        return None
+    expected = result["expected"]
+    labels = ", ".join(
+        label for label in (expected["agent_label"], expected["model_label"]) if label
+    )
+    observed = ", ".join(
+        [
+            *(f"{AGENT_LABEL_PREFIX}{value}" for value in result["actual"]["agent_labels"]),
+            *(f"{MODEL_LABEL_PREFIX}{value}" for value in result["actual"]["model_labels"]),
+        ]
+    )
+    return {
+        "id": "attribution-vocabulary",
+        "severity": "major",
+        "kind": "attribution",
+        "message": (
+            f"PR attribution labels ({observed}) are not keel's vocabulary for ledger "
+            f"implementer {result['implementer']!r}. Expected: {labels}. "
+            "Obtain labels from `keel attribution` instead of composing them by hand."
+        ),
+    }
+
+
 def _unarmed_finding(
     *,
     enforced: bool,
@@ -933,8 +1416,9 @@ def _unarmed_finding(
         "kind": "arming",
         "message": (
             "Evidence gate is not armed, so no requirements were checked. Arm it via ship "
-            "provenance (ship branch, posted review verdict, ship-run ledger, or the gate "
-            "label), or disarm deliberately with the operator waiver label."
+            "provenance (the keel.ship-provenance.v1 comment a live run posts on its PR, a "
+            "ship branch, a posted review verdict, the ship-run ledger, or the gate label), "
+            "or disarm deliberately with the operator waiver label."
         ),
     }
 
@@ -976,21 +1460,165 @@ def _attribution_finding(
     }
 
 
-#: A concrete thing a review can point at: a path, a ``path:line``, a backticked
-#: symbol, or a dotted/called identifier. Presence of *structure*, never a
-#: judgement about whether the review was good — the same line ai-jury's
-#: ``emitted_findings_block()`` draws.
-_VERDICT_ANCHORS = (
-    re.compile(r"[\w./-]+\.[A-Za-z0-9]{1,5}:\d+"),  # path/to/file.py:42
-    re.compile(r"[\w-]+/[\w./-]+\.[A-Za-z0-9]{1,5}\b"),  # src/keel/thing.py
-    re.compile(r"`[^`\n]{2,}`"),  # `a_symbol`, `--a-flag`
-    re.compile(r"\b\w+\.\w+\(\)"),  # module.function()
+#: A file named without its directory — ``evidence.py``, ``CHANGELOG.md``.
+#:
+#: The path anchors read *any* one-to-five-character extension, because a
+#: directory has already proved the token is a path. With no directory nothing
+#: is left to carry that proof: ``Node.js``, ``Next.js``, ``Vue.js`` and
+#: ``D3.js`` are spelled exactly like ``evidence.py``, and in prose a product
+#: is named far more often than a bare file is. Listing the extension cannot
+#: separate them — ``.js`` is a real source extension, and dropping it would
+#: refuse real reviews to refuse four product names — so this form does not
+#: anchor a verdict by itself. It *corroborates*:
+#: see :data:`_VERDICT_CORROBORATORS`.
+_VERDICT_SOURCE_FILE = re.compile(
+    r"\b[\w-]+\.(?:py|pyi|md|rst|txt|ya?ml|toml|json|cfg|ini|lock"
+    r"|sh|js|mjs|cjs|ts|tsx|jsx|rb|go|rs|css|html?|svg|sql)\b"
 )
+
+#: ``module.symbol`` / ``Class.method`` — the dotted identifier a review writes
+#: for something it is not calling (#1106), read only when the token carries a
+#: mark prose does not use: an underscore, an internal capital, a run of
+#: capitals, or a capitalised segment.
+#:
+#: **A dot is not evidence, and neither is a capital.** Requiring the mark
+#: stops ``github.com`` and ``pypi.org``. It does not stop ``GitHub.com``,
+#: ``GitLab.com``, ``OpenAI.com`` or ``SourceForge.net``, because a capitalised
+#: first segment is precisely the mark ``Config.parse`` carries — the two are
+#: one shape, and no sixth character class tells them apart. That is why this
+#: form corroborates rather than anchors (:data:`_VERDICT_CORROBORATORS`): the
+#: alternative was a list of hostnames to refuse, which cannot be finished,
+#: because anyone can register the next one.
+#:
+#: Both sides of the dot still need two characters, so "e.g." and "i.e." are not
+#: identifiers whatever else they carry.
+_VERDICT_DOTTED_SYMBOL = re.compile(
+    r"\b(?=[\w.]*(?:_|[a-z0-9][A-Z]|[A-Z]{2}|[A-Z][a-z]))"
+    r"[A-Za-z_]\w+(?:\.[A-Za-z_]\w+)+"
+)
+
+#: A **bare** identifier: ``cache_key``, ``_prompt_mode``, ``__post_init__``.
+#:
+#: **The joining underscore is the whole rule** — two lowercase alphanumeric
+#: segments with an underscore between them. Lowercase deliberately: `My_Thing`
+#: is prose with a connector, and CamelCase is read only when dotted or
+#: backticked, for the reason :data:`_VERDICT_DOTTED_SYMBOL` gives.
+#:
+#: Underscores that merely wrap a name are
+#: decoration, so a lone ``_private`` or ``__dunder__`` is *not* read; it is
+#: ``post_init`` inside ``__post_init__`` that matches.
+#:
+#: The joining underscore is a mark English prose and product names do not use,
+#: and it is the only lexical difference between a symbol and a capitalised
+#: noun: ``GitHub`` and ``GitLab`` are CamelCase in exactly the way
+#: ``JuryConfig`` is, so reading CamelCase let "The GitHub and GitLab side of
+#: this is unchanged" clear a floor of two while naming nothing in the change.
+#: No pattern separates those two, and a list of product names to refuse would
+#: need a new entry every time a reviewer mentions a new product. CamelCase
+#: symbols are still read everywhere they are written with a dot or in
+#: backticks, which is how a class is normally named.
+_VERDICT_BARE_IDENTIFIER = re.compile(r"\b_*[a-z0-9]+(?:_[a-z0-9]+)+_*\b")
+
+#: A concrete thing a review can point at, on its own — a ``path:line``, a
+#: path, a backticked symbol, or a called identifier. Presence of *structure*,
+#: never a judgement about whether the review was good — the same line
+#: ai-jury's ``emitted_findings_block()`` draws.
+#:
+#: What these four have and :data:`_VERDICT_CORROBORATORS` do not is that the
+#: **punctuation is the author pointing**. Backticks, a directory separator, a
+#: ``:42`` and a ``()`` are marks a reviewer types deliberately at a thing;
+#: none of them appear around a product name in ordinary prose. A bare dotted
+#: token is just a token with a dot in it.
+_VERDICT_ANCHORS = re.compile(
+    r"[\w./-]+\.[A-Za-z0-9]{1,5}:\d+|"  # path/to/file.py:42
+    r"[\w-]+/[\w./-]+\.[A-Za-z0-9]{1,5}\b|"  # src/keel/thing.py
+    r"`[^`\n]{2,}`|"  # `a_symbol`, `--a-flag`
+    r"\b\w+\.\w+\(\)"  # module.function()
+)
+
+#: The unbackticked forms — a bare filename, a bare dotted token, a bare
+#: identifier — each of which is *also* how something that is not a symbol gets
+#: written. Two of them anchor a verdict; one does not (#1106).
+#:
+#: **This is a shape, not a lexicon, and that is the point.** Three rounds of
+#: widening the anchor set were each undone by a token that is not a symbol:
+#: ``claude.ai`` in a tool footer, ``GitHub``/``GitLab`` as bare CamelCase,
+#: then ``Node.js`` and ``GitHub.com``. Every one was answered by refining a
+#: character class, and every refinement admitted the next such token, because
+#: ``Node.js`` and ``evidence.py`` are the same shape and so are ``GitHub.com``
+#: and ``Config.parse``. No character class ends that sequence and no blocklist
+#: of products or hostnames can be finished. What separates a review from a
+#: mention is not the spelling of one token but how many the verdict has: prose
+#: mentions a product in passing; a review that walked the change names more
+#: than one thing. A clause that says an act of review happened
+#: (:data:`_VERDICT_CHECKED_CLAUSE`) is the one exception, and only for
+#: "checked": see there for why the other verbs could not be given the same
+#: latitude, and why judging their object by this same test made the branch
+#: inert.
+#:
+#: Measured over every verdict posted across keel and ai-jury: corroboration
+#: refuses all four ``*.js`` product names and all four capitalised hostnames,
+#: costs 30 of the 141 verdicts #1106 recovered — 22 of those 30 being the
+#: default template's "Scope reviewed:" line with a single token dropped into
+#: it — and regresses nothing that passed before #1106. Dropping the two bare
+#: forms outright instead, the fallback, refuses the same eight strings but
+#: keeps only 98 of the 141 and loses a review naming ``evidence.py`` and
+#: ``contracts.py``, which is a review.
+_VERDICT_CORROBORATORS = (
+    _VERDICT_SOURCE_FILE,  # evidence.py, CHANGELOG.md
+    _VERDICT_DOTTED_SYMBOL,  # cache.cache_key, JuryConfig.__post_init__
+    _VERDICT_BARE_IDENTIFIER,  # collect_static_hints, _prompt_mode
+)
+
+#: How many distinct corroborating tokens stand in for an anchor. At one, the
+#: corpus says the rule readmits 22 of the 75 ``Reviewed <title>: <affirmation>``
+#: rubber stamps #926 is named for; at two it admits none of them.
+_VERDICT_CORROBORATION_FLOOR = 2
+
+#: What may sit between an act-of-review verb and its object: an optional colon,
+#: and an optional break onto a bullet, because "Checked:\n- …" is the same
+#: clause with a list under it and refusing it was punctuation pedantry (#1106).
+#: Layout only — it says nothing about what the object has to be.
+_VERDICT_CLAUSE_TAIL = r"[ \t]*:?[ \t]*(?:\r?\n[ \t]*[-*][ \t]*)?"
+
+#: One sentence's worth of characters. A sentence ends at `.!?;` or an ellipsis
+#: **followed by space or line end** — a period inside `evidence.py` is not a
+#: sentence end, and the filename has to survive inside an object, so "Checked
+#: evidence.py and contracts.py" is no longer truncated at the first dot —
+#: the punctuation pedantry this change is about. Only
+#: :data:`_VERDICT_CHECKED_CLAUSE` reads this; the second clause that did was
+#: removed with the verb widening.
+_VERDICT_SENTENCE = r"(?:[^.!?;\u2026\n]|[.!?;\u2026](?!\s|$))"
 
 #: The escape hatch the issue insists on: a genuinely clean review must stay
 #: expressible. "Checked X, Y and Z; found nothing" is a real review outcome and
-#: must not be forced to invent an anchor.
-_VERDICT_CHECKED_CLAUSE = re.compile(r"\bchecked\b[^.\n]{8,}", re.IGNORECASE)
+#: must not be forced to invent an anchor. Its object stays free-form, as it has
+#: been since #926: 35 verdicts in the corpus pass on this clause and nothing
+#: else, saying things like "Checked the formula syntax, the version URL and the
+#: checksum placeholder" — English objects, naming no symbol.
+#:
+#: The object now ends at a *sentence* rather than at any period, which is a
+#: change from `[^.\n]{8,}`: it buys a filename, since `evidence.py` no longer
+#: truncates to `evidence`, and it costs a trailing `;`, `!` or `?` clause —
+#: "Checked config; found nothing of concern in the rest" passes on `main` and
+#: is refused here. No verdict in the 1,421 measured is written that way, which
+#: is why the corpus shows no regression; that is a weaker claim than "takes
+#: nothing away" and is the one the evidence supports.
+#:
+#: **#1106 tried to widen this to traced/read/ran/inspected/verified and the
+#: widening turned out inert.** Those verbs could not keep a free-form object —
+#: "Read the whole diff and everything looks correct" is the #926 receipt with a
+#: synonym at the front — so their object was made to name something. But
+#: "names something" is the same test the whole prose already takes, and the
+#: object is part of the prose, so a verdict that satisfied the clause had
+#: always satisfied the anchor check first: across 1,421 verdicts the branch
+#: decided **zero** of them. Dead code with a docstring explaining what it did
+#: is worse than neither, so it is gone. Widening the vocabulary needs the
+#: object to be judged by something other than the prose test, which #1106 did
+#: not find.
+_VERDICT_CHECKED_CLAUSE = re.compile(
+    rf"\bchecked\b{_VERDICT_CLAUSE_TAIL}{_VERDICT_SENTENCE}{{8,}}", re.IGNORECASE
+)
 
 #: Below this share of novel words, the prose is the PR title said again. The
 #: observed shape was `Reviewed <title>: <generic affirmation>` — 75 of 75
@@ -1001,7 +1629,21 @@ _WORD = re.compile(r"[a-z0-9]+")
 
 
 def _verdict_prose(body: str) -> str:
-    """The verdict's own words: header block, markers and HTML comments removed."""
+    """The verdict's own words: header block, marker line and HTML comments removed.
+
+    The marker is matched as a *whole line*, never as a substring. It is rendered
+    on its own bare line, so the header slice above has already dropped it; a
+    substring test therefore only ever reached prose that *quotes* the marker,
+    and deleted it. That cost the review of #1119 its entire scope — a
+    1,700-character line naming four files was dropped because it named the
+    marker it was documenting, and the verdict was then refused for naming
+    nothing (#1120).
+
+    This is the rule :func:`marker_in_header` already states earlier in this
+    module: a marker below the header is prose, and ``MARKER in body`` cannot
+    tell the two apart (#1026). This function was the one place that substring
+    test survived.
+    """
     lines = body.splitlines()
     start = 0
     for index, raw in enumerate(lines):
@@ -1013,9 +1655,41 @@ def _verdict_prose(body: str) -> str:
         for line in lines[start:]
         if line.strip()
         and not line.strip().startswith("<!--")
-        and REVIEW_VERDICT_MARKER not in line
+        and line.strip() != REVIEW_VERDICT_MARKER
     ]
     return "\n".join(kept)
+
+
+def _verdict_corroborators(text: str) -> set[str]:
+    """The distinct unbackticked tokens in ``text``, counting each one once.
+
+    A written token is one piece of evidence however many patterns read it:
+    ``cache.cache_key`` is matched by :data:`_VERDICT_DOTTED_SYMBOL` whole and by
+    :data:`_VERDICT_BARE_IDENTIFIER` as its second half, and counting it twice
+    would let one token clear a floor that exists to require two. Matches
+    contained inside a longer match are therefore dropped, and what survives is
+    deduplicated by text, so a reviewer who names ``evidence.py`` three times has
+    still named one file.
+    """
+    spans = sorted(
+        (
+            (match.start(), match.end(), match.group(0))
+            for pattern in _VERDICT_CORROBORATORS
+            for match in pattern.finditer(text)
+        ),
+        key=lambda span: (span[0], -span[1]),
+    )
+    kept: list[tuple[int, int, str]] = []
+    for span in spans:
+        if any(span[0] >= start and span[1] <= end for start, end, _ in kept):
+            continue
+        kept.append(span)
+    return {token for _, _, token in kept}
+
+
+def _review_act_clause(prose: str) -> bool:
+    """Whether ``prose`` says an act of review was performed on something."""
+    return bool(_VERDICT_CHECKED_CLAUSE.search(prose))
 
 
 def verdict_substance(body: str, *, pr_title: str = "") -> tuple[bool, str]:
@@ -1030,13 +1704,22 @@ def verdict_substance(body: str, *, pr_title: str = "") -> tuple[bool, str]:
 
     Two mechanical requirements, both content-agnostic beyond structure:
 
-    * **An anchor.** A path, a ``path:line``, a backticked symbol, or a called
-      identifier — or an explicit "checked …" clause, because a genuinely clean
-      review must stay expressible and forcing it to invent a file reference
-      would make the check worse than nothing.
+    * **An anchor.** A ``path:line``, a path, a backticked symbol or a called
+      identifier, whose punctuation is the author pointing — or, lacking one,
+      two distinct unbackticked tokens, because ``Node.js`` and ``evidence.py``
+      are one shape and only the count separates a mention from a review — or
+      an act-of-review clause naming what was looked at, because a genuinely
+      clean review must stay expressible and forcing it to invent a file
+      reference would make the check worse than nothing.
     * **Novelty against the title.** Prose that is substantially the PR title
       restated is the observed shape, and it survives the anchor test whenever
       the title happens to contain a path.
+
+    The two are independent on purpose, and that is what lets the anchor set be
+    generous (#1106). An anchor asks whether the reviewer pointed at anything;
+    the novelty floor asks whether the prose is the title said again. A verdict
+    that names a symbol *and* is otherwise the title restated fails the second
+    check, so widening the first cannot readmit the #926 shape by itself.
 
     This says nothing about whether a review was *good*. It cannot, and trying
     would make the gate a critic. It distinguishes a review from a receipt.
@@ -1045,11 +1728,15 @@ def verdict_substance(body: str, *, pr_title: str = "") -> tuple[bool, str]:
     if not prose.strip():
         return False, "verdict has no prose beyond its header"
 
-    anchored = any(pattern.search(prose) for pattern in _VERDICT_ANCHORS)
-    if not anchored and not _VERDICT_CHECKED_CLAUSE.search(prose):
+    # ⚡ Bolt Optimization: Use combined compiled regex instead of generator overhead
+    anchored = bool(_VERDICT_ANCHORS.search(prose)) or (
+        len(_verdict_corroborators(prose)) >= _VERDICT_CORROBORATION_FLOOR
+    )
+    if not anchored and not _review_act_clause(prose):
         return False, (
-            "verdict names nothing concrete — no file, line, symbol, or "
-            "'checked …' clause, so it cannot be told apart from a receipt"
+            "verdict names nothing concrete — no file, line, symbol, no two "
+            "of a filename/dotted name/identifier, and no 'checked …' clause, "
+            "so it cannot be told apart from a receipt"
         )
 
     title_words = set(_WORD.findall(pr_title.lower()))
@@ -1073,15 +1760,53 @@ def _reviewer_key(item: dict[str, Any], body: str) -> str:
     return f"body:{digest}"
 
 
-def _matches_head(item: dict[str, Any], body: str, head_sha: str | None) -> bool:
+def _matches_head(
+    item: dict[str, Any],
+    body: str,
+    head_sha: str | None,
+    covered_heads: Collection[str] = (),
+) -> bool:
+    """Does this comment answer for ``head_sha``? A blank head means *do not filter*.
+
+    **Deliberately not :func:`keel.juryavail.is_pinnable_head`'s rule, and the difference
+    is worth stating** (#1068). This one filters *evidence items* inside a gate that, with
+    no head resolved, is head-agnostic from end to end — every review verdict counts, so
+    holding jury verdicts alone to a head nobody knows would refuse a gate the rest of
+    which is already unfiltered. Nothing reached through here removes a requirement:
+    :func:`_review_evidence_keys` and :func:`_review_vendor_provenance` count verdicts
+    towards one, and :func:`jury_panel_size` feeds ``max(declared, minimum_vendors)``, so a
+    stale ``panelists:`` can only ever raise the bar.
+
+    :func:`jury_participating_vendors` was the exception, and #1069 closed it rather than
+    changing this predicate: its count *can* downgrade a gating jury to advisory (#1015), so
+    it now asks :func:`keel.juryavail.is_pinnable_head` for itself before it reads anything.
+    Its head rule is its own, for the reason a pin's is — it removes a requirement — and the
+    two readers that do not remove one keep this reading. That is the whole distinction
+    between the three panel-shaped readers layered here, and it is a property of what each
+    one's answer can *do*, not of where it is read from.
+
+    A *pin* is the case that cannot use this reading, because it does remove requirements —
+    it takes ``review-verdict-1..3`` off the required set entirely. So the pin
+    (:func:`keel.juryavail.pin`, read by :func:`keel.cli._shipped_jury_availability`)
+    refuses a blank head before :func:`panel_verdict_posted` is asked at all, rather than
+    this predicate changing under the surfaces that need the permissive one.
+    """
     if not head_sha:
         return True
+    # **A head the current one descends from by capture commits alone** answers for it
+    # too (#1203). The learning is the pull request's last commit, written after review
+    # and before the merge, so every verdict would otherwise be pinned to a head the
+    # branch has already moved past. `covered_heads` is never filled from a comment or an
+    # argument an agent supplies: its only producer is `capture.capture_only_descent`,
+    # which holds each commit in between to one parent, the landing marker, and exactly
+    # one path inside the configured sink — so what it admits is a lesson, never code.
+    accepted = {head_sha, *covered_heads}
     fields = _fields(body)
     recorded = fields.get("head")
     if recorded:
-        return recorded == head_sha
+        return recorded in accepted
     commit_id = item.get("commit_id")
-    return isinstance(commit_id, str) and commit_id == head_sha
+    return isinstance(commit_id, str) and commit_id in accepted
 
 
 def _fields(body: str) -> dict[str, str]:
@@ -1116,11 +1841,12 @@ def _fields(body: str) -> dict[str, str]:
                 break
             continue
         started = True
+        # A marker-only line is the artifact's own header, not a field: skip it and
+        # keep reading. A line that merely *mentions* a marker is prose, and prose
+        # ends the block — the #932 boundary this parser exists to hold.
         if (
-            (line.startswith("<!--") and line.endswith("-->"))
-            or REVIEW_VERDICT_MARKER in line
-            or JURY_VERDICT_MARKER in line
-        ):
+            line.startswith("<!--") and line.endswith("-->")
+        ) or _CLASSIFICATION_MARKERS_SET.issuperset(line.split()):
             continue
         match = _FIELD_RE.match(line)
         if match:
@@ -1133,16 +1859,22 @@ def _fields(body: str) -> dict[str, str]:
 
 
 def _is_review_verdict_body(body: str) -> bool:
-    if not body or _is_ship_assessment(body) or _has_closure_marker(body):
+    """Whether ``body`` is a review verdict, decided by its header alone (#1026).
+
+    The jury and closure exclusions are no longer separate substring tests:
+    :func:`marker_in_header` yields at most one marker, so a body anchored to the
+    jury or closure marker simply is not a review verdict, and a review verdict
+    that *mentions* either one in its prose still is.
+    """
+    if _is_ship_assessment(body):
         return False
-    if JURY_VERDICT_MARKER in body:
-        return False
-    return REVIEW_VERDICT_MARKER in body
+    return marker_in_header(body) == REVIEW_VERDICT_MARKER
 
 
 def _has_trusted_review_marker(items: list[dict[str, Any]]) -> bool:
     return any(
-        _is_trusted_source(item, enforced=True) and REVIEW_VERDICT_MARKER in _body(item)
+        _is_trusted_source(item, enforced=True)
+        and marker_in_header(_body(item)) == REVIEW_VERDICT_MARKER
         for item in items
     )
 
@@ -1152,6 +1884,7 @@ def jury_participating_vendors(
     pr_reviews: list[dict[str, Any]] | None = None,
     *,
     head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
     enforced: bool = True,
 ) -> int | None:
     """Return the panel size declared by a posted jury verdict, or ``None``.
@@ -1168,14 +1901,204 @@ def jury_participating_vendors(
 
     When several verdicts qualify, the largest declared count wins: a re-post
     correcting an earlier partial run should not be capped by the stale one.
+
+    **This one reader is held to an exact head, and its two siblings are not** (#1069).
+    Alone among the three panel-shaped readers here, this count can *remove* a
+    requirement: below ``jury.min_vendors`` it downgrades a gating jury to advisory
+    (:func:`keel.ship.resolve_jury`), which drops ``jury-verdict`` from the required
+    evidence entirely. So it asks :func:`keel.juryavail.is_pinnable_head` — the same
+    blank-head predicate the panel pins ask — before it reads a comment at all, and a
+    run that resolved no head declares nothing rather than inheriting the last verdict
+    on the pull request. Without the guard, `keel evidence-verify` run offline with no
+    ``--head-sha`` (its documented default) read a ``vendors: 1`` verdict posted against
+    an earlier head as this head's and relaxed the gate: a requirement removed by
+    evidence nobody re-checked. A *mismatched* head was already refused, by
+    :func:`_matches_head` — that predicate is exact once a head is known, and permissive
+    only when none is — so the guard closes the blank-head half and nothing else.
+
+    :func:`jury_panel_size` and :func:`panel_verdict_posted` deliberately keep the
+    permissive reading, because neither can relax anything: the first feeds
+    ``max(declared, minimum_vendors)`` and can only raise the bar, and the second is
+    already refused on a blank head by its caller, which owns the pin order.
+    """
+    if not juryavail.is_pinnable_head(head_sha):
+        return None
+    counts = [
+        parsed
+        for item in [*(pr_comments or []), *(pr_reviews or [])]
+        if _is_jury_verdict(item, head_sha=head_sha, covered_heads=covered_heads, enforced=enforced)
+        if (parsed := _parse_vendor_count(_fields(_body(item)).get("vendors"))) is not None
+    ]
+    return max(counts) if counts else None
+
+
+def jury_panel_size(
+    pr_comments: list[dict[str, Any]] | None = None,
+    pr_reviews: list[dict[str, Any]] | None = None,
+    *,
+    head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
+    enforced: bool = True,
+) -> int | None:
+    """Return the panel size declared by a posted jury verdict, or ``None`` (#1015).
+
+    Reads the ``panelists: <N>`` field off the same comment
+    :func:`jury_participating_vendors` reads ``vendors:`` from, and for the same
+    reason: when the jury **is** the review panel, the number of ballots is the
+    reviewer count the evidence gate must require, and a hosted runner can read
+    it from nowhere else.
+
+    ``None`` means "not declared", which leaves the gate on the contract's floor
+    rather than requiring nothing. The largest declared count wins, so a re-post
+    that completes a partial panel raises the requirement instead of being capped
+    by the stale verdict — the direction that fails closed.
+
+    **It does not share that sibling's head rule, and the asymmetry is deliberate**
+    (#1069). This count reaches :func:`keel.ship._jury_panel_size`, which answers
+    ``max(declared, minimum_vendors)`` — so a stale or blank-head ``panelists:`` can
+    only ever *raise* what the tier owes, never remove a requirement. Holding it to an
+    exact head would refuse a bar-raising reading inside a gate whose other half, with
+    no head resolved, is already unfiltered (:func:`_matches_head`). ``vendors:`` is the
+    one that can relax, so ``vendors:`` is the one that is pinned.
     """
     counts = [
         parsed
         for item in [*(pr_comments or []), *(pr_reviews or [])]
-        if _is_jury_verdict(item, head_sha=head_sha, enforced=enforced)
-        if (parsed := _parse_vendor_count(_fields(_body(item)).get("vendors"))) is not None
+        if _is_jury_verdict(item, head_sha=head_sha, covered_heads=covered_heads, enforced=enforced)
+        if (parsed := _parse_vendor_count(_fields(_body(item)).get("panelists"))) is not None
     ]
     return max(counts) if counts else None
+
+
+def panel_verdict_posted(
+    pr_comments: list[dict[str, Any]] | None = None,
+    pr_reviews: list[dict[str, Any]] | None = None,
+    *,
+    head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
+    enforced: bool = True,
+) -> bool:
+    """Is a head-pinned jury verdict already on this pull request? (#1066)
+
+    Proof that the panel *sat*, from the one place a bare CI runner can read it: the run
+    ledger and the jury artifact both live under the gitignored ``.keel/state/``, while PR
+    comments are always visible. A verification surface uses it to pin the contract to what
+    the ship measured rather than re-measuring the panel on its own machine. It is the
+    *weaker* of the two pins and speaks only when the run left no ledger record for this
+    head; :func:`keel.juryavail.pin` owns that order and is the one place it is written.
+
+    Distinct from :func:`jury_panel_size`, which answers *how many* ballots and is ``None``
+    for a verdict predating the ``panelists:`` field. Presence is the weaker question, and
+    the one that must not depend on an optional field.
+
+    **Call this only with a head you actually resolved.** Like every reader here it goes
+    through :func:`_matches_head`, which reads a blank ``head_sha`` as "do not filter" —
+    right for counting evidence, wrong for a pin, which is why the caller refuses a blank
+    head first (:func:`keel.juryavail.is_pinnable_head`).
+
+    :func:`jury_participating_vendors` asks that same predicate *itself* rather than
+    leaving it to a caller (#1069), and the difference is about who the callers are: this
+    one is read from exactly one place, :func:`keel.juryavail.pin`, which owns the pin
+    order and so is the right place for the rule; the vendor count is read straight off
+    ``keel evidence-verify``'s argv-derived head, where there is no single owner to put it
+    in front of.
+    """
+    return any(
+        _is_jury_verdict(item, head_sha=head_sha, covered_heads=covered_heads, enforced=enforced)
+        for item in [*(pr_comments or []), *(pr_reviews or [])]
+    )
+
+
+def shipped_panel_decision(
+    pr_comments: list[dict[str, Any]] | None = None,
+    *,
+    head_sha: str | None = None,
+    enforced: bool = True,
+) -> str | None:
+    """The panel decision **this run** recorded, read back off its closure comment (#1068).
+
+    The middle pin, and the one that makes the strongest pin work anywhere. The run's own
+    ``ship_run`` ledger record outranks a posted jury verdict — a comment records what
+    somebody put on the pull request, the ledger records what the run *did* — but the
+    ledger lives under the gitignored ``.keel/state/``, so on a hosted ``evidence-verify``
+    or ``merge`` there is no record to read and that precedence held on the shipping
+    workstation and nowhere else. A leftover or collaborator-posted ``keel.jury-verdict.v1``
+    then answered for a run that had fallen back, and took ``review-verdict-1..3`` off the
+    required set.
+
+    The run's decision is already on the pull request: s11 posts the closure comment keel
+    renders from that same ledger record, and since #1068 round 6 it carries
+    :data:`keel.closure.JURY_PANEL_MARKER` beside the human ``Jury panel:`` line. So this
+    reads the run's own statement from the one place that travels with the pull request.
+
+    Three conditions, and each is the same rule its siblings hold to:
+
+    * **Trusted author only** (:func:`_is_trusted_source`). keel posts the closure comment
+      on the operator's behalf, which is exactly the authority a posted jury verdict has —
+      no more. An untrusted author must not be able to relax the contract *in either
+      direction*: neither to claim a fallback that drops the panel item, nor to claim the
+      panel sat.
+    * **An actual closure comment** (:func:`_has_closure_marker`), so the marker counts only
+      inside the artifact that renders it — a reviewer quoting the marker while describing
+      this change is prose, the #1026 rule every marker here is read under.
+    * **Pinned to this head.** The marker names the head its record was written for and it
+      must be the head under verification, because a pull request outlives its heads and a
+      pin removes requirements.
+
+    **The latest such comment is the answer, not the first** (#1068 round 7). One head can
+    be shipped more than once — a re-run, a force-push back onto the same commit, a second
+    ship on a different machine — and each ship posts its own closure comment. ``pr_comments``
+    arrives in GitHub's order, oldest first, so this walks the whole list and keeps the last
+    match: the newest statement wins, which is the same direction
+    :func:`keel.ledger.latest_ship_run_for_pr` selects the ledger record in, and
+    :func:`keel.juryavail.pin` ranks the two sources on the premise that they agree about it.
+    Returning the first match meant an older ``decision=fallback`` outranked the panel-sat
+    ship that followed it — and round 6 emitted no marker at all for a panel that sat, so the
+    later run had nothing to outrank the older one *with*. :func:`keel.closure._jury_panel`
+    now renders ``decision=available`` too, which is what makes last-wins well defined here.
+
+    ``None`` for everything else — no comment, an older head, a marker keel did not write —
+    and ``None`` means *this source is silent*, never a waiver: :func:`keel.juryavail.pin`
+    then goes on to the posted verdict exactly as it did before.
+    """
+    if not head_sha:
+        return None
+    latest: str | None = None
+    for item in pr_comments or []:
+        if not _is_trusted_source(item, enforced=enforced):
+            continue
+        body = _body(item)
+        if not _has_closure_marker(body):
+            continue
+        decision = _jury_panel_decision(body, head_sha)
+        if decision is not None:
+            latest = decision
+    return latest
+
+
+def _jury_panel_decision(body: str, head_sha: str) -> str | None:
+    """The decision ``body``'s panel marker records for ``head_sha``, or ``None``.
+
+    A token parser over one HTML-comment line, not a regex over Markdown: the line is
+    :func:`keel.closure._jury_panel_marker`'s exact render, so it unwraps with the same
+    :func:`_unwrap_html_comment` a header marker does and splits into
+    ``<marker> head=<sha> decision=<value>``. A line that is not that shape is prose and is
+    skipped, which is why the human sentence above it — which *names* neither field — can
+    never be mistaken for the record.
+    """
+    for raw_line in (body or "").splitlines():
+        tokens = _unwrap_html_comment(raw_line.strip()).split()
+        if not tokens or tokens[0] != closure.JURY_PANEL_MARKER:
+            continue
+        fields: dict[str, str] = {}
+        for token in tokens[1:]:
+            key, _, value = token.partition("=")
+            # First wins, the convention `_fields` already reads headers under, and a
+            # token carrying no `=` becomes a valueless key that matches neither field.
+            fields.setdefault(key, value)
+        if fields.get("head") == head_sha:
+            return fields.get("decision")
+    return None
 
 
 def _parse_vendor_count(raw: str | None) -> int | None:
@@ -1193,11 +2116,14 @@ def _is_jury_verdict(
     item: dict[str, Any],
     *,
     head_sha: str | None = None,
+    covered_heads: Collection[str] = (),
     enforced: bool = True,
 ) -> bool:
     if not _is_trusted_source(item, enforced=enforced):
         return False
     body = _body(item)
-    if not body or _is_ship_assessment(body) or _has_closure_marker(body):
+    if _is_ship_assessment(body):
         return False
-    return JURY_VERDICT_MARKER in body and _matches_head(item, body, head_sha)
+    return marker_in_header(body) == JURY_VERDICT_MARKER and _matches_head(
+        item, body, head_sha, covered_heads
+    )

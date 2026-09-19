@@ -15,11 +15,30 @@ jobs:
   build-n-publish:
     name: Build, Publish, and Release
     runs-on: ubuntu-latest
+    # A backstop, not *the* bound. Every command below that talks to the network
+    # carries a bound of its own, because a ceiling here cannot tell a stalled
+    # download from a slow job and cannot fail with a message naming what
+    # stalled. But per-command bounds only cover the commands somebody looked
+    # at, and this job also runs six actions whose HTTP is theirs and
+    # `python -m build`, which shells out to pip. So the job gets a ceiling too,
+    # and it caps the *next* unbounded command as well as the ones already
+    # found. Without it the ceiling is GitHub's six-hour default, in a job that
+    # sits between a PyPI upload and the GitHub Release — where a hang is the
+    # half-made release this file exists to prevent.
+    #
+    # Sized above the sum of this job's own bounds, not by feel: the build-deps
+    # install (300s), the wheel install (60s) and the archive fetch
+    # (10 x (10s + 30s + `sleep 6`) = 460s) come to 820s, and twenty measured
+    # runs put the whole job at 0.9 minutes at worst. The remainder is headroom
+    # for the six actions, which carry no bound this file can count.
+    timeout-minutes: 30
     permissions:
       id-token: write       # PyPI trusted publishing (OIDC) + provenance attestation
       contents: write       # create the GitHub Release and upload assets
-      pull-requests: write # open the formula-digest follow-up (#984)
       attestations: write   # build-provenance attestations
+      # No `pull-requests: write`. Nothing after the tag writes to `main` any
+      # more: the formula is rendered below and attached to the release instead
+      # of being repaired in a follow-up pull request (#1023, #990).
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -28,15 +47,92 @@ jobs:
         with:
           python-version: "3.13"
 
+      # Refuse a release that does not agree with itself, before anything is built
+      # or uploaded (#1024). PyPI files are immutable, so this is the last phase in
+      # which a CHANGELOG still headed `## [Unreleased]`, a plugin manifest naming
+      # the previous version, or a drifted keel-visual marker is still fixable.
+      # Same guards as `make release-check`; stdlib-only, so it runs before the
+      # hash-locked install below and cannot fail for a dependency's reasons.
+      - name: Check the release surfaces agree
+        env:
+          TAG: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            python scripts/release_check.py --tag "$TAG"
+          else
+            # Manual dispatch is the TestPyPI rehearsal: there is no tag to compare.
+            python scripts/release_check.py
+          fi
+
       - name: Install build dependencies
         run: |
-          python -m pip install \
+          # `timeout`, not pip's `--timeout`: that one bounds a single quiet
+          # read, so a peer dripping a byte inside it holds the call open for as
+          # long as it likes. Both are set — the socket timeout fails faster on
+          # an ordinary stall, the wrapper is what actually bounds the command.
+          timeout 300 python -m pip install \
+            --timeout 30 \
             --only-binary=:all: \
             --require-hashes \
             -r .github/requirements/publish-tools.txt
 
+      # Reproducible builds, step 1 of 2. Without a fixed timestamp `python -m build`
+      # stamps the current time into the archives, so two runs over the *same* tree
+      # produce different bytes and different SHA256s. That is not cosmetic: PyPI
+      # keeps the first upload (`skip-existing: true`), so a re-run at the same tag
+      # would publish a GitHub Release describing artifacts PyPI never served, and
+      # the verify job below would report a digest mismatch on a healthy release.
+      #
+      # Pinned to the tagged commit's own commit time, so the value is a property of
+      # the tag rather than of when the runner started.
+      - name: Pin SOURCE_DATE_EPOCH to the tagged commit
+        run: |
+          set -euo pipefail
+          epoch="$(git log -1 --pretty=%ct)"
+          echo "SOURCE_DATE_EPOCH=${epoch}" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=${epoch} ($(date -u -d "@${epoch}" +%FT%TZ))"
+
       - name: Build package distributions
         run: python -m build --no-isolation --sdist --wheel --outdir dist/
+
+      # Reproducible builds, step 2 of 2. SOURCE_DATE_EPOCH is necessary and not
+      # sufficient: with the pinned setuptools 84.0.0 the wheel comes out
+      # byte-identical but the sdist does not — its root directory member takes wall
+      # clock through a PAX record, the gzip header carries its own mtime, and every
+      # member carries the runner's uid/gid. scripts/normalize_sdist.py rewrites that
+      # envelope (see its docstring for the measured digests). Runs before the SBOM,
+      # the checksums, the attestation and the upload, so every downstream step sees
+      # the archive that will actually be published.
+      - name: Normalize the sdist for reproducibility
+        run: python scripts/normalize_sdist.py dist/*.tar.gz
+
+      # And then prove it, on this toolchain, on every release. A reproducibility
+      # claim that is only ever asserted in a comment is how the sdist gap survived
+      # the first round of this work: the wheel was checked, matched, and the sdist
+      # was assumed to behave the same way. Build a second time into a scratch
+      # directory and require both artifacts to hash identically.
+      - name: Verify the build is reproducible
+        run: |
+          set -euo pipefail
+          python -m build --no-isolation --sdist --wheel --outdir "${RUNNER_TEMP}/rebuild"
+          python scripts/normalize_sdist.py "${RUNNER_TEMP}"/rebuild/*.tar.gz
+          failed=0
+          for original in dist/*; do
+            name="$(basename "$original")"
+            a="$(sha256sum "$original" | cut -d" " -f1)"
+            b="$(sha256sum "${RUNNER_TEMP}/rebuild/${name}" | cut -d" " -f1)"
+            echo "${name}"
+            echo "  build 1: ${a}"
+            echo "  build 2: ${b}"
+            if [ "$a" != "$b" ]; then
+              echo "::error title=Build is not reproducible::${name} differs between two builds of the same tree; a re-run at this tag would publish a checksum file describing artifacts PyPI never served"
+              failed=1
+            fi
+          done
+          rm -rf "${RUNNER_TEMP}/rebuild"
+          [ "$failed" -eq 0 ]
 
       # CycloneDX software bill of materials for the built package. Written into
       # release/ (NOT dist/) so the PyPI upload sees only the wheel + sdist —
@@ -44,7 +140,7 @@ jobs:
       # ships with the GitHub Release.
       - name: Generate CycloneDX SBOM
         run: |
-          python -m pip install --no-deps dist/*.whl
+          timeout 60 python -m pip install --timeout 30 --no-deps dist/*.whl
           mkdir -p release
           cyclonedx-py environment --output-format JSON --output-file release/sbom.cdx.json
 
@@ -57,6 +153,111 @@ jobs:
           cd release
           sha256sum *.whl *.tar.gz sbom.cdx.json > SHA256SUMS
           cat SHA256SUMS
+
+      # The formula, rendered from what the tag actually produced (#1023, #990).
+      #
+      # A committed Formula/keel.rb had to name a url and a sha256 that cannot
+      # both be correct at once: the url is bumped in the release commit, and the
+      # digest belongs to the archive GitHub builds *from the tag* — created from
+      # that very commit. So the digest was stale on every release by
+      # construction, and making it true cost a second write to `main`
+      # afterwards: a pull request opened by this workflow that a human still had
+      # to merge, and an hourly-failing tap sync whenever nobody did (#981).
+      #
+      # The tag exists by the time this step runs, so the pair is knowable *here*
+      # and nowhere earlier. Rendering it at this moment removes the requirement
+      # instead of repairing its symptom: nothing in the repository names a
+      # digest, so nothing in the repository can be stale.
+      #
+      # This is the one thing the release constructs rather than copies. The
+      # counter-argument (#779: a release step that builds something moves its
+      # checks into the phase that runs once per tag) is answered by refusing
+      # here rather than reporting — every failure below exits non-zero.
+      #
+      # POSITION IS LOAD-BEARING. This sits between `Generate checksums` and the
+      # attestation, so it runs *before* anything irreversible: PyPI files are
+      # immutable and `skip-existing: true` means the version cannot be
+      # re-uploaded, so a render failure after the upload would leave a published
+      # version whose formula has to be fixed by cutting another release. Nothing
+      # here needs the upload: the inputs are GITHUB_REF_NAME, GITHUB_REPOSITORY,
+      # the committed template and release/SHA256SUMS. (The sibling renders after
+      # its upload because it must — its url and digest come from what PyPI
+      # reports about the sdist it just accepted. Here the url is the tag
+      # archive, which exists the moment the tag is pushed.)
+      - name: Render the Homebrew formula from the tagged archive
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          # Bounded, and named so a test can assert the number rather than match
+          # the loop's text. GitHub builds tag archives on demand; the first
+          # request after a push occasionally 404s while the ref propagates.
+          #
+          # 10 x 6s = 60s, a fifth of the sibling's 300s, because the two are
+          # waiting for different things. It waits for PyPI to *index* an upload
+          # — a third-party pipeline whose latency is measured in minutes. This
+          # waits for GitHub to serve an archive of a ref its own API already
+          # accepted, in the same run that pushed it; the only gap is internal
+          # propagation, seconds. A minute of retries is generous for that, and
+          # the failure it must not produce is a long silent hang before the
+          # release: the job already holds the built artifacts by this point.
+          ARCHIVE_WAIT_ATTEMPTS: "10"
+          ARCHIVE_WAIT_SECONDS: "6"
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          archive="${RUNNER_TEMP}/tag-archive.tar.gz"
+
+          fetched=""
+          for attempt in $(seq 1 "$ARCHIVE_WAIT_ATTEMPTS"); do
+            # Both flags, not one: `--connect-timeout` bounds reaching the peer
+            # and leaves a peer that connects and then goes quiet unbounded.
+            if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$archive"; then
+              fetched=1
+              echo "fetched the tag archive on attempt ${attempt}"
+              break
+            fi
+            echo "the tag archive is not being served yet (attempt ${attempt}/${ARCHIVE_WAIT_ATTEMPTS}); retrying in ${ARCHIVE_WAIT_SECONDS}s"
+            sleep "$ARCHIVE_WAIT_SECONDS"
+          done
+          if [ -z "$fetched" ]; then
+            echo "::error title=No tag archive::${url} did not resolve within the bounded wait; refusing to publish a formula whose digest nothing measured"
+            exit 1
+          fi
+
+          digest="$(sha256sum "$archive" | cut -d" " -f1)"
+          echo "url:    ${url}"
+          echo "sha256: ${digest}"
+
+          mkdir -p release
+          sed -e "s|@URL@|${url}|g" \
+              -e "s|@SHA256@|${digest}|g" \
+              -e "s|@VERSION@|${version}|g" \
+              packaging/homebrew/keel.rb.template > release/keel.rb
+
+          # `sed` reports success whether or not it substituted anything, so a
+          # renamed placeholder would ship a formula that cannot parse.
+          left="$(grep -oE '@[A-Z0-9_]+@' release/keel.rb || true)"
+          if [ -n "$left" ]; then
+            echo "::error title=Unrendered placeholder::${left} survived rendering"
+            exit 1
+          fi
+
+          # The guard #990 identified as the load-bearing one, asserted on the
+          # rendered file rather than on the variables that produced it: the url
+          # must be this project's archive for the version being released. A
+          # digest comparison alone is satisfied by a formula that faithfully
+          # describes somebody else's tarball.
+          if ! grep -qF "  url \"https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz\"" release/keel.rb; then
+            echo "::error title=Wrong url::the rendered formula does not name this repository's ${GITHUB_REF_NAME} archive"
+            exit 1
+          fi
+          if ! grep -qE '^  sha256 "[0-9a-f]{64}"$' release/keel.rb; then
+            echo "::error title=No digest::the rendered formula carries no top-level sha256"
+            exit 1
+          fi
+
+          ( cd release && sha256sum keel.rb >> SHA256SUMS )
+          cat release/keel.rb
 
       # Cryptographic attestation binding the artifacts to this workflow run,
       # verifiable with `gh attestation verify`.
@@ -87,149 +288,375 @@ jobs:
 
       - name: Create GitHub Release and Upload Packages
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
         with:
           files: |
             release/*.whl
             release/*.tar.gz
             release/sbom.cdx.json
             release/SHA256SUMS
+            release/keel.rb
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
           generate_release_notes: true
+          # First upload wins, matching PyPI's `skip-existing: true` above. The
+          # action overwrites by default, so a workflow re-run at the same tag used
+          # to replace SHA256SUMS with digests of a *rebuilt* artifact while PyPI
+          # kept the original — the two records of one release then disagreed by
+          # construction. Both sides now refuse to replace what was published.
+          overwrite_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish-formula:
-    # This repo is the source of truth for Formula/keel.rb (#774). The tap holds
-    # the copy `brew install` actually runs, and they were once kept equal by hand
-    # — which is how #787 shipped: the formula was fixed here, the guard checked
-    # the copy here, and users kept installing the broken one until someone synced
-    # the tap manually. The tap now pulls on a schedule, so this job's remaining
-    # job is to refuse to release a formula that could not install.
+  verify:
+    # Everything after "the upload succeeded" used to be prose. `release_smoke.py`
+    # was documented in docs/keel/release.md and wired into no workflow at all, and
+    # "confirm the PyPI digests match the GitHub Release" was a sentence in a
+    # runbook. This job is that paragraph, executed (#1024).
     #
-    # Copy, not construct. Everything interesting about this file is already
-    # asserted on every push by test_release_docs.py; a release step that built
-    # the formula would move those checks into the one phase that runs once per
-    # tag, which is the phase where mistakes are least observed (#779).
-    name: Sync the formula to the Homebrew tap
+    # It deliberately checks what PyPI *serves*, not what this run built: the
+    # failure worth catching is a release that built fine and installs wrong.
+    name: Verify the published release
     needs: build-n-publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # Sixty, because a job stopped by `timeout-minutes` is *cancelled*: the
+    # `if: failure()` step below does not run and no `release-broken` issue is
+    # filed, for a release that is already public. So the ceiling has to sit
+    # above the sum of this job's own bounds *and* leave room for the report,
+    # or the mechanism that tells a maintainer is the thing the ceiling kills.
+    # All of them, in order:
+    #
+    #   - the JSON-API wait: 20 x (`--connect-timeout 10` + `--max-time 25`
+    #     + `sleep 15`) = 1000s. The connect timeout is counted on top of the
+    #     max time rather than inside it: an over-estimate, deliberately, since
+    #     the number this guards is a ceiling;
+    #   - the two artifact downloads: 2 x (10s + 120s) = 260s;
+    #   - the install retry, wrapped whole at 900s — its own budget is
+    #     20 x (attempt + `sleep 15`), and only the wrapper is countable
+    #     because pip's `--timeout` bounds a read rather than a call;
+    #   - `release_smoke.py`, wrapped at 300s: it builds a venv and resolves
+    #     from the index a second time;
+    #   - the release cross-check: `timeout 120` + `timeout 60` = 180s;
+    #   - the `if: failure()` report: four `timeout 60` `gh` calls = 240s.
+    #
+    # That is 2880s. `tests/test_workflow_ceilings.py` recomputes it from this
+    # file rather than reading this comment, and checks the other two jobs the
+    # same way, so a wait added later cannot quietly outgrow its ceiling.
+    # Twenty measured runs put the job at 0.3 minutes when nothing waits; the
+    # ceiling is sized for the case where everything does. It stays a last
+    # resort and not the mechanism: a step that fails on its own bound fails
+    # the job, names what stalled, and files the report.
+    timeout-minutes: 60
     permissions:
-      contents: write      # push the digest branch
-      pull-requests: write # open the follow-up PR (#984)
+      contents: read   # checkout + `gh release download` of the SHA256SUMS asset
+      issues: write    # open or update `release-broken: <tag>` when this fails
+    env:
+      TAG: ${{ github.ref_name }}
+      LOG: ${{ github.workspace }}/verify.log
+      # The bound on the index waits, named rather than inlined so a test can
+      # assert the number instead of matching a loop's text. 20 x 15s = five
+      # minutes, and BOTH waits below read these: the JSON-API poll that finds
+      # the digests, and the install that resolves through the simple index.
+      # They are separate surfaces with separate lag (#1111), so each gets the
+      # budget rather than sharing one that the first can spend on the second's
+      # behalf — but out of one pair of variables, so an edit moves both.
+      PYPI_WAIT_ATTEMPTS: "20"
+      PYPI_WAIT_SECONDS: "15"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - name: Set the formula's post-tag digest, or open the PR that does
-        # The url is bumped in the release commit — test_release_docs pins it to
-        # the declared version — but the digest describes the tarball GitHub
-        # builds *from the tag*, created from the commit that release PR
-        # produces. So at this moment the stored digest is stale by
-        # construction, on every release without exception (#842).
-        #
-        # This used to `exit 1`. Two problems with that. It runs
-        # `needs: build-n-publish`, so it turned a release that had already
-        # published to PyPI successfully into a failed run — and a red that is
-        # always red cannot report a real release failure. And it duplicated a
-        # check that already exists closer to the user: the tap's sync-formula
-        # workflow re-hashes the artifact itself and refuses to commit on a
-        # mismatch, which is the guard that actually stands between a formula
-        # and `brew install` (added after #805, and it worked on 1.17.0).
-        #
-        # So report the value the formula needs and let the release run say
-        # whether the *release* succeeded. Nothing downstream is weakened.
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install from PyPI, smoke it, and cross-check the published digests
         env:
-          # `gh pr create` for the digest follow-up; scoped to this repo.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # One step, teed to a log whose tail the failure handler below posts into an
+        # issue. `set -o pipefail` keeps the tee from swallowing a non-zero exit.
+        #
+        # CONSTRAINT: nothing secret may reach $LOG — a public issue quotes its tail
+        # verbatim. No secret is expanded into this step's script; GH_TOKEN is read
+        # from the environment by `gh` and never echoed. The tail is additionally
+        # passed through a token-shaped mask before it is posted (see below).
+        run: |
+          set -euo pipefail
+          {
+            set -euo pipefail
+            version="${TAG#v}"
+            req="keel-workflow==${version}"
+            pypi="${RUNNER_TEMP}/pypi"
+            meta="${RUNNER_TEMP}/pypi.json"
+            mkdir -p "$pypi"
+
+            echo "== waiting for PyPI to serve both distributions of ${version} =="
+            # "Something is served" is not the condition worth waiting for: the wheel
+            # is indexed before the sdist, and the digest cross-check below would then
+            # compare one artifact and pass having verified half a release. Wait until
+            # the release's own JSON document lists both package types.
+            for attempt in $(seq 1 "$PYPI_WAIT_ATTEMPTS"); do
+              if curl -fsSL --connect-timeout 10 --max-time 25 "https://pypi.org/pypi/keel-workflow/${version}/json" -o "$meta" \
+                && [ "$(jq -r '[.urls[].packagetype] | unique | join(",")' "$meta")" = "bdist_wheel,sdist" ]; then
+                echo "both distributions listed on attempt ${attempt}"
+                break
+              fi
+              if [ "$attempt" -eq "$PYPI_WAIT_ATTEMPTS" ]; then
+                echo "::error title=PyPI never served both distributions::${req} did not have a wheel and an sdist on the index within the bounded wait"
+                exit 1
+              fi
+              sleep "$PYPI_WAIT_SECONDS"
+            done
+            jq -r '.urls[] | "  \(.packagetype)  \(.filename)  uploaded \(.upload_time_iso_8601)"' "$meta"
+
+            echo "== the published artifacts, against PyPI's own digests =="
+            # PyPI is the primary record. `digests.sha256` is what the index computed
+            # over the bytes it stores and will serve forever, and `skip-existing:
+            # true` means no later run can change them. That is a stronger guarantee
+            # than "the build reproduces": the build job pins SOURCE_DATE_EPOCH,
+            # normalizes the sdist envelope and proves both artifacts rebuild
+            # identically, but this comparison holds even if some future toolchain
+            # change breaks that, because it never compares against a rebuild.
+            #
+            # Fetched from the document's own urls[] rather than resolved by pip:
+            # `pip download --no-binary=:all:` prepares the sdist's metadata, pulling
+            # an unpinned setuptools into an isolated build env to learn a filename
+            # this document already states.
+            checked=0
+            while read -r name url want; do
+              curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "${pypi}/${name}"
+              got="$(sha256sum "${pypi}/${name}" | cut -d" " -f1)"
+              echo "${name}"
+              echo "  pypi declares: ${want}"
+              echo "  bytes hash to: ${got}"
+              if [ "$want" != "$got" ]; then
+                echo "::error title=Corrupt artifact::${name} does not hash to the digest PyPI declares for it"
+                exit 1
+              fi
+              checked=$((checked + 1))
+            done < <(jq -r '.urls[] | "\(.filename) \(.url) \(.digests.sha256)"' "$meta")
+            # Always two. Zero would mean the loop compared nothing and the step
+            # passed for that reason.
+            if [ "$checked" -ne 2 ]; then
+              echo "::error title=Nothing compared::expected 2 artifacts, hashed ${checked}"
+              exit 1
+            fi
+
+            echo "== clean venv: install, keel version =="
+            python -m venv "${RUNNER_TEMP}/verify-venv"
+            # The wait above proves the JSON API knows this version. `pip` does
+            # not resolve through the JSON API — it reads the simple index,
+            # served from a different cache that lags behind it. Cutting v1.21.0
+            # that gap was twenty-five seconds wide: both distributions listed on
+            # attempt 1, both digests matched, and `pip` then reported a version
+            # list ending at 1.20.0. The five-minute budget above had been spent
+            # watching a surface that was already ready, so the surface that was
+            # not ready got one attempt, and `release-broken: v1.21.0` (#1110)
+            # was filed against a release a plain re-run then verified unchanged.
+            #
+            # So the install gets the budget too, out of the same two variables:
+            # it is the assertion, and an index that cannot resolve the version
+            # yet is a wait rather than a result. The script reads
+            # PYPI_WAIT_ATTEMPTS/PYPI_WAIT_SECONDS from this job's env, exits
+            # non-zero once they are spent, and is exercised against a stub
+            # installer in tests/test_pypi_install_retry.py (#1111).
+            # Wrapped here rather than inside the script: it runs `"$installer"`
+            # as a single word, and `timeout(1)` is GNU coreutils that
+            # `macos-latest` does not ship — so a bound added inside would have
+            # to be skipped on the very runners `tests/test_pypi_install_retry.py`
+            # executes the real script on. The whole loop is what needs bounding
+            # anyway. 900s: the loop's own waiting is 19 x 15s = 285s and a
+            # resolve of two wheels takes seconds, so this is more than twice
+            # any honest run and still stops a hung pip a quarter of an hour in.
+            timeout 900 env \
+              INSTALLER="${RUNNER_TEMP}/verify-venv/bin/pip" REQUIREMENT="$req" \
+              .github/scripts/pip-install-with-retry.sh
+            installed="$("${RUNNER_TEMP}/verify-venv/bin/keel" version)"
+            echo "keel version -> ${installed}"
+            # The tag is the claim; this is the package's answer to it. A wheel built
+            # from the wrong commit installs and runs perfectly while reporting a
+            # different version, which nothing else here would notice.
+            if [ "$installed" != "keel ${version}" ]; then
+              echo "::error title=Version mismatch::the package PyPI serves for ${TAG} reports '${installed}', not 'keel ${version}'"
+              exit 1
+            fi
+
+            echo "== keel doctor (log-only: advisory by design, see below) =="
+            # Deliberately not `--strict`. doctor's checks are advisory here: run
+            # against a PyPI install from outside a keel checkout it correctly warns
+            # that no adapter surfaces are present, which is not a release defect.
+            # Its output is in the log for a human reading a failure, and it cannot
+            # fail this job on its own.
+            (cd "${RUNNER_TEMP}" && "${RUNNER_TEMP}/verify-venv/bin/keel" doctor)
+
+            echo "== release_smoke.py against the published package =="
+            # This builds its own venv and resolves "$req" from the index a
+            # second time, and carries no retry of its own. That is deliberate,
+            # but not for the reason it used to be: the retry above passes
+            # `--no-cache-dir`, so it leaves nothing in pip's HTTP cache and this
+            # resolve is a genuinely independent request rather than a replay of
+            # the page the canary already read. It is a stronger check for it.
+            #
+            # No retry, because the two failures mean different things. The
+            # install above does not return until this runner has resolved this
+            # version through the simple index at least once; a miss here would
+            # mean the index answered the same runner two different ways seconds
+            # apart — a regression, not the lag #1111 is about, and one that
+            # should fail the release loudly rather than be waited out.
+            timeout 300 python scripts/release_smoke.py --requirement "$req"
+
+            echo "== secondary: the GitHub Release SHA256SUMS =="
+            # Secondary, and tolerant of exactly one history. Both sides now refuse to
+            # replace a published file — PyPI via `skip-existing`, the release upload
+            # via `overwrite_files: false` — so these must agree. A release cut before
+            # those settings could have had SHA256SUMS overwritten by a re-run that
+            # rebuilt the artifacts. That is a defect in the release's bookkeeping,
+            # not evidence that the package PyPI serves is wrong (PyPI's own digests
+            # matched above), so it warns instead of failing.
+            #
+            # The discriminator is the asset's own createdAt vs updatedAt, NOT its
+            # age relative to the PyPI upload. Measured on the healthy v1.19.3
+            # release: PyPI uploaded at 07:28:47 and the release assets at 07:28:58,
+            # so "the asset is newer than the PyPI upload" is true of *every* normal
+            # release — a rule keyed on that would downgrade every genuine mismatch
+            # to a warning, which is worse than the bug it was meant to fix. GitHub
+            # bumps updatedAt only when an asset is *replaced*; on a first upload the
+            # two timestamps are equal, so this asks the exact question.
+            # `gh` has no request timeout of its own — not a flag, not an
+            # environment variable — so the wrapper is the only bound available.
+            timeout 120 gh release download "$TAG" --pattern SHA256SUMS --dir "${RUNNER_TEMP}/ghrel" --clobber
+            cat "${RUNNER_TEMP}/ghrel/SHA256SUMS"
+            sums="$(timeout 60 gh release view "$TAG" --json assets \
+              --jq '.assets[] | select(.name == "SHA256SUMS") | "\(.createdAt) \(.updatedAt)"')"
+            sums_created="$(date -u -d "$(echo "$sums" | cut -d" " -f1)" +%s)"
+            sums_updated="$(date -u -d "$(echo "$sums" | cut -d" " -f2)" +%s)"
+            replaced=0
+            if [ "$sums_updated" -gt "$sums_created" ]; then
+              replaced=1
+            fi
+            echo "SHA256SUMS uploaded ${sums% *}, last updated ${sums#* } (replaced: ${replaced})"
+            for artifact in "$pypi"/*; do
+              name="$(basename "$artifact")"
+              want="$(awk -v n="$name" '$2 == n { print $1 }' "${RUNNER_TEMP}/ghrel/SHA256SUMS")"
+              got="$(sha256sum "$artifact" | cut -d" " -f1)"
+              echo "${name}"
+              echo "  release: ${want:-<absent>}"
+              echo "  pypi:    ${got}"
+              if [ -z "$want" ]; then
+                echo "::error title=Not in SHA256SUMS::${name} is on PyPI but the release lists no digest for it"
+                exit 1
+              fi
+              if [ "$want" = "$got" ]; then
+                continue
+              fi
+              if [ "$replaced" -eq 1 ]; then
+                echo "::warning title=SHA256SUMS was replaced after its first upload::${name} differs, and this release's checksum file was overwritten after it was first published — a re-run that rebuilt the artifacts. PyPI's own digest matched, so the package is intact; it is the release's checksum file that describes something else."
+                continue
+              fi
+              echo "::error title=Digest mismatch::${name} on PyPI is not the artifact this release published"
+              exit 1
+            done
+            echo "== verified ${req} =="
+          } 2>&1 | tee "$LOG"
+
+      - name: Open or update the release-broken issue
+        if: failure()
+        # A red job in a workflow nobody opens after a green publish is the same
+        # notice-nobody-acts-on that left the tap failing for a day (#981). A
+        # broken release gets a thing on a list instead, deduped by title so a
+        # re-run comments rather than filing a second one.
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          url=$(grep -m1 -oE 'https://github.com/[^"]+\.tar\.gz' Formula/keel.rb)
-          want=$(grep -m1 -oE '^  sha256 "[0-9a-f]{64}"' Formula/keel.rb | grep -oE '[0-9a-f]{64}')
-          curl -fsSL "$url" -o /tmp/formula-src.tar.gz
-          got=$(sha256sum /tmp/formula-src.tar.gz | cut -d' ' -f1)
-          echo "url:  $url"
-          echo "want: $want"
-          echo "got:  $got"
-          if [ "$want" = "$got" ]; then
-            echo "formula digest already matches the tag"
-            exit 0
-          fi
-          
-          # The tag exists by the time this runs, so the digest is knowable *now*.
-          # This used to emit a ::notice:: and leave the follow-up to a human — which
-          # is what was forgotten for 1.19.1, after which the tap refused every sync
-          # for a day (#981). A notice nobody is required to act on is not a safeguard.
-          #
-          # A pull request, not a push: main is protected, and a direct push is how
-          # the sibling repo's equivalent step failed silently for a whole release.
-          branch="chore/formula-digest-${GITHUB_REF_NAME}"
-          sed -i.bak "s|^  sha256 \"[0-9a-f]\{64\}\"|  sha256 \"${got}\"|" Formula/keel.rb
-          rm -f Formula/keel.rb.bak
-          
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
-          git add Formula/keel.rb
-          git commit -m "chore(homebrew): set the ${GITHUB_REF_NAME} formula checksum" \
-            -m "release-bump moves the url to the new tag but cannot know its digest: the archive does not exist until the tag is pushed. Opened automatically." \
-            -m "no issue"
-          
-          if ! git push origin "$branch"; then
-            echo "::error title=Formula follow-up not pushed::Set sha256 to ${got} in Formula/keel.rb by hand, or the tap will refuse to sync."
-            exit 0
-          fi
-          
-          gh pr create --base main --head "$branch" \
-            --title "chore(homebrew): set the ${GITHUB_REF_NAME} formula checksum" \
-            --body "Opened automatically by publish.yml after ${GITHUB_REF_NAME}.
-          
-          \`make release-bump\` moves the formula url to the new tag but cannot know its digest — the archive does not exist until the tag is pushed. Until this lands the tap refuses to sync and \`brew upgrade\` cannot see the release.
-          
-          | | |
-          |---|---|
-          | url | \`${url}\` |
-          | declared | \`${want}\` |
-          | actual | \`${got}\` |
-          
-          The digest is read from the published artifact, not constructed. \`external promises\` re-downloads and re-hashes it on this PR, so CI confirms the value independently before it merges.
-          
-          no issue — release follow-up." \
-            || echo "::notice::a pull request for $branch already exists"
+          title="release-broken: ${TAG}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 
-          # Arm the PR to land on its own once CI has re-verified the digest.
-          # main requires no approvals, only checks, so nothing is bypassed —
-          # this removes the wait between "green" and "someone noticed", which
-          # is the only manual step left in the chain and the one that left the
-          # tap failing hourly for a day (#981). Best-effort: if the repository
-          # has the setting off, the PR simply waits for a person.
-          gh pr merge --auto --squash "$branch" \
-            || echo "::notice::auto-merge unavailable; land $branch to unblock the tap"
+          # This tail goes verbatim into a public issue. The verify step above
+          # carries the constraint that nothing secret may reach $LOG, and nothing
+          # there writes one. Masking token shapes anyway: the runner redacts
+          # registered secrets in its own log but not inside a file it is asked to
+          # read back, and a future edit to that step should not be one careless
+          # `echo` away from publishing a credential. (There is no repo-wide
+          # redaction helper for workflows — `src/keel/redaction.py` is the capture
+          # artifact policy, a different surface with a different contract.)
+          logtail="$(tail -n 100 "$LOG" 2>/dev/null || echo '(no log captured)')"
+          logtail="$(printf '%s\n' "$logtail" \
+            | sed -E 's/(gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}/***redacted***/g')"
 
-      - name: Confirm the tap will pick this up
-        # No push from here, and no token. GITHUB_TOKEN is scoped to this repo, so
-        # writing the tap needed a PAT with `contents: write` on it — one repo
-        # holding write access to another, to create, store and rotate.
-        #
-        # The tap pulls instead: berkayturanci/homebrew-keel runs a scheduled
-        # workflow that fetches this formula, resolves its url, re-hashes the
-        # artifact, and commits when they differ. Reading a public repo needs no
-        # credential, and the token that writes the tap is the tap's own.
-        #
-        # This step only reports where the tap currently stands, so the release
-        # log says whether it is already current or will catch up shortly. It
-        # cannot fail the release: a tap a few minutes behind still installs, and
-        # the step above already refused to release a formula that does not hash
-        # to its own tarball.
+          body="$(printf '%s\n\n%s\n\n%s\n\n```\n%s\n```\n' \
+            "Post-publish verification failed for \`${TAG}\`. PyPI files are immutable: fix forward with a new version, and yank ${TAG} if the published artifact is wrong (docs/keel/release.md, Rollback And Re-Run Notes)." \
+            "Run: ${run_url}" \
+            "Last 100 lines of the verify log (token shapes masked):" \
+            "$logtail")"
+
+          # `|| true`, because this step runs under `set -euo pipefail` and a
+          # failed command substitution in an assignment *is* a failure: a `gh`
+          # that times out (`timeout` exits 124) or rate-limits would exit the
+          # reporter here and file nothing at all — the release-broken report
+          # swallowed by the bound added to protect it. An empty result already
+          # means "no open issue with this title", which is the safe reading:
+          # the branch below then creates one, and a duplicate report is a far
+          # better outcome than silence about a broken release.
+          existing="$(timeout 60 gh issue list --state open --search "\"${title}\" in:title" \
+            --json number,title \
+            --jq "map(select(.title == \"${title}\")) | .[0].number // empty" || true)"
+
+          if [ -n "$existing" ]; then
+            timeout 60 gh issue comment "$existing" --body "$body"
+            echo "commented on #${existing}"
+          else
+            # Labels are best effort: a missing label must not swallow the report.
+            timeout 60 gh issue create --title "$title" --body "$body" \
+              --label "type:bug" --label "priority:high" --label "role:core" \
+              || timeout 60 gh issue create --title "$title" --body "$body"
+          fi
+
+  tap-status:
+    # What is left of the old `publish-formula` job. It used to download the tag
+    # archive, rewrite Formula/keel.rb, push a branch, open a pull request and arm
+    # auto-merge on it — five mechanisms for one unsatisfiable requirement, which
+    # #1023 removed by rendering the formula in the publish job above and
+    # attaching it to the release instead. Nothing here writes anything, in this
+    # repository or any other: `contents: read`, no token, no `gh`.
+    #
+    # It reports where the tap stands so the release log answers "will `brew
+    # upgrade` see this?" without anyone opening a second repository. It cannot
+    # fail the release: the tap pulls on a 30-minute schedule, so being briefly
+    # behind is the design rather than a defect, and the render step already
+    # refused to attach a formula that does not hash to the archive it names.
+    name: Report where the Homebrew tap stands
+    needs: build-n-publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # One bounded `curl` and some `grep`; twenty measured runs put it at 0.2
+    # minutes. Fifteen is a ceiling for the checkout and the runner, not for
+    # this job's work, which cannot legitimately approach it.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Compare the tap with this tag
         run: |
           set -euo pipefail
-          curl -fsSL -H "Accept: application/vnd.github.raw" \
-            "https://api.github.com/repos/berkayturanci/homebrew-keel/contents/Formula/keel.rb" \
-            -o /tmp/tap-keel.rb || { echo "::notice::could not read the tap; it syncs on its own schedule"; exit 0; }
-          if diff -q Formula/keel.rb /tmp/tap-keel.rb >/dev/null; then
-            echo "tap is already serving this formula"
-          else
-            echo "::notice::tap is behind; its scheduled sync will pick this up within ~30 minutes."
-            echo "To publish immediately: gh workflow run 'Sync formula from keel' --repo berkayturanci/homebrew-keel"
+          tap="berkayturanci/homebrew-keel"
+          # The contents API, not raw.githubusercontent.com: `raw` is CDN-cached
+          # for minutes, so right after a sync it serves the previous formula and
+          # this step would report a tap that is already current as behind.
+          if ! curl -fsSL --connect-timeout 10 --max-time 30 -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/${tap}/contents/Formula/keel.rb" \
+              -o "${RUNNER_TEMP}/tap-keel.rb"; then
+            echo "::notice::could not read ${tap}; it syncs on its own schedule"
+            exit 0
           fi
+          serving="$(grep -m1 -oE '/tags/v[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' "${RUNNER_TEMP}/tap-keel.rb" || true)"
+          echo "tap serves: ${serving:-<no tag url found>}"
+          echo "this tag:   /tags/${GITHUB_REF_NAME}.tar.gz"
+          if [ "$serving" = "/tags/${GITHUB_REF_NAME}.tar.gz" ]; then
+            echo "the tap is already serving this release"
+            exit 0
+          fi
+          echo "::notice::the tap is behind; its scheduled sync pulls this release's keel.rb asset within ~30 minutes."
+          echo "To publish immediately: gh workflow run sync-formula.yml --repo ${tap}"

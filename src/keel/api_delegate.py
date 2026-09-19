@@ -39,16 +39,40 @@ from dataclasses import dataclass
 
 from . import config
 
+# The vendor whose endpoint and key-env name come from ``knobs.delegate_profiles``
+# instead of the hardcoded table below (#666). It moved to the leaf :mod:`keel.vocab`
+# with the rest of the shared vendor vocabulary (#1050) because
+# :data:`keel.vocab.EFFORT_VENDORS` names it; re-exported here, which is where the
+# package reads it.
+from .vocab import OPENAI_COMPATIBLE as OPENAI_COMPATIBLE
+
+#: The module's public surface, in definition order (#1070). It is declared because the
+#: ``X as X`` re-exports above are read from *other* modules — a use CodeQL's
+#: ``py/unused-import`` cannot see, since it counts same-module uses only. A name listed
+#: in ``__all__`` is used by definition, so the declaration answers the scanner with the
+#: language's own statement of intent rather than with a dismissal. Being a real
+#: declaration it has to be the *whole* surface, not the re-exports alone;
+#: ``tests/test_reexport_surface.py`` holds it to that in both directions.
+__all__ = [
+    "OPENAI_COMPATIBLE",
+    "DEFAULT_MAX_TOKENS",
+    "DEFAULT_TIMEOUT",
+    "ApiResult",
+    "env_key_name",
+    "has_api_token",
+    "present_key_names",
+    "merge_payload",
+    "GuardedAddressError",
+    "build_http_only_opener",
+    "generate",
+]
+
 #: Response cap for a single unattended completion; overridable per call.
 DEFAULT_MAX_TOKENS = 16384
 #: Per-request timeout in seconds; overridable per call.
 DEFAULT_TIMEOUT = 300
 
 _ANTHROPIC_VERSION = "2023-06-01"
-
-#: The one vendor whose endpoint and key-env name come from ``knobs.delegate_profiles``
-#: instead of the hardcoded table below (#666).
-OPENAI_COMPATIBLE = "openai-compatible"
 
 #: vendor -> (endpoint, env var carrying the key), matching ``agents.API_VENDORS``.
 #: Every URL here is a **hardcoded constant** — that is what keeps the SSRF story
@@ -144,13 +168,43 @@ def _scrub(text: str, key: str) -> str:
     return text.replace(key, "[REDACTED:api-key]") if key else text
 
 
+def merge_payload(payload: dict, extra: dict | None) -> dict:
+    """Merge a vendor payload fragment into a request body, one nesting level at a time.
+
+    A shallow ``update`` is wrong for exactly one vendor and that vendor matters: Gemini
+    spells reasoning effort as ``generationConfig.thinkingConfig.thinkingBudget``, and a
+    shallow merge of that fragment would drop the ``maxOutputTokens`` already sitting in
+    ``generationConfig`` — the request would still succeed, with an unbounded answer.
+    Recursive on dicts, replace on everything else; the input is never mutated.
+    """
+    merged = dict(payload)
+    for name, value in (extra or {}).items():
+        current = merged.get(name)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[name] = merge_payload(current, value)
+        else:
+            merged[name] = value
+    return merged
+
+
 def _build_request(
-    vendor: str, model: str, prompt: str, key: str, max_tokens: int, base: str | None = None
+    vendor: str,
+    model: str,
+    prompt: str,
+    key: str,
+    max_tokens: int,
+    base: str | None = None,
+    extra: dict | None = None,
 ) -> tuple[str, dict[str, str], bytes]:
     """Build ``(url, headers, body)`` for one single-shot generation call.
 
     ``base`` is the endpoint. It is a hardcoded ``_VENDORS`` constant for every vendor
     except ``openai-compatible``, where it comes from the validated profile.
+
+    ``extra`` is the caller's payload fragment — the per-vendor reasoning-effort spelling
+    :func:`keel.delegate.plan_run` resolves (``thinking`` / ``reasoning_effort`` /
+    ``generationConfig.thinkingConfig``). It is merged **into** the body rather than
+    layered over it; see :func:`merge_payload`.
     """
     payload: dict
     template = base if base is not None else _VENDORS[vendor][0]
@@ -193,7 +247,7 @@ def _build_request(
             "max_completion_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }
-    return url, headers, json.dumps(payload).encode("utf-8")
+    return url, headers, json.dumps(merge_payload(payload, extra)).encode("utf-8")
 
 
 def _parse_content(vendor: str, data: object) -> str | None:
@@ -372,6 +426,7 @@ def generate(
     api_key_env: str | None = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: int = DEFAULT_TIMEOUT,
+    extra_payload: dict | None = None,
     _env=os.environ,
     _opener=None,
 ) -> ApiResult:
@@ -380,6 +435,10 @@ def generate(
     Pure request/response — no retries (the s4 contract owns the 2-retry loop on
     a bad diff and the no-retry-on-429 rule), no streaming, no tools. ``_env``
     and ``_opener`` are injectable so the wrapper is fully unit-testable offline.
+
+    ``extra_payload`` is an optional vendor-shaped fragment merged into the request body
+    — how ``keel delegate run --effort`` reaches a hosted vendor (#1012). Keyword-only
+    with a ``None`` default, so every existing caller builds the same body it did before.
     """
     if vendor == OPENAI_COMPATIBLE:
         # The only vendor whose URL and key-env come from config rather than from
@@ -410,7 +469,9 @@ def generate(
         if unsafe is not None:
             return ApiResult(False, error_code="bad-model", error=unsafe)
 
-    url, headers, body = _build_request(vendor, model, prompt, key, max_tokens, entry[0])
+    url, headers, body = _build_request(
+        vendor, model, prompt, key, max_tokens, entry[0], extra_payload
+    )
     # URL comes only from the hardcoded _VENDORS constants — never config, env,
     # or model/prompt content.
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")  # nosec B310

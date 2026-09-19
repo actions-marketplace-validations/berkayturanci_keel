@@ -11,24 +11,27 @@
 
 1. [Architecture & Roles](#architecture--roles)
 2. [How to Select Models](#how-to-select-models)
-3. [Hosted API Delegates (Zero-CLI)](#1-hosted-api-delegates-zero-cli)
+3. [One Executor: `keel delegate run`](#one-executor-keel-delegate-run)
+   - [Who fixes a review finding](#who-fixes-a-review-finding)
+4. [Hosted API Delegates (Zero-CLI)](#1-hosted-api-delegates-zero-cli)
    - [Anthropic (Claude)](#anthropic-claude)
-   - [OpenAI (GPT / o-series)](#openai-gpt--o-series)
+   - [OpenAI](#openai)
    - [Google (Gemini)](#google-gemini)
-4. [OpenAI-Compatible Profiles (OpenRouter, DeepSeek, Groq, local LLMs)](#2-openai-compatible-profiles)
+5. [OpenAI-Compatible Profiles (OpenRouter, DeepSeek, Groq, local LLMs)](#2-openai-compatible-profiles)
    - [OpenRouter (Universal Model Gateway)](#openrouter)
    - [DeepSeek Official API](#deepseek-official-api)
    - [Groq](#groq)
    - [Together AI](#together-ai)
    - [Local vLLM / LM Studio / LiteLLM Proxy](#local-vllm--lm-studio--litellm)
-5. [Local Offline Models (Ollama)](#3-local-offline-models-ollama)
-6. [Agent CLIs (Subprocess)](#4-agent-clis-subprocess)
+6. [Local Offline Models (Ollama)](#3-local-offline-models-ollama)
+7. [Agent CLIs (Subprocess)](#4-agent-clis-subprocess)
    - [Claude Code (`claude`)](#claude-code)
    - [Codex (`codex`)](#codex)
    - [Antigravity (`agy`)](#antigravity)
-7. [Generic CLI Profiles (Aider, Cursor Agent, Custom Scripts)](#5-generic-cli-profiles)
-8. [Multi-Model & Ensemble Review Posture](#6-multi-model--ensemble-review-posture)
-9. [Summary Comparison Table](#summary-comparison-table)
+8. [Generic CLI Profiles (Aider, Cursor Agent, Custom Scripts)](#5-generic-cli-profiles)
+9. [Multi-Model & Ensemble Review Posture](#6-multi-model--ensemble-review-posture)
+10. [Summary Comparison Table](#summary-comparison-table)
+11. [Which of these work on your machine](#which-of-these-work-on-your-machine)
 
 ---
 
@@ -52,8 +55,8 @@ You can choose models at three different levels:
 ### 1. Per-Command Override (CLI Flags)
 Pass `--delegate` (for implementer) or `--review-delegate` (for reviewer):
 ```bash
-# Implement with Gemini 2.5 Pro and review with Claude 3.7 Sonnet
-/keel:ship 123 --delegate google-api:gemini-2.5-pro --review-delegate anthropic-api:claude-3-7-sonnet-20250219
+# Implement on one vendor, review on another
+/keel:ship 123 --delegate agy:gemini-3.8-flash-high --review-delegate anthropic-api:claude-opus-5
 
 # Implement with DeepSeek-R1 via an OpenRouter profile
 /keel:ship 123 --delegate openrouter:deepseek/deepseek-r1
@@ -61,19 +64,175 @@ Pass `--delegate` (for implementer) or `--review-delegate` (for reviewer):
 
 ### 2. Issue Labels
 Label an issue on GitHub to route implementation automatically:
-* `delegate:google-api` + `delegate-model:gemini-2.5-pro`
-* `delegate:anthropic-api` + `delegate-model:claude-3-7-sonnet-20250219`
+* `delegate:google-api` + `delegate-model:<model-id>`
+* `delegate:anthropic-api` + `delegate-model:claude-sonnet-5`
 * `delegate:openrouter` + `delegate-model:meta-llama/llama-3.3-70b-instruct`
 
-### 3. Project Configuration Defaults (`project.yaml`)
-Map specific issue roles/platforms to default agents in `.keel/project.yaml`:
+### 3. Project Team Policy (`project.yaml`)
+`knobs.team` is where a project states its whole team — implementer per issue role, one
+mandatory gate reviewer from a different vendor, reviewer seats per risk tier, and the
+jury:
+
 ```yaml
 knobs:
-  implementer_agents:
-    core: backend-developer     # maps to host agent or profile
-    frontend: anthropic-api:claude-3-7-sonnet-20250219
-    docs: google-api:gemini-2.5-flash
+  team:
+    implement:
+      default: { provider: claude }
+      by_role:
+        core: { provider: agy, model: gemini-3.8-flash-high, effort: high }
+        frontend: { provider: anthropic-api, model: claude-sonnet-5 }
+        docs: { provider: "subagent:docs-writer" }   # a host subagent, not a vendor
+    gate: { provider: codex, distinct_from: implementer }
+    review:
+      by_tier:
+        "2": [{ provider: claude }, { provider: codex }]
+        "3": jury
+    jury: { mode: gating, min_vendors: 2 }
 ```
+
+A `provider` is resolved by the same registry `keel delegate run` uses, and
+`subagent:<name>` is the explicit spelling for a host (Claude-class) subagent. Full
+reference: [`configuration.md#team`](configuration.md#team).
+
+The older `knobs.implementer_agents` still works and is mapped onto
+`team.implement.by_role`, but it is **deprecated**: its values were documented as vendor
+strings here and as Claude subagent names in `ship.md` s4, and nothing said which.
+
+Both documented spellings keep working, and keel now says which is which: a value whose
+head names a provider it can resolve **is** that provider (with the model after the colon);
+anything else is the host subagent, and keel prefixes it for you.
+
+```yaml
+knobs:
+  implementer_agents:                        # deprecated — prefer team.implement.by_role
+    core: backend-developer                  # -> subagent:backend-developer
+    frontend: anthropic-api:claude-sonnet-5  # -> anthropic-api, model claude-sonnet-5
+    docs: agy:gemini-3.8-flash-high          # -> agy, model gemini-3.8-flash-high
+```
+
+### 4. When the panel *is* the reviewer (`review: jury`)
+
+The seats above are **host reviewers**: named providers, one verdict each. A tier can
+instead hand its whole review to the cross-vendor panel by setting the tier's value to the
+string `jury` rather than a seat list:
+
+```yaml
+knobs:
+  team:
+    review:
+      by_tier:
+        "2": [{ provider: claude }, { provider: codex }]
+        "3": jury          # the panel is this tier's review — no host seats beside it
+    jury: { mode: gating, min_vendors: 2 }
+```
+
+On such a tier s7 dispatches [ai-jury](https://github.com/berkayturanci/ai-jury) **once**
+instead of running host readers beside it, and
+`keel review --from-jury <report.json>` turns the panel's JSON report
+(`jury --format json`, report schema 1.1+) into the run's public evidence: one head-pinned
+`keel.review-verdict.v1` per panelist ballot that **counts as a review** (ai-jury
+`is_review`: panelist, substantive scope, not `ABSTAIN`), carrying the `vendor:` and
+`model:` that produced *that* ballot, plus the panel's own `keel.jury-verdict.v1`
+consensus record — all
+in one call, so ballots and verdict are pinned to the same head SHA by construction. The
+required verdict count becomes the panel's own declared size, and `--json` returns a
+`panel` block whose **verified** consensus findings are the s9 fix-loop input, in the
+`{"findings": […]}` shape [`keel fixloop brief --findings`](cli.md) already reads.
+
+Adopt it deliberately. A panel tier has no host seats to fall back on, and nothing per-run
+can take the panel away: `--no-jury` and `--jury-advisory` are recorded and not applied
+(`--no-jury does not apply: this tier's review is the jury panel …`), because removing the
+panel there would leave the tier with no required review evidence at all.
+
+**keel itself has not adopted this for its own tier 3.** `projects/keel.yaml` staffs three
+named reviewer seats (`claude`, `agy`, `subagent:opus-reviewer`) with
+`jury: { mode: advisory }`, and says why in the file: the switch commits every tier-3 keel
+change to a panel run, so it waits until `keel review --from-jury` has been exercised on a
+real pull request. The mechanism above is what a *consumer* project configures; it is not
+what keel runs on itself. Full reference:
+[`configuration.md#team`](configuration.md#team).
+
+### Who fixes a review finding
+
+`knobs.team.fix` names the seat that takes a review finding back. Its default is the
+reserved provider `implementer` — an **alias**, not a vendor: *whoever implemented this
+change*, resolved to the seat s4 actually dispatched. That default is the point. A
+delegated implementation whose findings come back to the host is a delegation that saved
+nobody's quota, and it is what happened before there was a rule.
+
+```yaml
+knobs:
+  team:
+    fix: { provider: implementer }   # the default; omit the block entirely for the same
+    # fix: { provider: codex }       # or pin a named provider for every fix round
+```
+
+`implementer` is valid **only** at `team.fix.provider` (and as `gate.distinct_from`);
+anywhere else it would name a provider that does not exist, and `keel validate` says so.
+
+s9 does not read this block itself — `keel fixloop brief` does, and hands back the round's
+brief plus the seat, walking the ladder `implementer → gate → host` when a round fails or
+a provider is unavailable:
+
+```bash
+keel fixloop brief --pr 1042 --findings findings.json --round 2 \
+  --out fix-2.md --cwd "$WORKTREE" --json
+# -> fixer: { provider: codex, stage: gate }, dispatch: [keel, delegate, run, …, --role, fix, …]
+```
+
+The budget is unchanged at three rounds: the ladder decides *who* fixes, never *how often*.
+Full flags: [`cli.md`](cli.md), under `keel fixloop brief`.
+
+---
+
+## One Executor: `keel delegate run`
+
+Whatever you select above, **one command performs the dispatch**. `keel delegate run`
+resolves the provider, picks the vendor's flags for the role, delivers the prompt off the
+process list, translates `--effort` into the vendor's own spelling, and prints one JSON
+document. The `/keel:*` adapters call it; nothing hand-builds a vendor invocation any
+more, which is what stopped the argv shapes drifting between adapters.
+
+```bash
+# tool-enabled implementer, any transport
+keel delegate run --provider agy:gemini-3.8-flash --role implement \
+  --prompt-file brief.md --cwd ../wt-1012 --timeout 3600
+
+# read-only reviewer — the role picks the vendor's read-only invocation
+keel delegate run --provider anthropic-api:claude-opus-5 --role review \
+  --prompt-file rubric.md --effort high
+
+# a long run that outlives the caller
+keel delegate run --provider codex --role implement --prompt-file brief.md \
+  --timeout 3600 --detach --run-id impl-1012 --root .
+keel delegate wait impl-1012 --root . --timeout 3600
+```
+
+* `--provider` takes the same token as `--delegate`: a name or `name:model`, resolved
+  **built-in vendor > project profile > machine registry**. A built-in always wins and can
+  never be redefined by config or by a file in `$HOME`.
+* Model ids are validated against where they land: the strict `[A-Za-z0-9._-]` rule where
+  the model reaches a command line or `google-api`'s URL path, and `[A-Za-z0-9._:/-]` where
+  it is only a JSON body field — which is why `ollama:qwen2.5-coder:32b` and
+  `openrouter:deepseek/deepseek-r1` work.
+* `--role review|gate|chair` runs read-only; `--role implement|fix` runs tool-enabled. For
+  the three built-in CLIs the read-only invocation carries no write-enabling flag, asserted
+  per vendor in keel's tests. keel cannot enforce read-only for an arbitrary binary, so the
+  result reports `read_only` **and** `read_only_backed` — branch on the second: a profile
+  with `args` and no `review_args` reviews with the *implementer's* flags.
+* `--effort low|medium|high` becomes an `agy` model suffix, a `codex`
+  `model_reasoning_effort` override, Anthropic `thinking`, OpenAI `reasoning_effort`, or
+  Gemini `thinkingConfig` — and `effort_applied: false` plus a warning where the vendor
+  cannot express it. A provider entry's own `effort:` is the default when `--effort` is
+  absent.
+* Failures are fail-soft: `ok: false` with an `error_code`
+  (`missing-binary`, `nonzero-exit`, `timeout`, `rate-limit`, `no-key`, `lost`, …), never a
+  traceback. The retry, fall-back and tier rules stay with the caller.
+* Pass `--timeout` to both `run` and `wait` on a detached run: the first becomes the run's
+  own deadline, which is what lets a killed child be reported `lost` instead of sitting at
+  `running` forever.
+
+Full flag and contract reference: [`cli.md`](cli.md#keel-delegate).
 
 ---
 
@@ -85,47 +244,47 @@ endpoint via Python standard library HTTP (`urllib`), needing only an API key in
 ### Anthropic (Claude)
 * **Vendor Prefix**: `anthropic-api:<model>`
 * **Required Env Var**: `ANTHROPIC_API_KEY`
-* **Common Models**:
-  * `claude-3-7-sonnet-20250219`
-  * `claude-3-5-sonnet-20241022`
-  * `claude-3-5-haiku-20241022`
+* **Example models** — a vendor's catalogue moves, so these are illustrations rather
+  than a supported list:
+  * `claude-opus-5` — the strongest
+  * `claude-sonnet-5` — the everyday default
+  * `claude-haiku-4-5-20251001` — the cheap, fast one
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# Run implementation via Claude 3.7 Sonnet API
-/keel:ship 42 --delegate anthropic-api:claude-3-7-sonnet-20250219
+# Run implementation via the hosted Anthropic API
+/keel:ship 42 --delegate anthropic-api:claude-opus-5
 ```
 
-### OpenAI (GPT / o-series)
+### OpenAI
 * **Vendor Prefix**: `openai-api:<model>`
 * **Required Env Var**: `OPENAI_API_KEY`
-* **Common Models**:
-  * `gpt-4o`
-  * `gpt-4o-mini`
-  * `o3-mini`
-  * `o1`
+* **Model id**: whichever id the vendor currently serves. This page deliberately does not
+  reprint a hosted catalogue — the last time it did, it went stale in place. Run
+  `keel doctor --providers` for the ids your CLIs advertise, and read the vendor's own
+  model list for the hosted ones.
 
 ```bash
 export OPENAI_API_KEY="sk-proj-..."
 
-# Run implementation via GPT-4o API
-/keel:ship 42 --delegate openai-api:gpt-4o
+# Run implementation via the hosted OpenAI API
+/keel:ship 42 --delegate openai-api:<model-id>
 ```
 
 ### Google (Gemini)
 * **Vendor Prefix**: `google-api:<model>`
 * **Required Env Var**: `GEMINI_API_KEY`
-* **Common Models**:
-  * `gemini-2.5-pro`
-  * `gemini-2.5-flash`
-  * `gemini-2.0-flash-exp`
+* **Model id**: as for OpenAI, whichever id the vendor currently serves — run
+  `keel doctor --providers` for the ids your CLIs advertise. The Antigravity CLI reports
+  its own list, which is where ids such as `gemini-3.8-flash-high` in this page's `agy:`
+  examples come from.
 
 ```bash
 export GEMINI_API_KEY="AIzaSy..."
 
-# Run implementation via Gemini 2.5 Pro API
-/keel:ship 42 --delegate google-api:gemini-2.5-pro
+# Run implementation via the hosted Gemini API
+/keel:ship 42 --delegate google-api:<model-id>
 ```
 
 > **Security Note on Google API**: Keel sends the key via the `x-goog-api-key` header (never in query parameters)
@@ -256,6 +415,9 @@ ollama pull qwen2.5-coder:32b
 
 # Use DeepSeek-R1 locally for review
 /keel:ship 42 --review-delegate ollama:deepseek-r1:14b
+
+# The same dispatch, directly: one POST to the local /api/generate
+keel delegate run --provider ollama:qwen2.5-coder:32b --role implement --prompt-file brief.md
 ```
 
 ---
@@ -283,6 +445,37 @@ If you have official agent CLI tools installed and authenticated on your machine
 * **Prerequisites**: Antigravity CLI (`agy`) in PATH.
 ```bash
 /keel:ship 42 --delegate agy
+```
+
+`agy` is the one built-in CLI that does **not** work in the process's working directory
+by default: it operates on its own copy under `~/.gemini/antigravity-cli/scratch/`, so
+before #1134 an `implement` run edited that copy and left the worktree keel gave it
+untouched. keel now passes `--add-dir <cwd>` on every agy dispatch that has an **absolute** `cwd`,
+which is what makes the directory keel named the directory agy edits — `keel delegate run`
+resolves a relative `--cwd` before planning, because the child is started inside that
+directory and would otherwise resolve the flag against itself — measured against a
+standalone clone and a linked git worktree, with and without the flag; only the runs
+carrying it touched the real files, and only they made no scratch copy.
+
+keel also passes `--print-timeout <timeout>s`. agy's print mode stops at its own 5m
+default, so a `--timeout 900` dispatch used to die at 298s with agy's own
+`timeout waiting for response` — keel's bound never reached the process it was bounding.
+
+`claude` and `codex` take neither flag: both run where they are started. Neither has been
+exercised here in the `implement` role, so that is a statement about their documented
+behaviour rather than a measurement, and it is worth making the same check before relying
+on one of them to modify a worktree.
+
+For all three, the invocation is core's: `keel delegate run` selects the vendor's
+read-only mode for `--role review|gate|chair` and its write-enabled mode for
+`--role implement|fix`, and the prompt travels on the CLI's standard input rather than its
+argv — a prompt carries the diff, and an argv is world-readable in `ps`. A read-only
+`claude` runs under a tool **allow-list** and no permission bypass; `codex` under its
+`read-only` sandbox; `agy` under `--sandbox`, which is the only read-only mechanism it
+documents and the reason it still needs the non-interactive permission flag.
+
+```bash
+keel delegate run --provider claude --role review --prompt-file rubric.md
 ```
 
 ---
@@ -321,10 +514,10 @@ Keel encourages **cross-model verification** to prevent self-affirming model bli
 ### Heterogeneous Review Panels
 Run implementation on one vendor and assign independent reviewers on different model architectures:
 ```bash
-# Implement with Claude 3.7, review with Gemini 2.5 Pro and GPT-4o
+# Implement on Anthropic, review on two other vendors
 /keel:ship 101 \
-  --delegate anthropic-api:claude-3-7-sonnet-20250219 \
-  --review-delegate google-api:gemini-2.5-pro \
+  --delegate anthropic-api:claude-opus-5 \
+  --review-delegate agy:gemini-3.8-flash-high \
   --reviewers 2
 ```
 
@@ -338,12 +531,35 @@ When [`ai-jury`](https://github.com/berkayturanci/ai-jury) is installed, Keel ga
 
 ## Summary Comparison Table
 
-| Category | Identifier / Vendor | Transport | Setup Requirement | Example Usage |
+| Category | Identifier / Vendor | Transport | Setup Requirement | `keel delegate run --provider …` |
 |---|---|---|---|---|
-| **Hosted Anthropic** | `anthropic-api:MODEL` | HTTP (stdlib) | `ANTHROPIC_API_KEY` | `--delegate anthropic-api:claude-3-7-sonnet-20250219` |
-| **Hosted OpenAI** | `openai-api:MODEL` | HTTP (stdlib) | `OPENAI_API_KEY` | `--delegate openai-api:gpt-4o` |
-| **Hosted Google** | `google-api:MODEL` | HTTP (stdlib) | `GEMINI_API_KEY` | `--delegate google-api:gemini-2.5-pro` |
-| **OpenAI-Compatible** | `knobs.delegate_profiles` | HTTP (stdlib) | Custom endpoint + env key | `--delegate openrouter:deepseek/deepseek-r1` |
-| **Local Ollama** | `ollama:MODEL` | HTTP (local) | Local `ollama` daemon | `--delegate ollama:qwen2.5-coder:32b` |
-| **Agent CLI** | `claude`, `codex`, `agy` | Subprocess | Installed CLI in PATH | `--delegate claude` |
-| **Generic CLI** | `knobs.delegate_profiles` (`cli`) | Subprocess | Tool binary in PATH | `--delegate aider` |
+| **Hosted Anthropic** | `anthropic-api:MODEL` | HTTP (stdlib) | `ANTHROPIC_API_KEY` | `anthropic-api:claude-opus-5` |
+| **Hosted OpenAI** | `openai-api:MODEL` | HTTP (stdlib) | `OPENAI_API_KEY` | `openai-api:<model-id>` |
+| **Hosted Google** | `google-api:MODEL` | HTTP (stdlib) | `GEMINI_API_KEY` | `google-api:<model-id>` |
+| **OpenAI-Compatible** | `knobs.delegate_profiles` | HTTP (stdlib) | Custom endpoint + env key | `openrouter:deepseek/deepseek-r1` |
+| **Local Ollama** | `ollama:MODEL` | HTTP (local) | Local `ollama` daemon | `ollama:qwen2.5-coder:32b` |
+| **Agent CLI** | `claude`, `codex`, `agy` | Subprocess | Installed CLI in PATH | `claude` |
+| **Generic CLI** | `knobs.delegate_profiles` (`cli`) | Subprocess | Tool binary in PATH | `aider` |
+
+---
+
+## Which of these work on your machine
+
+Everything above is what keel *supports*. What is usable **here** is a property of the
+machine and the person, and `keel doctor --providers` is the command that answers it:
+
+```bash
+keel doctor --providers          # a table: available / reason / transport / capabilities
+keel doctor --providers --json   # providers[], registry_path, warnings
+```
+
+It probes every built-in vendor, every `knobs.delegate_profiles` entry, and every entry of
+the machine-level [provider registry](configuration.md#provider-registry) — agent CLIs by
+`PATH` plus `--version`, hosted APIs by key *presence* (names only; no request is made),
+Ollama by its local `/api/tags`, which also lists the served models. Probes are time-boxed
+and fail-soft; an unavailable provider always says why.
+
+Keys and endpoints you do not want in a committed `project.yaml` belong in
+`~/.keel/providers.yaml` (or `$KEEL_PROVIDERS`), which is operator-owned and never
+committed. Project profiles win on a name clash, and the clash is reported rather than
+silently applied.

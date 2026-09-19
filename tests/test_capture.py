@@ -17,7 +17,82 @@ def _config_with_capture_policy(policy):
 
 
 def _config_with_learning_policy(policy):
-    return _config_with_capture_policy({"learning": policy})
+    """A project that runs a content hook, with this learning policy inside it.
+
+    The parent pair is not decoration: `capture.enabled` is the project saying it
+    intends to run a post-merge extension and `mode: extension` is the one mode
+    that has a content hook, so `learning_decision` refuses `create-learning`
+    without them. A learning policy tested against a project that runs no hook is
+    a policy nothing would honour.
+    """
+    return _config_with_capture_policy({"enabled": True, "mode": "extension", "learning": policy})
+
+
+class TheParentPolicyDecidesWhetherThereIsAHook(unittest.TestCase):
+    """`learning.mode: create-learning` under a project that runs no hook.
+
+    Gating only the *write* on the parent pair left the record claiming
+    `create-learning` with `durable_artifact: true` for a run that produced
+    nothing — the write/record disagreement this feature already treats as
+    load-bearing one level down, inverted.
+    """
+
+    def decision(self, capture_policy):
+        return capture.learning_decision(
+            title="a lesson",
+            capture_status="applied",
+            config=_config_with_capture_policy(
+                {
+                    **capture_policy,
+                    "learning": {"enabled": True, "mode": "create-learning"},
+                }
+            ),
+        )
+
+    def test_a_project_that_runs_no_hook_gets_marker_only(self):
+        for label, policy in (
+            ("capture disabled", {"enabled": False, "mode": "extension"}),
+            ("marker-only", {"enabled": True, "mode": "marker-only"}),
+            ("enabled omitted", {"mode": "extension"}),
+            ("nothing declared", {}),
+        ):
+            with self.subTest(policy=label):
+                decision = self.decision(policy)
+                self.assertEqual(decision["decision"], "marker-only")
+                self.assertFalse(decision["durable_artifact"])
+
+    def test_a_project_that_runs_one_still_gets_its_learning(self):
+        decision = self.decision({"enabled": True, "mode": "extension"})
+        self.assertEqual(decision["decision"], "create-learning")
+        self.assertTrue(decision["durable_artifact"])
+
+    def test_the_writer_and_the_decision_answer_the_same_question(self):
+        """One predicate, so they cannot drift apart again."""
+        for policy in (
+            {"enabled": False, "mode": "extension"},
+            {"enabled": True, "mode": "marker-only"},
+            {"enabled": True, "mode": "extension"},
+        ):
+            with self.subTest(policy=policy):
+                config = _config_with_capture_policy(
+                    {
+                        **policy,
+                        "learning": {
+                            "enabled": True,
+                            "mode": "create-learning",
+                            "sink": {"kind": "markdown-dir"},
+                        },
+                    }
+                )
+                decision = capture.learning_decision(
+                    title="a lesson", capture_status="applied", config=config
+                )
+                self.assertEqual(
+                    decision["durable_artifact"],
+                    capture.learning_sink_writes(
+                        config=config, decision=decision, capture_status="applied"
+                    ),
+                )
 
 
 def _record(pr, *, issue=None, marker=None):
@@ -180,6 +255,98 @@ class TestCaptureContract(unittest.TestCase):
 
         self.assertEqual(report["status"], "incomplete")
         self.assertEqual(report["summary"]["invalid"], 1)
+        self.assertEqual(report["results"][0]["status"], "invalid")
+        self.assertEqual(report["results"][0]["marker_count"], 2)
+
+    def test_verify_session_counts_markers_on_the_merged_head(self):
+        """#1157: a superseded head's marker must not fail the merged one.
+
+        `existing_capture_marker` refuses a second marker per (pull request,
+        head) so a red first run no longer bricks the pull request. Counting per
+        pull request here would move that deadlock one step later — the pull
+        request would fail verification for carrying two markers, and the only
+        exit would again be editing an append-only audit ledger. A merged pull
+        request does not change head, so the last record's head is the merged
+        one and the invariant is read where it holds.
+        """
+        records = [
+            {
+                "schema_version": "keel.run-ledger.v1",
+                "record_type": "ship_run",
+                "pull_request": {"number": 168},
+                "git": {"head_sha": "48681d19"},
+                "capture": {"marker": "compound-learning: pr=168 status=skipped:no-policy"},
+            },
+            {
+                "schema_version": "keel.run-ledger.v1",
+                "record_type": "ship_run",
+                "pull_request": {"number": 168},
+                "git": {"head_sha": "eed4f81a"},
+                "capture": {"marker": "compound-learning: pr=168 status=applied"},
+            },
+        ]
+
+        report = capture.verify_session(records, [168])
+
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["results"][0]["status"], "applied")
+
+    def test_a_run_that_never_reached_capture_does_not_move_the_counted_head(self):
+        """#945's record, meeting #1157's scoping.
+
+        A run that re-records gates after a rebase writes `not_run` with no
+        marker on a new head. Reading the counted head off the *last* record
+        would look past a real applied marker on the merged head and report the
+        capture missing — and `reconcile_session` would then plan to emit a
+        marker that already exists. `ledger.latest_ship_run_for_pr` documents why
+        last-by-pull-request is the wrong proxy for a head-scoped question; a row
+        with no marker is not evidence about capture at all.
+        """
+        merged = {
+            "schema_version": "keel.run-ledger.v1",
+            "record_type": "ship_run",
+            "pull_request": {"number": 168},
+            "git": {"head_sha": "48681d19"},
+            "capture": {"marker": "compound-learning: pr=168 status=applied"},
+            "assessment": {"merge": {"action": "merge"}},
+        }
+        rebased = {
+            "schema_version": "keel.run-ledger.v1",
+            "record_type": "ship_run",
+            "pull_request": {"number": 168},
+            "git": {"head_sha": "deadbeef"},
+            "capture": {"not_run": True, "marker": None},
+        }
+
+        report = capture.verify_session([merged, rebased], [168])
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["results"][0]["status"], "applied")
+
+        reconcile = capture.reconcile_session([merged, rebased], [168])
+        self.assertEqual(reconcile["results"][0]["status"], "complete")
+        self.assertEqual(reconcile["results"][0].get("actions", []), [])
+
+    def test_verify_session_still_rejects_two_markers_on_one_head(self):
+        """The invariant this check exists for survives the scoping above."""
+        records = [
+            {
+                "schema_version": "keel.run-ledger.v1",
+                "record_type": "ship_run",
+                "pull_request": {"number": 168},
+                "git": {"head_sha": "eed4f81a"},
+                "capture": {"marker": "compound-learning: pr=168 status=applied"},
+            },
+            {
+                "schema_version": "keel.run-ledger.v1",
+                "record_type": "ship_run",
+                "pull_request": {"number": 168},
+                "git": {"head_sha": "eed4f81a"},
+                "capture": {"marker": "compound-learning: pr=168 status=skipped:no-policy"},
+            },
+        ]
+
+        report = capture.verify_session(records, [168])
+
         self.assertEqual(report["results"][0]["status"], "invalid")
         self.assertEqual(report["results"][0]["marker_count"], 2)
 
@@ -653,10 +820,10 @@ class TestRetrieveRelevantLearnings(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             p = Path(td)
             (p / "auth_tokens.md").write_text(
-                "# Auth Token Handling\nAlways refresh expired bearer tokens."
+                "# Auth Token Handling\nAlways refresh expired bearer tokens.", encoding="utf-8"
             )
             (p / "database_lock.md").write_text(
-                "# SQLite Locking\nDo not hold write locks across network calls."
+                "# SQLite Locking\nDo not hold write locks across network calls.", encoding="utf-8"
             )
             (p / "ignored.bin").write_bytes(b"\x00\x01\x02")
 
@@ -674,9 +841,136 @@ class TestRetrieveRelevantLearnings(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             p = Path(td)
-            (p / "lesson.md").write_text("# Lesson\nSome content")
+            (p / "lesson.md").write_text("# Lesson\nSome content", encoding="utf-8")
             with patch.object(Path, "read_text", side_effect=OSError("permission denied")):
                 self.assertEqual(capture.retrieve_relevant_learnings("lesson content", td), [])
+
+    def test_a_link_out_of_the_directory_is_not_read_as_a_lesson(self):
+        """A lesson is text an agent brief quotes; a link must not make any file one.
+
+        `is_file` and `read_text` both follow a symlink, so `leak.md -> ../credentials`
+        put the target's first line into the brief as a lesson title. A link to another
+        lesson in the same directory still reads.
+        """
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lessons = root / "learning"
+            lessons.mkdir()
+            outside = root / "credentials.md"
+            outside.write_text("# Auth token: s3cr3t\nauth token rotation", encoding="utf-8")
+            (lessons / "leak.md").symlink_to(outside)
+            (lessons / "real.md").write_text(
+                "# Auth token handling\nRefresh the auth token before it expires.",
+                encoding="utf-8",
+            )
+            (lessons / "alias.md").symlink_to(lessons / "real.md")
+            results = capture.retrieve_relevant_learnings("auth token", lessons, max_results=5)
+            # Reached through a link, the directory is still the directory.
+            (root / "via").symlink_to(lessons, target_is_directory=True)
+            via = capture.retrieve_relevant_learnings("auth token", root / "via", max_results=5)
+        self.assertEqual(sorted(r["file"] for r in results), ["alias.md", "real.md"])
+        self.assertEqual(sorted(r["file"] for r in via), ["alias.md", "real.md"])
+
+
+class TestCaptureImportGraph(unittest.TestCase):
+    def test_capture_does_not_import_config(self):
+        """``config`` → ``capture`` is the only allowed edge; the reverse is a CodeQL cycle.
+
+        A ``TYPE_CHECKING`` import is still an edge: CodeQL's ``py/cyclic-import``
+        does not honour that guard, and ``ProjectConfig`` is defined after
+        ``config`` imports this module. Duck-typing ``policy_pack`` is what
+        actually closes it.
+        """
+        import ast
+        from pathlib import Path
+
+        source = Path(capture.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        hits: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                names = [alias.name for alias in node.names]
+                if node.module in {"config", "keel.config"} or (
+                    node.level >= 1 and node.module is None and "config" in names
+                ):
+                    hits.append(ast.unparse(node))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "config" or alias.name.startswith("keel.config"):
+                        hits.append(alias.name)
+        self.assertEqual(hits, [])
+
+
+class TheRecordSaysWhereItsArtifactCanBeRead(unittest.TestCase):
+    """`capture.artifact_scope` (#1185).
+
+    An in-repo sink's path means the same thing in every clone. A sink outside the
+    checkout records an absolute path, and the run ledger is *committed*, so that path
+    travels to teammates and CI runners where it names nothing. Saying which kind it is
+    lets `capture-verify` tell "written somewhere this host cannot see" from "never
+    written" — the same absence, very different facts.
+    """
+
+    def test_the_sinks_shape_decides(self):
+        for path, expected in (
+            (".keel/learning", capture.ARTIFACT_SCOPE_REPOSITORY),
+            ("~/knowledge", capture.ARTIFACT_SCOPE_MACHINE),
+            ("/srv/knowledge", capture.ARTIFACT_SCOPE_MACHINE),
+        ):
+            with self.subTest(path=path):
+                config = _config_with_learning_policy(
+                    {
+                        "enabled": True,
+                        "mode": "extension",
+                        "sink": {"kind": "markdown-dir", "path": path},
+                    }
+                )
+                self.assertEqual(capture.artifact_scope("anything.md", config), expected)
+
+    def test_a_dormant_sink_still_has_the_shape_it_has(self):
+        # The scope describes the sink's *path*, and a switched-off capture does not
+        # move it: `.keel/learning` is repo-relative whether or not anything writes
+        # there. Answered through `learning_sink_in_worktree` — which is gated on the
+        # hook, because *who commits the file* does depend on it — a dormant in-repo
+        # sink recorded `machine`, which reads as "written on a host you cannot see"
+        # for a path every clone has.
+        config = _config_with_capture_policy(
+            {
+                "enabled": False,
+                "mode": "extension",
+                "learning": {"sink": {"path": ".keel/learning"}},
+            }
+        )
+        self.assertEqual(capture.artifact_scope("x.md", config), capture.ARTIFACT_SCOPE_REPOSITORY)
+        # …and the question that *is* hook-gated keeps its answer.
+        self.assertFalse(capture.learning_sink_in_worktree(config))
+
+    def test_a_project_with_no_sink_has_no_scope(self):
+        # `learning_sink_in_worktree` answers False for "no sink" and "capture disabled"
+        # as well as for an outside sink, so the sink has to be looked for separately —
+        # otherwise a path inside the clone was recorded `machine` and noted as unreadable.
+        config = _config_with_capture_policy({"enabled": True, "mode": "extension"})
+        self.assertIsNone(capture.artifact_scope(".keel/learning/x.md", config))
+
+    def test_an_older_record_is_read_from_the_paths_shape(self):
+        # Nothing already in a ledger changes meaning: an anchored path was always an
+        # outside sink, on any platform.
+        for path, expected in (
+            (".keel/learning/x.md", capture.ARTIFACT_SCOPE_REPOSITORY),
+            ("/Users/b/knowledge/x.md", capture.ARTIFACT_SCOPE_MACHINE),
+            ("~/knowledge/x.md", capture.ARTIFACT_SCOPE_MACHINE),
+            ("C:/knowledge/x.md", capture.ARTIFACT_SCOPE_MACHINE),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(capture.artifact_scope(path), expected)
+
+    def test_no_artifact_has_no_scope(self):
+        for value in (None, "", "   "):
+            with self.subTest(value=value):
+                self.assertIsNone(capture.artifact_scope(value))
 
 
 if __name__ == "__main__":

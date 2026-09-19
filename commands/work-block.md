@@ -1,6 +1,6 @@
 ---
 description: Daytime multi-issue work block — process an explicit issue list or queue selector through ship with per-issue isolation and operator-visible stopping points.
-argument-hint: "[issue numbers...] [--queue <selector>] [--max <N>] [--hours <H>] [--review-comments <inline|summary>]"
+argument-hint: "[issue numbers...] [--queue <selector>] [--max <N>] [--hours <H>] [--review-comments <inline|summary>] [--delegate <provider>] [--review-delegate <provider>] [--effort <low|medium|high>] [--team <profile>] [--wizard]"
 allowed-tools: Bash(keel:*), Bash(git:*), Bash(gh:*), Bash(jury:*), Read, Edit, Write, Agent
 ---
 
@@ -41,7 +41,7 @@ to `ship`.
 keel validate .keel/project.yaml --root .
 keel plan     .keel/project.yaml --root . --command work-block --live --json
 keel work-block .keel/project.yaml --root . --live --json
-keel window   .keel/project.yaml --root .
+keel window   .keel/project.yaml
 ```
 
 Parse `contract.operator_consent` before selecting work, creating branches/worktrees,
@@ -51,11 +51,44 @@ the required `--approve-scope` values. Pass
 `operator_consent.delegated_agent_scope` into every child `/keel:ship` handoff. Children
 may use only `approved_mutation_scopes`; scope expansion blocks or escalates.
 
+`--wizard` is interactive opt-in only. Pass it through to the same Step 0 command; core
+runs the picker described in `/keel:ship`'s `--wizard` section, from the same provider
+probe, and in any non-interactive context degrades to a logged no-op that leaves the
+parsed flags exactly as they are. Work-block has no implementer or jury flag of its own,
+so core echoes those choices in the resolved flag set — hand them to every child
+`/keel:ship` verbatim rather than re-deciding them per issue.
+
 Read `contract.session_contract.work_block`. It is the queue primitive shared with
 `/keel:overnight`: queue snapshot, readiness refresh, per-issue worktree isolation, ship
 handoff, checkpoint/resume, run ledger, final report buckets, and stop conditions. Do not
 invent project-specific queue tiers in this adapter; read project policy from
 `.keel/project.yaml` or extension output.
+
+## Step 0b — Staffing: who runs the children
+
+This block accepts `--delegate <provider[:model]>`, `--review-delegate <provider>`
+(repeatable, positional per reviewer slot), `--effort <low|medium|high>`,
+`--team <profile>` and `--reviewers <n>`, and hands **every one of them that was set** to
+**every** child `/keel:ship`. Resolve them once, from the same preflight the rest of this
+command reads:
+
+```bash
+keel work-block .keel/project.yaml --root . --live --json \
+  --delegate "$DELEGATE" --review-delegate "$REVIEWER" --effort "$EFFORT" --team "$TEAM"
+```
+
+`contract.session_contract.work_block.delegation` comes back with the effective values and
+with `child_args` — the exact flag list to append. Append it verbatim to each handoff:
+
+```
+/keel:ship <issue> [--delegate <provider[:model]>] [--review-delegate <provider>] [--effort <low|medium|high>] [--team <profile>] [--reviewers <n>]
+```
+
+A flag the operator did not pass is simply absent; never invent one, and never drop one the
+operator did pass. `contract.assignment` shows what those values resolve to
+(`lead`, `implementer`, `effort`, `reviewers`, `review_panel`) — read it, do not re-derive
+it. Record the effective values, and the `assignment` they produced, in the session report:
+a block whose report does not say which team ran it cannot be audited later.
 
 ## Step 1 — Snapshot the queue
 
@@ -132,6 +165,8 @@ must include the fixed queue snapshot and these buckets:
 - Skipped
 - Needs-input
 
-Also include open questions, consent gaps, and the next 1–3 operator actions.
+Also include the effective staffing (`--delegate`, `--review-delegate`, `--effort`,
+`--team`, `--reviewers` as they were passed to the children), open questions, consent gaps,
+and the next 1–3 operator actions.
 
-<!-- keel-generated: surface=plugin command=work-block keel_version=1.19.2 source_sha256=9ac541b04fd4df257005468d50f4b3827d75d98b6ad3a0bdf3a2c060bb2aac21 generated_sha256=9ac541b04fd4df257005468d50f4b3827d75d98b6ad3a0bdf3a2c060bb2aac21 -->
+<!-- keel-generated: surface=plugin command=work-block keel_version=1.23.1 source_sha256=819ef54e37514ef71b7f824aad586aefe810404308f3ec8cacd0802d311ee954 generated_sha256=819ef54e37514ef71b7f824aad586aefe810404308f3ec8cacd0802d311ee954 -->

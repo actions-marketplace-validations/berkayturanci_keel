@@ -37,13 +37,29 @@ into topologically ordered execution waves, execute disjoint clusters in paralle
 git worktrees, and land batches cleanly via orthogonal fast-forward merges or adaptive
 self-healing funnel rebases.
 
+## Who does what — CTO, team lead, worker
+
+Three levels, and each one only does its own job:
+
+- **You are the CTO.** You cluster the backlog, launch one lead per cluster, and land the
+  waves. You do not implement, review, or drive a child ship yourself.
+- **One team lead per cluster.** A lead is a subagent you spawn for exactly one cluster. It
+  runs that cluster's `/keel:ship` runs with the providers the cluster's `assignment` names,
+  and it reports through the cluster's worker status record — the same records
+  `keel swarm-status` renders, so a lead needs no reporting channel of its own.
+- **Workers are the child ship runs** the lead drives, one per issue in its cluster.
+
+The hierarchy is not a suggestion about tone: a lead that reports up through anything other
+than the worker record is invisible to the board, and a CTO that implements has no one left
+to land the wave.
+
 ## Step 0 — Resolve config + swarm contract
 
 ```bash
 keel validate .keel/project.yaml --root .
 keel plan     .keel/project.yaml --root . --command swarm --live --json
-keel window   .keel/project.yaml --root .
-keel swarm-plan .keel/project.yaml --root . <issue-numbers...> --tree
+keel window   .keel/project.yaml
+keel swarm-plan .keel/project.yaml --issues <n,n,n> --tree
 ```
 
 Parse `contract.operator_consent` before selecting work, creating branches/worktrees,
@@ -53,37 +69,72 @@ the required `--approve-scope` values. Pass
 `operator_consent.delegated_agent_scope` into every child `/keel:ship` handoff. Children
 may use only `approved_mutation_scopes`; scope expansion blocks or escalates.
 
-## Step 1 — Deterministic static dependency analysis & clustering
+## Step 1 — Deterministic static dependency analysis, scoring & staffing
 
-Run static dependency analysis and scope prediction across the target issue set:
+Run static dependency analysis, scope prediction, difficulty scoring and per-cluster
+staffing across the target issue set:
 
 ```bash
-keel swarm-plan .keel/project.yaml --root . <issue-numbers...> --tree --json
+keel swarm-plan .keel/project.yaml --issues <n,n,n> --tree --json
 ```
 
+Pass the operator's staffing flags straight through — `--delegate`, `--review-delegate`,
+`--effort`, `--team <profile>` and `--reviewers` — so the plan shows the team the run will
+actually dispatch rather than the default one.
+
 - Inspect the generated waves, disjoint clusters, conflict edges, and direct landing eligibility.
+- Each cluster carries a `difficulty` (`band`, `score`, `tier` and the `signals` that
+  produced them) and an `assignment` (`lead`, `implementer`, `effort`, `reviewers`,
+  `review_panel`, `gate`, `fix`). Both are resolved by core from `knobs.team` plus
+  `knobs.team.by_difficulty`; do not re-derive either, and do not substitute a provider of
+  your own choosing for one the assignment names.
+- Read `assignment.warnings` before launching anything. A `--team` profile that names no
+  configured bench, or a gate that is its own implementer, is reported there and nowhere
+  else.
 - If `--plan-only` was requested, render the ASCII DAG tree and exit.
 
-## Step 2 — Isolated multi-worktree execution runtime
+## Step 2 — Launch one lead per cluster
 
 Launch parallel workers per cluster in dedicated git worktrees under `.keel/worktrees/swarm/`:
 
 ```bash
-keel swarm-run .keel/project.yaml --root . <issue-numbers...> --rebalance
+keel swarm-run .keel/project.yaml --root . --issues <n,n,n> --live
 ```
 
-- Each cluster worker drives standard `keel ship` backbone steps (`s0`–`s12`) in its isolated worktree.
+- Spawn **one team lead subagent per cluster**, briefed with that cluster's `assignment`
+  and `difficulty` verbatim. The lead runs the cluster's issues through the standard
+  `keel ship` backbone steps (`s0`–`s12`) in the cluster's isolated worktree.
+- The lead passes its cluster's team to every child ship it starts, using the **same five
+  flags a work block hands down** — `keel ship` accepts all of them:
+
+  ```
+  keel ship <project.yaml> --issue <N> --delegate <assignment.implementer> [--review-delegate <provider>]... [--role <assignment.role>] [--effort <assignment.effort>] [--team <assignment.team_profile>]
+  ```
+
+  One `--review-delegate` per staffed reviewer slot, in slot order. `--effort` and
+  `--team` carry the bench the cluster was staffed from, so the child's own resolution
+  reproduces the parent's instead of re-deriving a different one from config alone.
+  `keel swarm-run` appends exactly this set for the runs it starts itself; a lead driving
+  ships by hand appends the same. A seat that is a host `subagent:` rather than a provider
+  is not a `--delegate` value — spawn it as a subagent instead.
+- A role that is not `[A-Za-z0-9][A-Za-z0-9._-]*` is **not** passed: it would be parsed as
+  a flag by the child and break the run. Core drops it and says so in
+  `assignment.warnings`; the child resolves its role from the issue's own labels.
+- A lead never re-scores its cluster and never re-staffs it. If the work turns out heavier
+  than the band said, it reports that through the worker record and the CTO re-plans.
 - If runtime file modification divergence is detected, dynamic rebalancing partitions overlapping branches to the next wave tier.
-- Track live worker states with `keel swarm-status`.
+- Track live worker states with `keel swarm-status` — the board's `Lead` and `Band` columns
+  are how the operator sees which lead owns which cluster and why it drew its provider.
 
 ## Step 3 — Orthogonal batch landing & drift self-healing
 
 When an execution wave completes, land all passing clusters onto `main`:
 
 ```bash
-keel swarm-land .keel/project.yaml --root . --mode auto
+keel swarm-land .keel/project.yaml --root . --wave <n> --live
 ```
 
+- The landing mode is **derived from the wave's diff map**, not passed on the command line.
 - **Orthogonal Batch Landing**: Disjoint diff trees are fast-forwarded or batch-merged concurrently under atomic `merge_lock`.
 - **Adaptive Funnel Landing**: If overlapping file trees exist, sequential cherry-pick/rebase is executed with fail-soft self-healing.
 
@@ -96,7 +147,7 @@ keel swarm-status .keel/project.yaml --root .
 keel-visual swarm .keel/project.yaml --root . --out keel-swarm.html
 ```
 
-Optionally launch the localhost visualizer dashboard:
+When `--visual` was requested, launch the localhost visualizer dashboard:
 ```bash
 keel-visual swarm .keel/project.yaml --root . --serve --port 8766
 ```
@@ -105,10 +156,12 @@ keel-visual swarm .keel/project.yaml --root . --serve --port 8766
 
 Compile the overall multi-agent swarm outcome:
 - Total issues planned, clustered, and executed.
+- Per cluster: its difficulty band and score, its lead, and the implementer/reviewer seats
+  that ran it — plus any `assignment.warnings` that were raised and what was done about them.
 - Worker success/failure breakdown.
 - Landing mode used (Direct Batch vs Adaptive Funnel) and rebase self-healing stats.
 - Final multi-agent jury deliberation consensus and compound learning synthesis.
 - Record final completion:
   `keel activity .keel/project.yaml --root . --run-id "$RUN" --done`
 
-<!-- keel-generated: surface=skills command=swarm keel_version=1.19.2 source_sha256=e2c2ce49a7841788c5f69e401f238846c7b59fcee47fb532ef4a4d1e281be856 generated_sha256=bab54f776eb3baed061daf5a6fac2717f8be4bafdd45c572fac2d6aad5a08421 -->
+<!-- keel-generated: surface=skills command=swarm keel_version=1.23.1 source_sha256=98c145b2deac422004958fe48286f3b0bffb49c7905dd856a0df4f0a4e248b67 generated_sha256=2eb1103256b181cc6d4723b064f05fc0c27c994e98fc9c7d7f70116e84cb82b2 -->

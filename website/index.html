@@ -6,7 +6,7 @@
 
 <meta name="google-site-verification" content="YOfteG6Rawd61nFnQCQY1iLQB8MbUMlJA6zIFUkJC0g">
 
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://img.shields.io; connect-src 'self' https://cloudflareinsights.com;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://img.shields.io; connect-src 'self' https://cloudflareinsights.com https://api.github.com https://pypi.org;">
 
 <script>
   (function () {
@@ -117,7 +117,7 @@
     <div class="app-body">
       <!-- ───── sidebar ───── -->
       <nav class="sidebar" id="sidebar" aria-label="Workspace">
-        <div class="sb-brand"><img src="favicon.svg" alt=""><span class="nm">keel</span><span class="ver" data-version>v1.19.2</span></div>
+        <div class="sb-brand"><img src="favicon.svg" alt=""><span class="nm">keel</span><span class="ver" data-version>v1.23.1</span></div>
 
         <div class="sb-lab">Workspace</div>
         <button class="sb-item on" data-view="overview" aria-current="page"><span class="ic"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span> Overview</button>
@@ -126,7 +126,7 @@
         <button class="sb-item" data-view="what"><span class="ic"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 5-9 5-9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg></span> What it is</button>
         <button class="sb-item" data-view="backbone"><span class="ic"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/><path d="M7 12h3M14 12h3"/></svg></span> The backbone</button>
         <button class="sb-item" data-view="compare"><span class="ic"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v18M5 8l-3 6h6zM19 8l-3 6h6zM5 8V6M19 8V6M5 6h14"/></svg></span> How it compares</button>
-        <button class="sb-item" data-view="integrations"><span class="ic"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v1"/><path d="M18 8h4a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-4"/><circle cx="8" cy="12" r="2"/></svg></span> Integrations <span class="badge">32+</span></button>
+        <button class="sb-item" data-view="integrations"><span class="ic"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v1"/><path d="M18 8h4a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-4"/><circle cx="8" cy="12" r="2"/></svg></span> Integrations <span class="badge">30+</span></button>
         <button class="sb-item" data-view="visual"><span class="ic"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h3l2-6 4 14 3-9 2 3h4"/></svg></span> Visual</button>
         <button class="sb-item" data-view="swarm"><span class="ic"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></span> Swarm</button>
 
@@ -163,11 +163,12 @@
                 <span class="ov-install"><span class="p">$</span><code id="brew-cmd">brew install berkayturanci/keel/keel</code><button class="hi-copy" type="button" data-copy="brew install berkayturanci/keel/keel" data-copy-target="#brew-cmd" aria-label="Copy brew install command"><span>copy</span></button></span>
                 <span class="ov-install"><span class="p">$</span><code id="install-cmd">pip install keel-workflow</code><button class="hi-copy" type="button" data-copy="pip install keel-workflow" data-copy-target="#install-cmd" aria-label="Copy pip install command"><span>copy</span></button></span>
               </div>
-              <p class="ov-plugin">In Claude Code? Install it as a plugin — no <code class="plain">pip</code> required:
-                <span class="ov-install"><span class="p">&gt;</span><code id="plugin-cmd">/plugin install keel</code><button class="hi-copy" type="button" data-copy="/plugin install keel" aria-label="Copy plugin install command"><span>copy</span></button></span>
+              <p class="ov-plugin">Then put it in front of your agent as a plugin — Claude Code, Codex, Antigravity and Cursor each have their own command, and their own update path (<a href="https://github.com/berkayturanci/keel/blob/main/docs/keel/install.md">all four</a>). The plugin replaces the <code class="plain">install-adapter</code> step, not the CLI: the commands it ships shell out to <code class="plain">keel</code>. In Claude Code:
+                <span class="ov-install"><span class="p">&gt;</span><code id="plugin-cmd">/plugin marketplace add berkayturanci/keel</code><button class="hi-copy" type="button" data-copy="" data-copy-target="#plugin-cmd" aria-label="Copy the marketplace command"><span>copy</span></button></span>
+                <span style="display:block;margin-top:.35rem;font-size:.82rem;color:var(--faint)">…then <code class="plain">/plugin install keel</code>. Two steps: registering the marketplace does not install the plugin.</span>
               </p>
               <p class="ov-plugin">Or pin a release:
-                <span class="ov-install"><span class="p">$</span><code id="pin-cmd">pip install "git+https://github.com/berkayturanci/keel@v1.19.2"</code><button class="hi-copy" type="button" data-copy="" data-copy-target="#pin-cmd" aria-label="Copy pinned install command"><span>copy</span></button></span>
+                <span class="ov-install"><span class="p">$</span><code id="pin-cmd">pip install "git+https://github.com/berkayturanci/keel@v1.23.1"</code><button class="hi-copy" type="button" data-copy="" data-copy-target="#pin-cmd" aria-label="Copy pinned install command"><span>copy</span></button></span>
               </p>
               <p class="ov-badges">
                 <a href="https://github.com/berkayturanci/keel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/berkayturanci/keel/ci.yml?branch=main&amp;label=CI&amp;logo=githubactions&amp;logoColor=white" alt="CI" loading="lazy"></a>
@@ -319,30 +320,30 @@
           <div class="view-head">
             <p class="view-kicker green">Ecosystem &amp; Compatibility</p>
             <h1>Installs into the tools you already use.</h1>
-            <p>One project-neutral workflow core registers everywhere: <strong>12 AI assistants · 8 LLM backends · 6 engineering skill libraries · GitHub Actions &amp; MCP</strong>. Zero runtime lock-in, on-device, Apache-2.0.</p>
+            <p>One project-neutral workflow core registers everywhere: <strong>12 AI assistants · 6 LLM backends · 6 engineering skill libraries · GitHub Actions &amp; MCP</strong>. Zero runtime lock-in, on-device, Apache-2.0.</p>
           </div>
 
           <!-- Controls: Category Filter Tabs + Search -->
           <div class="integ-toolbar">
             <div class="integ-pills" role="radiogroup" aria-label="Filter integrations by category">
-              <button type="button" class="integ-pill active" data-cat="all" role="radio" aria-checked="true">All <span class="integ-count-badge">32</span></button>
+              <button type="button" class="integ-pill active" data-cat="all" role="radio" aria-checked="true">All <span class="integ-count-badge">30</span></button>
               <button type="button" class="integ-pill" data-cat="assistants" role="radio" aria-checked="false">AI Assistants <span class="integ-count-badge">12</span></button>
-              <button type="button" class="integ-pill" data-cat="backends" role="radio" aria-checked="false">LLM Backends <span class="integ-count-badge">8</span></button>
+              <button type="button" class="integ-pill" data-cat="backends" role="radio" aria-checked="false">LLM Backends <span class="integ-count-badge">6</span></button>
               <button type="button" class="integ-pill" data-cat="skills" role="radio" aria-checked="false">Skill Packs &amp; Tools <span class="integ-count-badge">6</span></button>
               <button type="button" class="integ-pill" data-cat="platforms" role="radio" aria-checked="false">Platforms &amp; CI <span class="integ-count-badge">6</span></button>
             </div>
             <div class="integ-search-wrap">
               <label for="integrations-search" class="sr-only">Search integrations</label>
-              <input type="search" id="integrations-search" class="integ-search" placeholder="Search 32+ integrations (e.g. Cursor, Claude, Ollama, Addy Osmani)...">
+              <input type="search" id="integrations-search" class="integ-search" placeholder="Search 30+ integrations (e.g. Cursor, Claude, Ollama, Addy Osmani)...">
             </div>
           </div>
 
           <div class="integ-status-bar">
-            <span id="integrations-count" class="integ-status-text">Showing 32 integrations</span>
+            <span id="integrations-count" class="integ-status-text">Showing 30 integrations</span>
           </div>
 
           <!-- Interactive Grid Container -->
-          <div class="integ-grid" id="integrations-grid" aria-live="polite"></div>
+          <div class="integ-grid" id="integrations-grid"></div>
         </section>
 
         <!-- Commands -->
@@ -355,7 +356,7 @@
               <div class="show-detail" id="show-detail" role="tabpanel" tabindex="0"></div>
             </div>
           </div>
-          <p class="cmd-note" style="margin-top:1.6rem;font-size:.82rem;color:var(--faint);font-style:italic">Examples are illustrative — each command reads its values from .keel/project.yaml. Install them with <code style="font-family:var(--font-mono)">keel install-adapter all</code> or the Claude Code plugin.</p>
+          <p class="cmd-note" style="margin-top:1.6rem;font-size:.82rem;color:var(--faint);font-style:italic">Examples are illustrative — each command reads its values from .keel/project.yaml. Install them with <code style="font-family:var(--font-mono)">keel install-adapter all</code> or the <a href="https://github.com/berkayturanci/keel/blob/main/docs/keel/install.md" style="color:inherit">agent plugin</a>.</p>
         </section>
 
         <!-- CLI -->
@@ -373,27 +374,47 @@ keel ship     &lt;cfg&gt; --root .  <span class="cm"># dry assessment → decisi
 
         <!-- Configuration -->
         <section class="view" id="view-config" data-view="config">
-          <div class="view-head"><p class="view-kicker brass">Layer 2 · values, not copied commands</p><h1>Configured with a small project.yaml</h1><p>A keel consumer is driven by values. Unknown keys are rejected by the bundled schema, so the reference is intentionally strict.</p></div>
+          <div class="view-head"><p class="view-kicker brass">Layer 2 · values, not copied commands</p><h1>Configured with a small project.yaml</h1><p>A keel consumer is driven by values. Unknown keys are rejected by the bundled schema, so the reference is intentionally strict. <code>knobs.team</code> states the whole team — who implements, who gives the mandatory gate review from a different vendor, who reviews at each risk tier (or <code>jury</code>, when the cross-vendor panel <b>is</b> the review) and who applies the findings — and <code>knobs.implement_mode: tdd</code> makes s4 test-first, while <code>knobs.loop</code> gives the implementation up to <code>max_iterations</code> gate-judged passes — with <code>tdd</code>, only the implementation phase; the tests are written once.</p></div>
           <div class="split">
             <div class="cfg-keys" id="cfg-keys"></div>
             <div class="codewrap">
               <button class="code-copy" type="button" data-copy="see docs" data-copy-target="#code-yaml" aria-label="Copy YAML example"><span>copy</span></button>
-              <pre class="code" id="code-yaml" tabindex="0" role="region" aria-label="Project YAML configuration example"><code><span class="k">core</span>: <span class="s">"^1.0"</span>
+              <pre class="code" id="code-yaml" tabindex="0" role="region" aria-label="Project YAML configuration example"><code><span class="k">extends</span>: <span class="s">keel</span>
+<span class="k">core_version</span>: <span class="s">"^1.0"</span>
 <span class="k">base_branch</span>: <span class="s">main</span>
 <span class="k">timezone</span>: <span class="s">Europe/Istanbul</span>
 <span class="k">merge_window</span>: <span class="s">"07:00-01:30"</span>
 
-<span class="k">gates</span>:
-  <span class="k">build</span>: <span class="s">make test</span>
-  <span class="k">lint</span>:  <span class="s">make lint</span>
+<span class="k">gates</span>: [<span class="s">build</span>, <span class="s">lint</span>]   <span class="cm"># gate names; the commands are knobs</span>
+
+<span class="k">knobs</span>:
+  <span class="k">build_gate_cmd</span>: <span class="s">make test</span>
+  <span class="k">lint_cmd</span>: <span class="s">make lint</span>
+  <span class="k">tier3_globs</span>: [<span class="s">"src/keel/orchestrator.py"</span>]
+  <span class="k">implement_mode</span>: <span class="s">tdd</span>  <span class="cm"># test-first s4 + tdd-order gate</span>
+  <span class="k">loop</span>:               <span class="cm"># with tdd: re-runs the implementation phase only</span>
+    <span class="k">max_iterations</span>: <span class="s">3</span>   <span class="cm"># still red after 3 passes: the issue blocks</span>
+  <span class="k">team</span>:               <span class="cm"># the whole team, as values</span>
+    <span class="k">implement</span>:
+      <span class="k">default</span>: { <span class="k">provider</span>: <span class="s">claude</span> }
+    <span class="k">gate</span>:            <span class="cm"># a different vendor, always</span>
+      <span class="k">provider</span>: <span class="s">codex</span>
+      <span class="k">distinct_from</span>: <span class="s">implementer</span>
+    <span class="k">review</span>:
+      <span class="k">by_tier</span>:
+        <span class="s">"2"</span>: [{ <span class="k">provider</span>: <span class="s">claude</span> }]
+        <span class="s">"3"</span>: <span class="s">jury</span>     <span class="cm"># the panel IS the review</span>
+    <span class="k">fix</span>: { <span class="k">provider</span>: <span class="s">implementer</span> }
 
 <span class="k">extensions</span>:          <span class="cm"># add-only Lego</span>
   <span class="k">pre-merge</span>:
     - <span class="s">design-parity-gate</span>
 
 <span class="k">policy_pack</span>:
-  <span class="k">labels</span>: [<span class="s">bug</span>, <span class="s">feature</span>, <span class="s">flake</span>]
-  <span class="k">tier3_globs</span>: [<span class="s">"src/keel/orchestrator.py"</span>]</code></pre>
+  <span class="k">name</span>: <span class="s">my-project</span>
+  <span class="k">labels</span>:
+    <span class="k">status</span>: [<span class="s">status:backlog</span>, <span class="s">status:in-progress</span>]
+    <span class="k">role</span>: [<span class="s">core</span>, <span class="s">docs</span>]</code></pre>
             </div>
           </div>
         </section>
@@ -413,7 +434,7 @@ keel ship     &lt;cfg&gt; --root .  <span class="cm"># dry assessment → decisi
                   <svg aria-hidden="true" class="anchor-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2"/><path d="M12 7v13M8 11H5a7 7 0 0 0 14 0h-3M5 12H3M21 12h-2"/></svg>
                   MERGED — issue #142 closed
                 </div>
-                <button class="replay" id="replay" type="button"><span aria-hidden="true">↻</span> replay the run</button>
+                <button class="replay" id="replay" type="button" aria-label="Replay the run animation"><span aria-hidden="true">↻</span> replay the run</button>
               </div>
             </div>
           </div>
