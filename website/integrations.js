@@ -72,7 +72,7 @@
       name: "Devin / External Agents",
       category: "assistants",
       badge: "Autonomous Agent",
-      desc: "Autonomous coding agent runs gated by Keel merge lock, review cycles, and 3-vendor jury.",
+      desc: "Autonomous coding agent runs gated by Keel's merge lock, review cycles, and the review-evidence gate.",
       cmd: "keel ship .keel/project.yaml --issue 101 --live",
       logo: "logos/devin.png"
     },
@@ -131,7 +131,7 @@
       category: "assistants",
       badge: "Autonomous Agent",
       desc: "Lightweight autonomous agent runner dispatched across parallel Swarm isolated worktrees.",
-      cmd: "keel swarm-run .keel/project.yaml --delegate hermes",
+      cmd: "keel swarm-run .keel/project.yaml --issues 12,15 --delegate hermes",
       note: "Needs a <code>knobs.delegate_profiles.hermes</code> entry naming the agent's binary — keel ships no profile for it. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
       logo: "logos/hermes.png"
     },
@@ -225,8 +225,8 @@
       id: "ai-jury",
       name: "Multi-Vendor AI Jury",
       category: "skills",
-      badge: "Consensus Engine",
-      desc: "Independent 3-vendor jury panel (Anthropic + OpenAI + Google) ensuring unanimous pre-merge verdicts.",
+      badge: "Cross-Vendor Review",
+      desc: "Cross-vendor review panel (e.g. Anthropic + OpenAI + Google); keel can dispatch it as the tier-3 review and gate the merge on its pinned ballots.",
       cmd: "keel ship .keel/project.yaml --jury",
       logo: "logos/jury.svg"
     },

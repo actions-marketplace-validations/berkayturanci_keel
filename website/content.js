@@ -66,7 +66,7 @@ window.KEEL = {
       cmd: "keel:swarm",
       one: "Multi-agent swarm coordinator — cluster backlog issues, run parallel waves, and batch land.",
       detail:
-        "Clusters backlog issues into disjoint execution waves based on static file-overlap and explicit DAG dependencies. Spawns parallel workers across isolated git worktrees (.keel/worktrees/swarm/), supports cross-model agent routing (Claude, Gemini, Codex, DeepSeek, Local Ollama), unifies reviews under the AI Jury consensus panel, and executes dual-mode batch landing under the merge lock with self-healing conflict rollback.",
+        "Clusters backlog issues into disjoint execution waves based on static file-overlap of predicted scopes. Spawns parallel workers across isolated git worktrees (.keel/worktrees/<swarm_id>/<cluster_id>/), supports cross-model agent routing (Claude, Gemini, Codex, DeepSeek, Local Ollama), reviews each cluster inside its own keel ship — which on tier-3 can be the cross-vendor AI Jury panel — and holds every branch behind a per-branch review-evidence check before sequential git merge --no-ff landing under the merge lock.",
     },
     {
       slug: "implement", name: "/keel:implement", group: "Per-step", featured: true, scene: "implement",
@@ -188,11 +188,11 @@ window.KEEL = {
     ["keel init [--wizard]", "scaffold .keel/project.yaml (detects the stack)"],
     ["keel validate <cfg>", "validate a config (and its extensions) against the schema"],
     ["keel plan <cfg> [--live --json]", "render the backbone + the full structured command contract; --live runs the s0 consent preflight"],
-    ["keel swarm-plan <cfg> --issues 12,15", "cluster backlog issues into disjoint execution waves and compute batch vs funnel landing plan"],
-    ["keel swarm-status <cfg>", "real-time multi-cluster execution snapshot, worker health, and DAG progress"],
-    ["keel swarm-run <cfg> --issues 12,15", "orchestrate parallel workers in isolated worktrees with dynamic rebalancing"],
-    ["keel swarm-land <cfg> --wave 1", "dual-mode batch landing under merge lock with self-healing conflict rollback"],
-    ["keel-visual swarm", "live 2D DAG graph and 3D spatial worktree topology dashboard"],
+    ["keel swarm-plan <cfg> --issues 12,15", "cluster backlog issues into conflict-free execution waves from their predicted scopes"],
+    ["keel swarm-status <cfg>", "multi-cluster status snapshot — each cluster's lead, difficulty band, and running/passed/failed state"],
+    ["keel swarm-run <cfg> --issues 12,15", "orchestrate parallel workers in isolated worktrees, rebalancing the plan when a cluster fails"],
+    ["keel swarm-land <cfg> --wave 1", "merge a wave's cluster branches sequentially under the merge lock, aborting on conflict"],
+    ["keel-visual swarm", "2D DAG and pseudo-3D spatial worktree topology, rendered as a snapshot"],
     ["keel run-gates <cfg>", "run the project's build / lint / command gates"],
     ["keel window <cfg>", "is the merge window open right now?"],
     ["keel ship <cfg>", "full dry assessment: tier, window, gates, decision"],
@@ -258,7 +258,7 @@ window.KEEL = {
   faq: [
     ["Do projects ever fork the backbone?", "No — that's the whole point. The ordered step machine and its invariants live in keel-core, which is installed and pinned, never copied. Projects only ever touch Layer 2 (values in project.yaml) and Layer 3 (add-only extensions). Changing the backbone is a keel-core change."],
     ["What does a command actually read?", "Every command is project-neutral. It never hardcodes a branch, build/lint command, agent, glob, timezone or window — it references the knob by name and asks the keel CLI for the value, so the same /keel:ship behaves differently in each repo purely from that repo's .keel/project.yaml."],
-    ["What's the jury gate?", "An opt-in review gate that runs the <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>ai-jury</a> multi-agent reviewer on the diff when it's installed, and is a fail-soft no-op otherwise. It snaps into the s7 review step."],
+    ["What's the jury gate?", "An opt-in review gate: add <code>jury</code> to your project's <code>gates:</code> list (off by default), and it runs the <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>ai-jury</a> multi-agent reviewer on the diff when the <code>jury</code> binary is installed — a fail-soft no-op otherwise. It runs at the gate phase (s8), beside build and lint."],
     ["Who implements, reviews and fixes — and can I change it?", "<code>knobs.team</code> states the whole team as values: the implementer per issue role (with model and reasoning effort), one mandatory gate reviewer from a <i>different</i> vendor, the reviewer seats for each risk tier, and the seat that applies the findings in the s9 fix loop. <code>keel plan</code> / <code>keel ship --json</code> render it as one resolved <code>assignment</code>, so every host runs the same team, and <code>keel validate</code> refuses a policy keel cannot execute — an unknown provider, a reasoning effort a vendor has no spelling for, or a gate reviewer that is the implementer. <code>--team &lt;profile&gt;</code> and <code>--effort</code> pick a named bench for one run."],
     ["Can the jury panel be the review itself, not an extra gate?", "Yes — set a tier's seats to the string <code>jury</code> (<code>knobs.team.review.by_tier.\"3\": jury</code>) and s7 dispatches the <a href='https://github.com/berkayturanci/ai-jury' target='_blank' rel='noopener'>ai-jury</a> panel <b>once</b> instead of running host readers beside it. <code>keel review --from-jury &lt;report.json&gt;</code> then turns the panel's report into the run's public evidence: one head-pinned review verdict per panelist ballot, carrying the vendor and model that produced it, plus the panel's consensus record — in one call, so everything is pinned to the same head SHA. The panel's <i>verified</i> findings are what the fix loop receives. Adopt it deliberately: on a panel tier no per-run flag can take the panel back off."],
     ["Can keel write the tests first?", "Yes. <code>knobs.implement_mode: tdd</code> (or <code>--tdd</code> for one run) splits s4 into two phases — a test-only commit carrying the issue's acceptance criteria, then the implementation — and s8 gains the pure, blocking <code>tdd-order</code> gate, which checks that commit order against the project's <code>test_groups</code> paths. So “tests first” is verified, not asserted."],
@@ -394,12 +394,12 @@ window.KEEL = {
     },
     {
       group: "Architecture", title: "Keel Swarm (Multi-Agent Concurrency & Cross-Model Topology)", slug: "swarm",
-      summary: "High-concurrency multi-agent orchestration — static DAG clustering, isolated git worktrees, cross-model routing, and dual-mode batch landing.",
+      summary: "High-concurrency multi-agent orchestration — static DAG clustering, isolated git worktrees, cross-model routing, and single-writer batch landing.",
       body:
         "<p><b>Keel Swarm</b> is Keel's high-concurrency multi-agent orchestration subsystem. While <code>/keel:ship</code> drives a single issue linearly, <code>/keel:swarm</code> clusters a list or backlog of issues into disjoint execution waves and executes them across isolated git worktrees in parallel.</p>" +
         "<h3>1. Static Dependency DAG & Wave Partitioning</h3>" +
-        "<p>Swarm computes file-overlap conflict graphs and explicit issue dependencies (<code>blocks #N</code> / <code>depends on #N</code>) without executing code. Orthogonal clusters are scheduled in parallel in <b>Wave 1</b>, while dependent or overlapping clusters are sequenced into subsequent waves (<code>Wave 2</code>, <code>Wave 3</code>).</p>" +
-        "<h3>2. Cross-Model Routing & Unified AI Jury Panel</h3>" +
+        "<p>Swarm computes file-overlap conflict graphs from each issue's predicted scope, without executing code; a cluster's dependencies are derived from that overlap. Orthogonal clusters are scheduled in parallel in <b>Wave 1</b>, while dependent or overlapping clusters are sequenced into subsequent waves (<code>Wave 2</code>, <code>Wave 3</code>).</p>" +
+        "<h3>2. Cross-Model Routing & Per-Cluster Review</h3>" +
         "<p>Different clusters can be assigned to different models and agent vendors concurrently via <code>knobs.team.implement.by_role</code> and <code>knobs.delegate_profiles</code>:</p>" +
         "<ul>" +
         "<li><b>Core / Architecture</b>: Claude 3.7 Sonnet / Claude Code (<code>claude</code>)</li>" +
@@ -407,15 +407,15 @@ window.KEEL = {
         "<li><b>Documentation / Scripts</b>: OpenAI GPT-4o / Codex (<code>codex</code> / <code>openai-api:</code>)</li>" +
         "<li><b>Local / Offline Worktrees</b>: Local Ollama / vLLM (<code>ollama:qwen2.5-coder</code>)</li>" +
         "</ul>" +
-        "<p>Regardless of which model authored the PR, every cluster goes through the cross-vendor <b>AI Jury</b> panel (Anthropic + OpenAI + Google) for unanimous review consensus before merging.</p>" +
-        "<h3>3. Dual-Mode Landing</h3>" +
-        "<p>Swarm supports two landing strategies under the single-writer <code>merge_lock</code>:</p>" +
+        "<p>Each cluster is reviewed inside its own <b>keel ship</b> run — on tier-3 work that can be the cross-vendor <b>AI Jury</b> panel (e.g. Anthropic + OpenAI + Google) — and no branch lands until it clears the review-evidence gate, whichever model authored it.</p>" +
+        "<h3>3. Single-Writer Batch Landing</h3>" +
+        "<p>Swarm lands every wave the same way under the single-writer <code>merge_lock</code>:</p>" +
         "<ul>" +
-        "<li><b>Direct Orthogonal Batch Landing</b>: Disjoint branches with zero file collisions are squashed directly into the base branch without intermediate rebases.</li>" +
-        "<li><b>Adaptive Atomic Funnel</b>: Overlapping clusters trigger a self-healing git rebase onto the newly merged base branch, re-running gates before completing the merge. Conflicts trigger an immediate safe rollback (<code>git rebase --abort</code>).</li>" +
+        "<li><b>Direct Orthogonal Batch Landing</b>: Disjoint branches with zero file collisions are merged into the base branch with <code>git merge --no-ff</code>, sequentially under the merge lock, with no rebases.</li>" +
+        "<li><b>Why one mode</b>: the planner only puts mutually disjoint clusters in a wave, so landing never needs a rebase. <code>swarm_landing.py</code> also implements an adaptive rebase funnel (marker-resolver healing, hold-and-rewind), but no <code>swarm-land</code> invocation selects it — it is reachable only from the library.</li>" +
         "</ul>" +
-        "<h3>4. Live 2D & 3D Spatial Dashboard</h3>" +
-        "<p><code>keel-visual swarm</code> renders real-time interactive DAG topological graphs and 3D spatial node networks in the terminal or browser, tracking worker progress, cluster state, and landing queues live.</p>",
+        "<h3>4. 2D & Pseudo-3D Spatial Snapshot</h3>" +
+        "<p><code>keel-visual swarm</code> renders an interactive DAG topological graph and a pseudo-3D spatial node view as an HTML page, showing the plan's waves, each cluster's running/passed/failed state, and the run's landing mode. It is a rendered snapshot — re-run to refresh.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/docs/keel/swarm.md",
     },
     {

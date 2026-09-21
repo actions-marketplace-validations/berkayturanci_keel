@@ -441,7 +441,7 @@
       stage.appendChild(el("div", "sc-lab", "multi-agent swarm · DAG wave clustering & batch landing"));
       var plan = el("div", "lanes");
       var w1 = el("div", "chip", '<span class="dot"></span>Wave 1 · Direct Orthogonal Batch<span class="meta">2 parallel clusters</span>');
-      var w2 = el("div", "chip muted", '<span class="dot"></span>Wave 2 · Adaptive Atomic Funnel<span class="meta">1 cluster (rebase)</span>');
+      var w2 = el("div", "chip muted", '<span class="dot"></span>Wave 2 · Direct Batch<span class="meta">1 cluster</span>');
       plan.appendChild(w1); plan.appendChild(w2);
       stage.appendChild(plan);
 
@@ -467,7 +467,7 @@
       stage.appendChild(cap); var capt = cap.querySelector("span:last-child");
 
       at(600, function () {
-        capt.textContent = "Wave 1 running in parallel worktrees (.keel/worktrees/swarm/)…";
+        capt.textContent = "Wave 1 running in parallel worktrees (.keel/worktrees/<swarm_id>/)…";
         fills[0].fill.style.width = "70%";
         fills[1].fill.style.width = "70%";
       });
@@ -482,14 +482,14 @@
         w1.classList.add("done");
         w2.classList.remove("muted"); w2.classList.add("work");
         fills[2].lane.classList.remove("muted");
-        fills[2].out.textContent = "rebasing"; fills[2].fill.style.width = "40%";
-        capt.textContent = "Wave 2: Self-healing rebase & funnel merge…";
+        fills[2].out.textContent = "merging"; fills[2].fill.style.width = "40%";
+        capt.textContent = "Wave 2: merging the dependent cluster under the lock…";
       });
 
       at(3800, function () {
         fills[2].fill.style.width = "100%"; fills[2].out.textContent = "merged"; fills[2].lane.classList.add("done");
         w2.classList.remove("work"); w2.classList.add("done");
-        cap.classList.add("ok"); capt.textContent = "✓ Swarm complete: 3 clusters landed · 0 conflicts · AI Jury unanimous";
+        cap.classList.add("ok"); capt.textContent = "✓ Swarm complete: 3 clusters landed · 0 conflicts · review gate passed";
       });
 
       at(6000, loop);

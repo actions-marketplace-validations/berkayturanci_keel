@@ -55,16 +55,17 @@ Changing the backbone is a keel-core change. Projects only ever touch layers 2�
 
 - **One backbone, every agent** — install once; `/keel:<command>` runs as native Claude commands
   *and* as a single shared skill set every other agent (Codex, Antigravity, Gemini) reads.
-- **High-concurrency Swarm orchestration** — cluster entire backlogs into topological dependency waves, execute disjoint clusters in isolated git worktrees, and land batches through orthogonal fast-forward merges or drift self-healing funnel rebases ([guide](docs/keel/swarm.md)).
+- **High-concurrency Swarm orchestration** — cluster entire backlogs into topological dependency waves, execute disjoint clusters in isolated git worktrees, and land them under a single-writer merge lock with sequential `git merge --no-ff` ([guide](docs/keel/swarm.md)).
 - **Project Lego + policy packs** — snap gates/steps into named hooks (`guard`, `tester`,
   `pre-merge`, …) and keep labels, path policy, health sources, local commands, and
   workflow preferences in `policy_pack` data instead of packaged command prose.
 - **Security presets** — declarative `policy_pack.presets: ["bandit", "gitleaks", "semgrep", "trivy"]`
   automatically slot SAST, secret scanning, and vulnerability auditing into the pipeline.
-- **Opt-in `jury` gate** — runs the [ai-jury](https://github.com/berkayturanci/ai-jury) multi-agent
-  reviewer on the diff when installed; a fail-soft no-op otherwise. Core resolves the mode from
-  the panel that actually ran: a cross-vendor gate needs ≥2 distinct vendors, so a short panel
-  downgrades to advisory instead of blocking on a jury that never convened.
+- **Opt-in `jury` gate** — add `jury` to your project's `gates:` list (off by default). Once
+  listed, it runs the [ai-jury](https://github.com/berkayturanci/ai-jury) multi-agent reviewer on
+  the diff when the `jury` binary is installed, or is a fail-soft no-op otherwise. Core resolves the
+  mode from the panel that actually ran: a cross-vendor gate needs ≥2 distinct vendors, so a short
+  panel downgrades to advisory instead of blocking on a jury that never convened.
 - **…or the panel *is* the review** — set `knobs.team.review.by_tier."3": jury` and s7 dispatches
   ai-jury **once** instead of running host reviewers beside it. `keel review --from-jury
   <report.json>` turns each panelist's ballot into a head-pinned `keel.review-verdict.v1` with the
@@ -480,7 +481,7 @@ If a step's gate fails, keel blocks its own merge — the same backbone every co
 - [`docs/keel/operator-consent.md`](docs/keel/operator-consent.md) — live-run operator consent scopes and delegated-agent scope rules
 - [`docs/keel/cli.md`](docs/keel/cli.md) — CLI reference
 - [`docs/keel/commands.md`](docs/keel/commands.md) — the 17 `/keel:<command>` workflows (plus the `keel status` progress command), each with its description
-- [`docs/keel/swarm.md`](docs/keel/swarm.md) — multi-agent swarm architecture, dependency DAG wave scheduling, isolated worktrees, dual-mode landing, and 2D/3D visualizer
+- [`docs/keel/swarm.md`](docs/keel/swarm.md) — multi-agent swarm architecture, dependency DAG wave scheduling, isolated worktrees, single-writer batch landing, and the 2D/pseudo-3D snapshot visualizer
 - [`docs/keel/cutover.md`](docs/keel/cutover.md) — staged guide to retire a project's copied command bodies (install → verify → retire), losing nothing
 - [`docs/keel/comparison.md`](docs/keel/comparison.md) — competitive landscape (Mergify, GitHub merge queue, Qodo/PR-Agent, CodeRabbit, Sweep, OpenHands, Danger, …) + ranked borrow-ideas
 - [`docs/keel/github-actions.md`](docs/keel/github-actions.md) — run keel live on GitHub's free runner (the `keel-ship` workflow)
