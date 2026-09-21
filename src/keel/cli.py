@@ -6164,8 +6164,14 @@ def _cmd_project_commands(args: argparse.Namespace) -> int:
     return 0
 
 
-def _ask(prompt: str, default: str) -> str:  # pragma: no cover - interactive I/O
-    raw = input(f"{prompt} [{default}]: " if default else f"{prompt}: ").strip()
+def _ask(prompt: str, default: str) -> str:
+    try:
+        raw = input(f"{prompt} [{default}]: " if default else f"{prompt}: ").strip()
+    except EOFError:
+        # No interactive input (stdin closed/piped, or a CI runner): take the default, exactly
+        # as an empty answer would. A `--wizard` run with no TTY then produces the all-defaults
+        # config instead of crashing with an unhandled EOFError (#1247).
+        return default
     return raw or default
 
 
@@ -6195,13 +6201,14 @@ def _cmd_init(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    repo = root.resolve().name
+    owner, repo = _derive_owner_repo(root)
     try:
         if getattr(args, "auto", False):
-            text, meta = scaffold.auto_detect_config(root, repo=repo)
+            text, meta = scaffold.auto_detect_config(root, repo=repo, owner=owner)
             stack = meta["stack"]
             print("keel init --auto")
             print(f"  stack        : {meta['stack']} ({meta['platform']})")
+            print(f"  owner/repo   : {(owner + '/' if owner else '') + repo}")
             print(f"  base branch  : {meta['base_branch']}")
             print(f"  build gate   : {meta['build_cmd']}")
             if meta.get("lint_cmd"):
@@ -6209,10 +6216,20 @@ def _cmd_init(args: argparse.Namespace) -> int:
         elif args.wizard:
             stack = scaffold.detect_stack(root)
             print(f"keel init wizard — detected stack: {stack} (Enter accepts each default)")
-            text = scaffold.wizard(stack, _ask, repo=repo, catalog=_wizard_catalog(), notify=_warn)
+            text = scaffold.wizard(
+                stack,
+                _ask,
+                repo=repo,
+                owner=owner,
+                base_default=scaffold.detect_base_branch(root),
+                catalog=_wizard_catalog(),
+                notify=_warn,
+            )
         else:
             stack = scaffold.detect_stack(root)
-            text = scaffold.default_config(stack, repo=repo)
+            text = scaffold.default_config(
+                stack, repo=repo, owner=owner, base_branch=scaffold.detect_base_branch(root)
+            )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -6228,16 +6245,39 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _derive_owner_repo(root: Path) -> tuple[str | None, str]:
+    """``(owner, repo)`` for a scaffolded config, from origin's URL when it names a pair.
+
+    A fresh scaffold that set ``repo`` to the directory name and no ``owner`` produced a config
+    whose live evidence and merge runs exit 1 (`_owner_repo` needs both). Reading them from the
+    ``origin`` remote fills both for the common case (a clone). With no remote, or a URL that
+    names no pair, it falls back to ``(None, <directory name>)`` — the old behaviour, and one
+    ``keel validate`` still accepts — so the operator sets ``owner`` by hand (#1247).
+    """
+    fallback_repo = root.resolve().name
+    pair = git.owner_repo_from_url(git.remote_url("origin", cwd=str(root)))
+    return pair if pair is not None else (None, fallback_repo)
+
+
 def _render_scaffolded_config(root: Path, *, wizard: bool) -> tuple[str, str]:
     stack = scaffold.detect_stack(root)
-    repo = root.resolve().name
+    owner, repo = _derive_owner_repo(root)
+    base_branch = scaffold.detect_base_branch(root)
     if wizard:
         print(f"keel setup wizard — detected stack: {stack} (Enter accepts each default)")
         return (
-            scaffold.wizard(stack, _ask, repo=repo, catalog=_wizard_catalog(), notify=_warn),
+            scaffold.wizard(
+                stack,
+                _ask,
+                repo=repo,
+                owner=owner,
+                base_default=base_branch,
+                catalog=_wizard_catalog(),
+                notify=_warn,
+            ),
             stack,
         )
-    return scaffold.default_config(stack, repo=repo), stack
+    return scaffold.default_config(stack, repo=repo, owner=owner, base_branch=base_branch), stack
 
 
 def _report_install(surface: str, installed: list[str], skipped: list[str]) -> None:
