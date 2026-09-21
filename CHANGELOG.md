@@ -6,6 +6,9 @@ All notable changes to keel are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **Inspection commands no longer execute a program from the checkout they inspect** (#1247). `keel doctor` — documented read-only — resolved the make gate's interpreter by running the project's `scripts/find_python.sh`, and the provider probe behind `keel doctor --providers`, `keel plan` and `keel swarm-plan` ran `<delegate_profiles.*.command> --version`. Both commands come from the inspected project's `.keel/project.yaml`, so pointing keel at a cloned repo or a fork's pull-request branch executed a program that repo shipped. Doctor now resolves the interpreter from `PY` or PATH `python3` and never runs the resolver; the probe refuses a `command` that is a relative path (a PATH name or an absolute path still probes). `tests/test_providerprobe_untrusted_command.py` and `tests/test_doctor.py` pin both.
+
 ### Changed
 - **keel-ship.dev reports into an analytics site of its own** (#1245).
   - **Before.** All five pages carried a Cloudflare Web Analytics token created in June for `berkayturanci.github.io`. The sibling project's site and two github.io project pages carried it too, so one dashboard mixed four properties. Nothing was lost — a token records a beacon from any host — but visits and Core Web Vitals could only be read per site through a Host filter.
@@ -13,6 +16,10 @@ All notable changes to keel are documented here. The format follows
   - **The guard.** A wrong token fails silently, because the beacon endpoint answers 204 either way. `tests/test_site_seo.py` requires every page to carry exactly one token, all pages to agree, and none to carry the shared one.
 
 ### Fixed
+- **The Quickstart commands run for a new user, and the install floor matches the package** (#1247).
+  - The README and site Quickstart told a fresh user to `keel validate projects/example-flutter.yaml` — a path that exists only inside a keel clone, so it failed with `MISSING`. They now use `.keel/project.yaml --root .` (the config `keel setup` just wrote), add `keel doctor`, show real output, and state the prerequisites (Python 3.11+, git, gh for a live run).
+  - `scripts/install.sh` accepted Python 3.10 though every release requires >=3.11; it now requires 3.11 and knows about 3.14.
+  - The site's VS Code/Cursor card and the editor docs advertised `code --install-extension berkayturanci.keel-vscode`, an extension not published to any registry — a publisher id anyone could register after launch and ship code to everyone who ran the command. The card and docs now build the extension from `editors/vscode/` instead; no unclaimed install id is advertised.
 - **A comment on a closed pull request no longer fails the evidence job on `main`'s head** (#1241).
   - **What broke.** `keel-ship.yml` re-runs the evidence gate on `issue_comment`, because a verdict is an issue comment. It did so for closed pull requests too. A closed pull request has no verdicts to find and often no attribution label, so that run could only fail — and a comment run is attributed to the default branch's head, so the red check landed on `main`.
   - **Measured.** After Dependabot closed five superseded pull requests, each with its usual comment, `main`'s healthy head carried six failed `keel evidence (verify)` checks; 22 of the last 100 `keel-ship` runs were comment-triggered failures.
