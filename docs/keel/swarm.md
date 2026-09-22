@@ -56,9 +56,15 @@ Keel Swarm is built on three core pillars:
    strictly immutable. Swarm does not alter or bypass backbone steps; instead, each parallel cluster
    worker executes a complete, standard `keel ship` run within its own isolated worktree.
 2. **Pure Core / Thin I/O Separation**: Dependency analysis, clustering, wave partitioning, and landing
-   decision logic are 100% pure and deterministic (`src/keel/swarm.py`). All filesystem, subprocess,
-   and git mutations are confined to thin fail-soft runtime wrappers (`src/keel/swarm_runtime.py`,
-   `src/keel/swarm_landing.py`).
+   decision logic are 100% pure and deterministic (`src/keel/swarm.py`). Every **subprocess and
+   git**
+   mutation is confined to thin fail-soft runtime wrappers (`src/keel/swarm_runtime.py`,
+   `src/keel/swarm_landing.py`) — but the filesystem is not: `resolve_swarm_state_dir` and
+   `save_swarm_state` in `swarm.py` `mkdir` and write `.keel/state/swarm/<swarm_id>.json`
+   (atomically
+   since [#932](https://github.com/berkayturanci/keel/issues/932); the `#872` in the code comment
+   beside it names an unrelated `gh api` fix). The separation the heading claims holds for the
+   process boundary, not for disk.
 3. **Deterministic Conflict Resolution**: Rather than naively merging branches or relying on LLMs
    to resolve arbitrary git merge conflicts, Swarm statically models predicted scopes, enforces
    worktree isolation, and keeps every wave's clusters mutually disjoint so landing never has to
@@ -191,10 +197,28 @@ knobs:
 ```
 
 ### Scope Prediction Heuristics
-- **Explicit Labels & Roles**: A recognised role maps to a deterministic glob — `docs` to
-  `docs/*`, `website` to `website/*`.
-- **Title / Body Keyword Parsing**: Mentions of files (`src/keel/*.py`, `tests/test_*.py`) or modules
-  automatically expand the predicted scope list.
+- **Title / Body Path Parsing**: a path written in the title or body expands the predicted scope —
+  `touch src/keel/*.py` yields `src/keel/*`. It is path matching, not language awareness, and it
+  cuts
+  both ways: `tests/test_*.py` yields nothing, because the extractor does not accept the `test_*`
+  segment — while a **backticked** module name is taken as a file. A bare `keel.swarm` yields
+  nothing,
+  but `` `keel.swarm` `` — how anyone writes a module in an issue — becomes the phantom path
+  `keel.swarm`. It suppresses the label fallback below, and it matches no real file, so the only
+  things it conflicts with are `*`, a `--declared-file` glob that happens to match it, and an
+  *identical* phantom. That last one is not an edge case — it is the **only** case a multi-issue
+  plan can produce, because nothing fetches an issue's own text: one backticked module in the shared
+  body gives every issue the same phantom, they all conflict, and the plan serialises into one wave
+  per issue —
+  the opposite of the isolation the path appears to describe. Measured: three issues, body
+  ``touch `keel.swarm` `` → three single-cluster waves. Check what a scope actually resolved to
+  with `swarm-plan --tree` rather
+  than assuming a mention was understood.
+- **Label / Role Fallback**: only when the text and `--declared-file` predicted *nothing*, a
+  substring match over the role **and every label** maps `docs`/`website`/`visual` to a directory
+  glob and `cli` to the single file `src/keel/cli.py`. Whatever it maps to is the same for every
+  issue in the run, which is why a shared label serialises the whole plan
+  ([#1274](https://github.com/berkayturanci/keel/issues/1274)).
 - **Disjointness Matrix**: If two issues touch non-overlapping directory trees or orthogonal subsystems,
   they are marked disjoint ($D_{ij} = 1$). If scopes intersect, a conflict edge is created ($C_{ij} = 1$).
 - **Topological Wave Partitioning**: Disjoint clusters are scheduled in Wave 1. Dependent or conflicting
@@ -244,19 +268,61 @@ keel swarm-run .keel/project.yaml --root . --issues 714,715,716,717 --live
 2. **Execution**: One **team lead** per cluster dispatches the implementer its `assignment`
    named, to execute the full `s0`–`s12` backbone. The lead appends the cluster's team to every
    child ship — `--delegate <implementer>`, one `--review-delegate` per staffed reviewer
-   slot, `--role`, and `--effort`/`--team` for the bench the cluster was staffed from — so
+   slot **whose seat is a provider** (a host-subagent seat gets no flag and the child re-resolves
+   it), `--role`, and `--effort`/`--team` for the bench the cluster was staffed from — so
    the child reproduces the parent's resolution instead of quietly deriving a different
    team from config alone. `keel ship` accepts all five.
 3. **Rebalancing on failure**: when a cluster's issue fails, `rebalance_swarm_plan` drops the
-   clusters carrying that issue from the remaining waves, so a failed prerequisite does not drag
-   later waves down; the independent, disjoint clusters proceed uninterrupted. (There is no runtime
-   scope audit — clusters are kept off each other's files by plan-time overlap partitioning and
-   per-worktree isolation, not by watching what a worker writes.)
-4. **Cleanup**: On completion or error, worktrees are pruned cleanly without leaving orphaned locks.
+   clusters carrying that issue and discards any wave left empty. **This does not do what it was
+   written for, and it is actively harmful.** Because the partition emits one issue per cluster, no
+   *remaining* wave ever carries the failed issue, so the drop is a no-op in every plan the CLI
+   builds. What is not a no-op is the discarded wave: `run_swarm_orchestration` iterates the wave
+   list by index, so when the failing cluster was alone in its wave the list shrinks underneath the
+   index and **the next, unrelated wave is skipped entirely** — its clusters finish the run as
+   `queued` — reported as `partial_failure`, or as `failed` when nothing else passed, and in
+   neither
+   case are they mentioned. Reproduced with three conflicting issues: issue 1 fails, the run
+   executes waves 1 and 3,
+   and `cluster-2-2` is never attempted. Being alone in its wave is sufficient but not
+   necessary — a two-cluster wave whose clusters both fail skips the next one too.
+
+   The positional loop came from [#893](https://github.com/berkayturanci/keel/pull/893), closing
+   [#873](https://github.com/berkayturanci/keel/issues/873), which asked for exactly that: before it
+   the loop iterated the original, immutable tuple and could skip nothing. So the skip is a
+   regression introduced by a correct fix, and iterating by identity again is the obvious direction.
+   Its test uses issue 101 in both waves
+   (`tests/test_swarm_runtime.py:272-273`), so it never sees an unrelated next wave. Tracked as
+   [#1268](https://github.com/berkayturanci/keel/issues/1268); the `queued` stranding is the same
+   bug, not the separate one [#1277](https://github.com/berkayturanci/keel/issues/1277) originally
+   described.
+
+   (There is also no runtime scope audit — clusters are kept off each other's files by plan-time
+   overlap partitioning and per-worktree isolation, not by watching what a worker writes.)
+4. **Cleanup**: partial, and only on a live run. `remove_swarm_worktree` runs
+   `git worktree remove --force` on the cluster's leaf directory (falling back to `rmtree`), and the
+   `finally` that calls it is guarded by `create_worktrees and not dry_run` — a dry run creates no
+   worktree to remove. Four things it does **not** do, each verified against
+   `src/keel/swarm_runtime.py`:
+
+   - the `.keel/worktrees/<swarm_id>/` parent directory is created by `mkdir(parents=True)` and
+     never
+     removed, so one directory per run accumulates;
+   - the `swarm/<swarm_id>/<cluster_id>` branch is never deleted — nothing in `src/keel` runs
+     `git branch -d/-D`. A re-run with the same `--swarm-id` therefore force-resets a surviving
+     branch, because the worktree is created with `git worktree add -B`;
+   - `git worktree prune` is never run, so a registration left behind by a failed remove stays in
+     `.git/worktrees`;
+   - `remove_swarm_worktree` returns `True` unconditionally and its caller discards the value, so a
+     failed cleanup is silent.
+
+   Nothing here manages locks, so "without leaving orphaned locks" — which this line claimed until
+   #1285 was audited — described a mechanism that does not exist. Tracked under
+   [#1278](https://github.com/berkayturanci/keel/issues/1278).
 
 ### Status board (`keel swarm-status`)
 Print the swarm's clusters — each one's lead, difficulty band, role, step and status
-(`running` / `passed` / `failed`) — from the persisted run state. It is a one-shot render of
+(`queued` / `running` / `passed` / `failed` / `merged` / `held` — the full vocabulary
+`SwarmWorkerStatus.status` carries) — from the persisted run state. It is a one-shot render of
 that state, not a live feed; re-run it to refresh:
 
 ```bash
@@ -326,7 +392,8 @@ keel-visual swarm .keel/project.yaml --root . --serve --port 8766
   pills, and role badges.
 - **Pseudo-3D Multi-Wave Topology**: An HTML5 Canvas renderer projecting the stacked wave layers as
   a pseudo-3D scene, with drag-to-rotate and scroll-to-zoom.
-- **Worker Matrix**: Worker cards showing each cluster's `running` / `passed` / `failed` state,
+- **Worker Matrix**: Worker cards showing each cluster's state —
+  `queued`/`running`/`passed`/`failed`/`merged`/`held` —
   its role badge, and the recorded `details` string.
 
 The rendered page is a snapshot of the run state at render time; re-run `keel-visual swarm` to
@@ -374,7 +441,7 @@ Swarm does not run a jury of its own. Review and learning happen inside each clu
 
 | Risk / Failure Scenario | Detection Mechanism | Fail-Soft Mitigation |
 | :--- | :--- | :--- |
-| **A cluster changes files another cluster also touches** | Plan-time static file-overlap partitioning (disjoint trees only share a wave) + isolated per-cluster worktrees | Overlapping clusters are sequenced into later waves; a failed cluster is dropped from the remaining waves. |
+| **A cluster changes files another cluster also touches** | Plan-time static file-overlap partitioning (disjoint trees only share a wave) + isolated per-cluster worktrees | Overlapping clusters are sequenced into later waves. The "failed cluster is dropped from the remaining waves" half is a no-op that skips the next wave instead — see item 3 above and [#1268](https://github.com/berkayturanci/keel/issues/1268). |
 | **Merge conflict during landing** | `git merge` non-zero exit code | Automatic `git merge --abort`; the base branch remains untouched; the cluster is reported `merge failed`. |
 | **Concurrent Merge Race Condition** | `merge_lock` file mutex | Atomic `mkdir`-based lock; a second writer raises `LockError` rather than retrying, so landing is single-writer by refusal. |
 | **Worker Subprocess Crash / OOM** | Subprocess exit status monitoring | Fail-soft error capture in `SwarmRunState`; remaining parallel workers continue unimpeded. |
