@@ -1,10 +1,49 @@
 ---
-description: Multi-agent swarm coordinator — cluster backlog issues, execute parallel waves in isolated worktrees, and land them under a single-writer merge lock.
+description: EXPERIMENTAL — a multi-agent swarm coordinator that clusters backlog issues, executes parallel waves in isolated worktrees, and lands them under a single-writer merge lock. Planning runs; a live run lands nothing yet (#1281). Use /keel:ship for work that must merge.
 argument-hint: "[issue numbers...] [--plan-only] [--tree] [--visual] [--delegate <provider>] [--review-delegate <provider>] [--effort <low|medium|high>] [--team <profile>]"
 allowed-tools: Bash(keel:*), Bash(git:*), Bash(gh:*), Bash(jury:*), Read, Edit, Write, Agent
 ---
 
 # /keel:swarm
+
+## ⚠️ Experimental — do not use this to land work
+
+`keel swarm-plan`, `--plan-only` and `--tree` run and render a plan. **A live run cannot produce a
+commit or a pull request**, and the reason is deeper than a missing flag: `keel ship` the CLI
+subcommand is a *dry ship assessment* — it reports tier, window, gates and a decision, and never
+commits, pushes or opens a PR in any mode. In keel's design the **agent** does the implementation
+by following `/keel:ship`; swarm's workers spawn the CLI instead, so a worker cannot commit. On
+top of that, `--live` is never forwarded to those children at all (#1269).
+
+It is not free, though: that CLI runs `git diff` and executes the project's planned gates, and the
+gate run is **not** behind `--live`. A dry `swarm-run` over N issues runs the whole gate suite N
+times, up to `--max-workers` in parallel. Budget for that before you start one.
+
+Planning does not see real scope either: `--issue-title`, `--issue-body`, `--issue-label` and
+`--declared-file` are shared by every issue and nothing fetches an issue's own text. With no scope
+text and no directory-hinting label a multi-issue plan returns one wave of synthetic globs; name a
+path — in a file, in the shared body, or via a label like `docs` that maps to a directory — and it
+lands in *every* issue's scope, so they all serialise instead (#1274). Neither is per-issue scope. `keel-visual swarm` always renders a flat DAG (#1275, #1280).
+
+So: **`--plan-only` is the one that stops**, and it already renders the ASCII tree — `--tree` is
+passed on the `swarm-plan` calls either way, so adding it changes nothing. `--visual` is a
+different matter twice over: it is read at Step 4, *after* Step 2, so on its own
+`/keel:swarm <issues> --visual` walks straight into the live `swarm-run` and `swarm-land`; and
+with `--plan-only` it never runs at all — and could not show anything if it did, because
+`keel-visual swarm` reads the state file only `swarm-run` writes and falls back to an empty
+board without it. That cuts a worktree per cluster, leaves the
+`swarm/<swarm_id>/<cluster_id>` branches behind (nothing deletes them), and runs the N child gate
+suites above — for a run that lands nothing. Read the plan it renders as "what I passed", not
+"per-issue scope". For anything
+the user expects to be **merged**, say plainly that swarm cannot do it and run `/keel:ship` per
+issue instead.
+
+Do not hand-drive the children to work around this. With `knobs.swarm_review_evidence` on — the
+default — `swarm-land` would hold the clusters anyway: no open PR, an unarmed gate, missing
+evidence, or a head that does not match the reviewed one. (With it off, a documented and logged
+opt-out, they would merge unverified.) Either way you would be skipping the per-issue ledger and
+the backbone that `/keel:ship` gives you. The rest
+is tracked under the audit epic #1281.
 
 ## Live progress — stamp this run (required)
 

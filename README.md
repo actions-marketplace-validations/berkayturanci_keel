@@ -1,7 +1,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/hero-light.svg">
-  <img src="docs/assets/hero-light.svg" alt="keel — drive every issue to merged on one fixed backbone: 13 steps, 28 extension slots, 17 /keel commands, multi-agent swarm DAGs, 100% covered">
+  <img src="docs/assets/hero-light.svg" alt="keel — drive every issue to merged on one fixed backbone: 13 steps, 28 extension slots, 17 /keel commands, experimental multi-agent swarm DAGs, 100% covered">
 </picture>
 
 # keel ⚓
@@ -20,9 +20,10 @@
 > backbone: they set per-project **values** in `project.yaml` and snap their own
 > **Lego pieces** into named extension slots.
 
-The keel is a ship's backbone — the fixed spine every project builds on. Linear work
-is driven by `keel:ship`, while high-concurrency parallel backlogs are orchestrated by
-`keel:swarm`; keel is where ships and fleets are built.
+The keel is a ship's backbone — the fixed spine every project builds on. Work is driven
+by `keel:ship`; `keel:swarm` aims the same backbone at a whole backlog as parallel waves,
+but it is **experimental** and does not land work yet ([#1281](https://github.com/berkayturanci/keel/issues/1281)). keel is where
+ships and fleets are built.
 
 Keel is based on the work pattern of a strong teammate in a real engineering team:
 take an issue from the queue, decide whether it is ready, own the implementation,
@@ -55,7 +56,7 @@ Changing the backbone is a keel-core change. Projects only ever touch layers 2�
 
 - **One backbone, every agent** — install once; `/keel:<command>` runs as native Claude commands
   *and* as a single shared skill set every other agent (Codex, Antigravity, Gemini) reads.
-- **High-concurrency Swarm orchestration** — cluster entire backlogs into topological dependency waves, execute disjoint clusters in isolated git worktrees, and land them under a single-writer merge lock with sequential `git merge --no-ff` ([guide](docs/keel/swarm.md)).
+- **High-concurrency Swarm orchestration** (**experimental**) — cluster entire backlogs into topological dependency waves, execute disjoint clusters in isolated git worktrees, and land them under a single-writer merge lock with sequential `git merge --no-ff` ([guide](docs/keel/swarm.md)). The planning commands run; **a live run cannot produce a commit or a pull request**. The child `keel ship` is a dry assessment that never commits or opens a PR in any mode — keel's design has the *agent* implement by following `/keel:ship` — and `--live` is not forwarded to it either ([#1269](https://github.com/berkayturanci/keel/issues/1269)); scope cannot be given per issue, so a multi-issue plan returns one flat wave ([#1274](https://github.com/berkayturanci/keel/issues/1274)). Audit epic: [#1281](https://github.com/berkayturanci/keel/issues/1281). Use `/keel:ship` for work you need merged.
 - **Project Lego + policy packs** — snap gates/steps into named hooks (`guard`, `tester`,
   `pre-merge`, …) and keep labels, path policy, health sources, local commands, and
   workflow preferences in `policy_pack` data instead of packaged command prose.

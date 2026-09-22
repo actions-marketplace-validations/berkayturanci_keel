@@ -64,9 +64,9 @@ window.KEEL = {
     {
       slug: "swarm", name: "/keel:swarm", group: "Flagship", flagship: true, featured: true, scene: "swarm",
       cmd: "keel:swarm",
-      one: "Multi-agent swarm coordinator — cluster backlog issues, run parallel waves, and batch land.",
+      one: "EXPERIMENTAL — multi-agent swarm coordinator: cluster backlog issues, run parallel waves, and batch land.",
       detail:
-        "Clusters backlog issues into disjoint execution waves based on static file-overlap of predicted scopes. Spawns parallel workers across isolated git worktrees (.keel/worktrees/<swarm_id>/<cluster_id>/), supports cross-model agent routing (Claude, Gemini, Codex, DeepSeek, Local Ollama), reviews each cluster inside its own keel ship — which on tier-3 can be the cross-vendor AI Jury panel — and holds every branch behind a per-branch review-evidence check before sequential git merge --no-ff landing under the merge lock.",
+        "EXPERIMENTAL — the planning commands run; a live run cannot produce a commit or a pull request. The child keel ship is a dry assessment that never commits in any mode, and --live is not forwarded to it either (#1269); scope cannot be given per issue — the scope flags are shared by every issue — so a multi-issue plan returns one flat wave, or, when the shared text or label names a path, serialises every issue behind it (#1274). Audit epic: #1281. Clusters backlog issues into disjoint execution waves based on static file-overlap of predicted scopes. Spawns parallel workers across isolated git worktrees (.keel/worktrees/<swarm_id>/<cluster_id>/), supports cross-model agent routing (Claude, Gemini, Codex, DeepSeek, Local Ollama), reviews each cluster inside its own keel ship — which on tier-3 can be the cross-vendor AI Jury panel — and holds every branch behind a per-branch review-evidence check before sequential git merge --no-ff landing under the merge lock.",
     },
     {
       slug: "implement", name: "/keel:implement", group: "Per-step", featured: true, scene: "implement",
@@ -163,7 +163,7 @@ window.KEEL = {
   /* ---- example invocation per command (illustrative) ------------- */
   cmdExample: {
     "ship": "/keel:ship 128 --reviewers 3",
-    "swarm": "/keel:swarm 714 715 716 717 --tree",
+    "swarm": "/keel:swarm 714 715 716 717 --plan-only",
     "implement": "/keel:implement 128",
     "review-cycle": "/keel:review-cycle 214 --review-comments inline",
     "pr-loop": "/keel:pr-loop 214",
@@ -190,8 +190,8 @@ window.KEEL = {
     ["keel plan <cfg> [--live --json]", "render the backbone + the full structured command contract; --live runs the s0 consent preflight"],
     ["keel swarm-plan <cfg> --issues 12,15", "cluster backlog issues into conflict-free execution waves from their predicted scopes"],
     ["keel swarm-status <cfg>", "multi-cluster status snapshot — each cluster's lead, difficulty band, and running/passed/failed state"],
-    ["keel swarm-run <cfg> --issues 12,15", "orchestrate parallel workers in isolated worktrees, rebalancing the plan when a cluster fails"],
-    ["keel swarm-land <cfg> --wave 1", "merge a wave's cluster branches sequentially under the merge lock, aborting on conflict"],
+    ["keel swarm-run <cfg> --issues 12,15", "EXPERIMENTAL (#1281) — orchestrate parallel workers in isolated worktrees, rebalancing the plan when a cluster fails; a live run produces no commits and no PRs"],
+    ["keel swarm-land <cfg> --wave 1", "EXPERIMENTAL (#1281) — merge a wave's cluster branches sequentially under the merge lock, aborting on conflict; nothing reaches it from a live swarm run yet"],
     ["keel-visual swarm", "2D DAG and pseudo-3D spatial worktree topology, rendered as a snapshot"],
     ["keel run-gates <cfg>", "run the project's build / lint / command gates"],
     ["keel window <cfg>", "is the merge window open right now?"],
@@ -394,8 +394,9 @@ window.KEEL = {
     },
     {
       group: "Architecture", title: "Keel Swarm (Multi-Agent Concurrency & Cross-Model Topology)", slug: "swarm",
-      summary: "High-concurrency multi-agent orchestration — static DAG clustering, isolated git worktrees, cross-model routing, and single-writer batch landing.",
+      summary: "EXPERIMENTAL — high-concurrency multi-agent orchestration: static DAG clustering, isolated git worktrees, cross-model routing, and single-writer batch landing. The live path does not land anything yet.",
       body:
+        "<p><b>⚠️ Experimental — this subsystem does not land work.</b> The planning commands run. A <i>live</i> run cannot produce a commit or a pull request, and the reason is deeper than a missing flag: <code>keel ship</code>, the CLI subcommand swarm's workers spawn, is a dry assessment that never commits, pushes or opens a PR in any mode — in keel's design the <i>agent</i> does the implementation by following <code>/keel:ship</code> — and on top of that <code>--live</code> is never forwarded to those children (<a href='https://github.com/berkayturanci/keel/issues/1269'>#1269</a>). Planning runs, but not on real scope: <code>--issue-title</code>, <code>--issue-body</code>, <code>--issue-label</code> and <code>--declared-file</code> are shared by every issue, so with no scope text a multi-issue plan clusters synthetic globs into one wave — and naming a path, or a label that maps to a directory, puts it in every issue's scope and serialises them instead (<a href='https://github.com/berkayturanci/keel/issues/1274'>#1274</a>) and <code>keel-visual swarm</code> always renders a flat DAG (<a href='https://github.com/berkayturanci/keel/issues/1275'>#1275</a>). Landing is guarded and does work as written — <code>swarm-land</code> holds any cluster without an open PR, an armed gate, evidence, and a head matching the reviewed one. The rest is tracked under the audit epic <a href='https://github.com/berkayturanci/keel/issues/1281'>#1281</a>. Read this as architecture, not as a supported workflow — use <code>/keel:ship</code> for work you need merged.</p>" +
         "<p><b>Keel Swarm</b> is Keel's high-concurrency multi-agent orchestration subsystem. While <code>/keel:ship</code> drives a single issue linearly, <code>/keel:swarm</code> clusters a list or backlog of issues into disjoint execution waves and executes them across isolated git worktrees in parallel.</p>" +
         "<h3>1. Static Dependency DAG & Wave Partitioning</h3>" +
         "<p>Swarm computes file-overlap conflict graphs from each issue's predicted scope, without executing code; a cluster's dependencies are derived from that overlap. Orthogonal clusters are scheduled in parallel in <b>Wave 1</b>, while dependent or overlapping clusters are sequenced into subsequent waves (<code>Wave 2</code>, <code>Wave 3</code>).</p>" +
@@ -548,7 +549,7 @@ window.KEEL = {
       body:
         "<p>keel is an <b>agentic work-ownership backbone</b>. Its job is not to be another isolated coding command, review bot, or merge queue — it is to make an agent <b>accountable for the whole path</b> a strong software teammate would normally own.</p>" +
         "<p>That path starts before code is written: read the issue, decide whether the scope is ready, ask for clarification when it is not, cut an isolated branch, implement, keep CI and tests green, get reviewed, fix feedback, merge inside policy, close the loop, and record what should be remembered next time.</p>" +
-        "<p><b>One issue, a work block, or a backlog.</b> Hand keel one issue, a bounded work block, or — with <code>swarm</code> — a backlog split into dependency waves that run in parallel worktrees, and get the same quality loop every time: readiness before mutation, isolated worktree, deterministic gates + capability checks, independent review and optional jury, merge-window + merge-lock safety, structured ledger, closeout + capture hooks, and morning/wrap visibility. The point isn't autonomy for its own sake — it's work that is observable, recoverable, reviewable, and governed by policy while the agent owns the execution details.</p>",
+        "<p><b>One issue, a work block, or a backlog.</b> Hand keel one issue or a bounded work block and get the same quality loop every time (<code>swarm</code> splits a backlog into dependency waves across parallel worktrees, but it is <b>experimental</b> and lands nothing yet — see <a href='https://github.com/berkayturanci/keel/issues/1281'>#1281</a>): readiness before mutation, isolated worktree, deterministic gates + capability checks, independent review and optional jury, merge-window + merge-lock safety, structured ledger, closeout + capture hooks, and morning/wrap visibility. The point isn't autonomy for its own sake — it's work that is observable, recoverable, reviewable, and governed by policy while the agent owns the execution details.</p>",
       source: "https://github.com/berkayturanci/keel/blob/main/README.md#the-vision-to-production-gap-in-agentic-ai",
     },
     {
