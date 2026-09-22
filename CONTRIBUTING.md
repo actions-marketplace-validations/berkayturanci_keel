@@ -45,7 +45,8 @@ By participating you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
    hundred syntax errors that look like a regression. `PY=/path/to/python make test`
    overrides the resolver; `make doctor-python` prints what it picked, and
    `keel doctor` reports the same interpreter under its `python_toolchain` check.
-4. The pure core is held at **100% line + branch coverage**. New core logic needs tests.
+4. The pure core is held at **100% line + branch coverage**. New core logic needs tests —
+   and for a *fix*, coverage is not the bar; see step 7.
    `make test` also fails if any tracked file — `CHANGELOG.md` most often, since it conflicts
    on nearly every PR — still carries an unresolved `<<<<<<<`/`=======`/`>>>>>>>` marker after
    a merge or rebase.
@@ -56,6 +57,33 @@ By participating you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
    reference (`Closes #N` / `Relates to #N`, or `no issue` for a pure chore). The
    [PR description lint](.github/workflows/pr-lint.yml) check enforces this — a PR template
    only pre-fills the body, it can't stop an empty PR.
+7. **If your PR fixes a bug, tell us what breaks without your fix — if you can.** One
+   sentence is plenty:
+
+   > Removing `/worktrees/` from the ignore tuple in `workspace.py` makes
+   > `test_git_ignores_a_swarm_worktree_at_the_path_swarm_writes_to` fail.
+
+   **This is not a gate and there is no form to fill in.** If you are not sure which test
+   covers your change, or the fix is hard to revert cleanly, open the PR anyway and say so —
+   working that out is part of review, and a maintainer will help. A fix with no evidence line
+   is still a welcome fix.
+
+   Why we ask at all: it is the one sentence that distinguishes a test which *guards* your fix
+   from one that merely runs through it. Coverage cannot make that distinction — `fail_under =
+   100` is enforced in CI, so "maintained 100 % coverage" is true of every merged pull request
+   before anyone writes it. An audit of 14 closed fixes in this repo found three whose tests
+   would have passed with the fix removed; all three offered coverage as their evidence. The
+   rationale is in [#1289](https://github.com/berkayturanci/keel/issues/1289).
+
+   It is also worth knowing what such a sentence does *not* prove. A test can fail without the
+   fix and still be blind to what the fix broke: #873's did, and the regression is
+   [#1268](https://github.com/berkayturanci/keel/issues/1268). The fixture has to be one where
+   the fix changes the outcome.
+
+   **Agents working in this repository have a stricter version of this rule** — they can run
+   the revert themselves, so `AGENTS.md` asks them to, per behaviour rather than per PR. Most
+   of the pull requests here are agent-authored, which is where the audit's failures came from;
+   the requirement lives there rather than on contributors.
 
 ## Bot-owned branches are read-only
 
