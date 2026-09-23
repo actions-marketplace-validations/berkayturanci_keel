@@ -8,8 +8,10 @@
 > - `keel ship` — the *CLI subcommand*, registered as `dry ship assessment (tier, window, gates,
 >   decision)` — never commits, pushes or opens a pull request, in any mode. It is not inert: it
 >   runs `git diff` and executes the project's planned gates, and that gate run is **not** behind
->   `--live`, so a dry `swarm-run` over N issues still runs the whole gate suite N times, up to
->   `--max-workers` in parallel. What it never does is produce the commit. In keel's design the
+>   `--live`, so a dry `swarm-run` over N issues still runs the whole gate suite N times. A dry
+>   run creates no worktrees, so those runs share your checkout; they run one at a time
+>   ([#1288](https://github.com/berkayturanci/keel/issues/1288)), whatever `--max-workers`
+>   says. What it never does is produce the commit. In keel's design the
 >   implementation is done by the **agent** following `/keel:ship`, and the CLI assesses it;
 >   swarm's workers spawn the CLI, so a worker cannot produce a commit in any mode.
 > - `swarm-run --live` is refused before anything starts. Its workers are handed `--live`
@@ -270,8 +272,8 @@ keel swarm-run .keel/project.yaml --root . --issues 714,715,716,717
 > no CLI path creates worktrees: this lifecycle is the library's
 > (`run_swarm_orchestration(dry_run=False)`), described so the next change starts from what it does.
 
-1. **Creation**: Dedicated worktrees are branched from the local `main` onto
-   `swarm/<swarm_id>/<cluster_id>`.
+1. **Creation**: Dedicated worktrees are branched from the configured `base_branch` onto
+   `swarm/<swarm_id>/<cluster_id>` ([#1262](https://github.com/berkayturanci/keel/issues/1262)).
 2. **Execution**: One **team lead** per cluster dispatches the implementer its `assignment`
    named, to execute the full `s0`–`s12` backbone. The lead appends the cluster's team to every
    child ship — `--delegate <implementer>`, one `--review-delegate` per staffed reviewer

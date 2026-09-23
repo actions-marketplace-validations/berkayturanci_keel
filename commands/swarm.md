@@ -18,7 +18,8 @@ operator-consent gate swarm cannot satisfy for a child (#1269, #1281).
 
 It is not free, though: that CLI runs `git diff` and executes the project's planned gates, and the
 gate run is **not** behind `--live`. A dry `swarm-run` over N issues runs the whole gate suite N
-times, up to `--max-workers` in parallel. Budget for that before you start one.
+times — one at a time, since a dry run has no worktrees and the runs share your checkout
+(#1288). Budget for that before you start one.
 
 Planning does not see real scope either: `--issue-title`, `--issue-body`, `--issue-label` and
 `--declared-file` are shared by every issue and nothing fetches an issue's own text. With no scope
@@ -205,4 +206,4 @@ Compile the overall multi-agent swarm outcome:
 - Record final completion:
   `keel activity .keel/project.yaml --root . --run-id "$RUN" --done`
 
-<!-- keel-generated: surface=plugin command=swarm keel_version=1.24.1 source_sha256=82d1911858c601e198864250b4c4dc8b7c5e612e191995fbe5112d6847d7ebcd generated_sha256=82d1911858c601e198864250b4c4dc8b7c5e612e191995fbe5112d6847d7ebcd -->
+<!-- keel-generated: surface=plugin command=swarm keel_version=1.24.1 source_sha256=9a9c39d063a82bec740c71cfb8bbd78b7dd1b2abeec6bd7fcc136a353269fad2 generated_sha256=9a9c39d063a82bec740c71cfb8bbd78b7dd1b2abeec6bd7fcc136a353269fad2 -->
