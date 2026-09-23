@@ -309,10 +309,58 @@ class SwarmLandingResult:
         }
 
 
+#: Punctuation prose puts around a path. A dot is not in it: a leading one is part of
+#: `.github/…` or `.keel/…` (stripping it made those `github/…`, #1279), and a trailing
+#: one is handled by :func:`_rstrip_path_punctuation`.
+_PATH_LEAD = "`'\" \t\r\n,;:"
+
+
+def _rstrip_path_punctuation(p: str) -> str:
+    """Trailing prose punctuation, dots included — except a final `.` or `..` segment,
+    which is a path step (`src/a/..` is `src`), not the end of a sentence."""
+    while True:
+        before = p
+        p = p.rstrip(_PATH_LEAD)
+        # `\\` counts as a separator here: this runs before it becomes `/`.
+        steps = p.replace("\\", "/")
+        if p.endswith(".") and not ("/" in steps and steps.rsplit("/", 1)[-1] in (".", "..")):
+            p = p[:-1]
+        if p == before:
+            return p
+
+
+def _strip_path_punctuation(p: str) -> str:
+    """Prose punctuation off both ends. A bracket goes only when it is unbalanced — the
+    leftover of prose like `(see src/a.py)` — and balanced ones are the path's own:
+    `docs/(draft)/` and `(docs/draft)/` keep theirs. Removing a pair that *looks* like
+    it wraps the path cannot be both idempotent and consistent (`(docs/draft)/` wraps
+    only once `normpath` drops the `/`), and the path-extraction patterns never
+    capture brackets, so only a `--declared-file` value, which is literal, has any."""
+    while True:
+        before = p
+        p = _rstrip_path_punctuation(p.lstrip(_PATH_LEAD))
+        if p.startswith("(") and p.count("(") > p.count(")"):
+            p = p[1:]
+        elif p.endswith(")") and p.count(")") > p.count("("):
+            p = p[:-1]
+        if p == before:
+            return p
+
+
 def _normalize_path(p: str) -> str:
-    cleaned = p.strip("`'\" \t\r\n.,;:()")
-    cleaned = cleaned.replace("\\", "/").removeprefix("./").removeprefix("/")
-    return posixpath.normpath(cleaned) if cleaned else ""
+    """One canonical spelling of a path, the same however often it is applied: the
+    plan normalises twice, and a second pass used to eat the `)` the first exposed
+    (`docs/(draft)/` → `docs/(draft)` → `docs/(draft`, #1279). The whole pass is
+    repeated to a fixed point, since `normpath` can itself expose new end
+    punctuation (`(docs/draft)/` → `(docs/draft)`). It ends: after the first round
+    no `\\` is left, and every later change only shortens the string."""
+    while True:
+        cleaned = _strip_path_punctuation(p)
+        cleaned = cleaned.replace("\\", "/").removeprefix("./").removeprefix("/")
+        cleaned = posixpath.normpath(cleaned) if cleaned else ""
+        if cleaned == p:
+            return cleaned
+        p = cleaned
 
 
 def extract_predicted_paths(text: str) -> list[str]:

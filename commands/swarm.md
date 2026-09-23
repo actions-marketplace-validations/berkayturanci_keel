@@ -172,7 +172,7 @@ This is the dry run: it assesses each cluster in its worktree and commits nothin
 When an execution wave completes, land all passing clusters onto `main`:
 
 ```bash
-keel swarm-land .keel/project.yaml --root . --wave <n> --live
+keel swarm-land .keel/project.yaml --root . --issues <n,n,n> --wave <n> --live
 ```
 
 - The landing mode is **derived from the plan's predicted scopes for the wave**, not passed on the command line.
@@ -205,4 +205,4 @@ Compile the overall multi-agent swarm outcome:
 - Record final completion:
   `keel activity .keel/project.yaml --root . --run-id "$RUN" --done`
 
-<!-- keel-generated: surface=plugin command=swarm keel_version=1.24.1 source_sha256=af529191b77965a9f74fca5c9c72b2f37576e04845eb68d9ce169acbd4c75f71 generated_sha256=af529191b77965a9f74fca5c9c72b2f37576e04845eb68d9ce169acbd4c75f71 -->
+<!-- keel-generated: surface=plugin command=swarm keel_version=1.24.1 source_sha256=82d1911858c601e198864250b4c4dc8b7c5e612e191995fbe5112d6847d7ebcd generated_sha256=82d1911858c601e198864250b4c4dc8b7c5e612e191995fbe5112d6847d7ebcd -->

@@ -1716,8 +1716,8 @@ class TestSwarmLandCLI(unittest.TestCase):
             for f in state_dir.glob("*.json"):
                 f.unlink()
 
-            buf_empty = io.StringIO()
-            with redirect_stdout(buf_empty):
+            buf_empty, err_empty = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf_empty), redirect_stderr(err_empty):
                 code_empty = main(
                     [
                         "swarm-land",
@@ -1727,10 +1727,15 @@ class TestSwarmLandCLI(unittest.TestCase):
                     ]
                 )
             self.assertEqual(code_empty, 1)
+            # #1279: said `status: failed` like a wave whose clusters all failed.
+            self.assertIn("swarm-land needs the wave's issues", err_empty.getvalue())
+            self.assertNotIn("status", buf_empty.getvalue())
 
             with tempfile.TemporaryDirectory() as tmp_fresh:
-                buf_no_state = io.StringIO()
-                with redirect_stdout(buf_no_state):
+                # No state dir and no issues: the no-scope refusal, not a lookup. (With
+                # issues it would reach the evidence checker's real `gh pr list`.)
+                buf_no_state, err_no_state = io.StringIO(), io.StringIO()
+                with redirect_stdout(buf_no_state), redirect_stderr(err_no_state):
                     code_no_state = main(
                         [
                             "swarm-land",
@@ -1740,6 +1745,7 @@ class TestSwarmLandCLI(unittest.TestCase):
                         ]
                     )
                 self.assertEqual(code_no_state, 1)
+                self.assertIn("swarm-land needs the wave's issues", err_no_state.getvalue())
 
     def test_swarm_land_cli_partial_failure_returns_exit_code_1(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1771,6 +1777,8 @@ class TestSwarmLandCLI(unittest.TestCase):
                             tmpdir,
                             "--swarm-id",
                             "swarm-part",
+                            "--issues",
+                            "714",
                             "--live",
                         ]
                     )
