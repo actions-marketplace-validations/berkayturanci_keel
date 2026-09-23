@@ -476,5 +476,108 @@ class ThePluginPageAgreesWithTheInstallPage(unittest.TestCase):
         self.assertIn("plugin.md", INSTALL_DOC.read_text(encoding="utf-8"))
 
 
+#: A `- [Name](#anchor)` Contents entry, keeping the link text and the anchor.
+CONTENTS_NAME = re.compile(r"^- \[([^\]]+)\]\(#([a-z0-9-]+)\)", re.M)
+
+#: A name a host list could wrongly carry: Gemini is a model and a provider
+#: (`docs/keel/models.md`), not a host keel installs into (#1333).
+NOT_A_HOST = ("Gemini",)
+
+
+def install_page_hosts() -> tuple[str, ...]:
+    """The hosts `install.md` measures, by display name, from its own Contents list.
+
+    Only the entries whose anchor is one of `AGENTS` count: a `Troubleshooting` or
+    `FAQ` entry is a section, not a host. `Antigravity (`agy`)` reads as
+    `Antigravity`: the parenthesis names the binary.
+    """
+    text = INSTALL_DOC.read_text(encoding="utf-8")
+    contents = text[text.index("## Contents") : text.index("---", text.index("## Contents"))]
+    return tuple(
+        re.sub(r"\s*\(.*\)$", "", name)
+        for name, anchor in CONTENTS_NAME.findall(contents)
+        if anchor in AGENTS
+    )
+
+
+def named_in(clause: str, names: tuple[str, ...]) -> set[str]:
+    """Which of `names` a clause names, as whole words."""
+    return {name for name in names if re.search(rf"\b{re.escape(name)}\b", clause)}
+
+
+def host_enumerations(snippet: str, names: tuple[str, ...]) -> list[str]:
+    """The clauses of a snippet that enumerate hosts: two or more of `names` in one clause.
+
+    A clause naming one host ("Claude Code also gets the plugin marketplace.",
+    "Cursor is partial: …") says something about that host, not which hosts keel has,
+    so it is not held to the list.
+    """
+    flat = " ".join(snippet.split())
+    return [c for c in re.split(r"(?<=[.;:])\s", flat) if len(named_in(c, names)) >= 2]
+
+
+class OneHostListEverywhere(unittest.TestCase):
+    """#1333: the README and llms.txt said "Codex, Antigravity, Gemini" and left out
+    Cursor; the site's meta and og descriptions said "Claude Code, Codex and Gemini";
+    only `install.md` named the four hosts keel actually installs into. Every public
+    host list is held to the install page's Contents, the list someone measured."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hosts = install_page_hosts()
+        readme = README.read_text(encoding="utf-8")
+        llms = (REPO_ROOT / "website" / "llms.txt").read_text(encoding="utf-8")
+        index = (REPO_ROOT / "website" / "index.html").read_text(encoding="utf-8")
+        marketplace = (REPO_ROOT / ".claude-plugin" / "marketplace.json").read_text(
+            encoding="utf-8"
+        )
+
+        def one(pattern: str, text: str, where: str) -> str:
+            found = re.search(pattern, text, re.S)
+            if found is None:
+                raise AssertionError(f"{where}: no match for {pattern!r}")
+            return found.group(1)
+
+        cls.surfaces = {
+            "README.md 'One backbone' bullet": one(
+                r"\n- \*\*One backbone(.*?)\n- \*\*", readme, "README.md"
+            ),
+            "website/llms.txt summary": one(r"\A# keel\n\n((?:> .*\n)+)", llms, "llms.txt"),
+            "index.html meta description": one(
+                r'<meta name="description" content="([^"]+)"', index, "index.html"
+            ),
+            "index.html og:description": one(
+                r'<meta property="og:description" content="([^"]+)"', index, "index.html"
+            ),
+            "index.html 'One backbone' card": one(
+                r"<b>One backbone[^<]*</b><span>(.*?)</span>", index, "index.html"
+            ),
+            "index.html integrations heading": one(
+                r'id="view-integrations".*?<p>(.*?)</p>', index, "index.html"
+            ),
+            ".claude-plugin/marketplace.json": one(
+                r'"description": "([^"]+)"', marketplace, "marketplace.json"
+            ),
+        }
+
+    def test_the_install_page_lists_the_four_hosts(self):
+        """Vacuity, and the one place the list is typed: the install page itself."""
+        self.assertEqual(self.hosts, ("Claude Code", "Codex", "Antigravity", "Cursor"))
+
+    def test_every_public_host_list_names_exactly_the_install_page_hosts(self):
+        names = (*self.hosts, *NOT_A_HOST)
+        for where, snippet in self.surfaces.items():
+            with self.subTest(surface=where):
+                lists = host_enumerations(snippet, names)
+                self.assertTrue(lists, f"{where} no longer lists its hosts")
+                for clause in lists:
+                    named = named_in(clause, names)
+                    self.assertEqual(
+                        named,
+                        set(self.hosts),
+                        f"{where} names {sorted(named)} as hosts: {clause!r}",
+                    )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

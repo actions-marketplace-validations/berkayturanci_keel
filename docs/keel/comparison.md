@@ -12,7 +12,7 @@ branch/worktree → implement (coding agent) → push → CI wait → multi-agen
 capture marker/verifier contract, redaction-before-durability guardrails, capture-health
 surfacing, and optional learning-quality decisions in the run ledger. Distinctive elements:
 
-- **Agent adapters** (Claude Code, Codex, Gemini, Antigravity) behind one backbone.
+- **Agent adapters** (Claude Code, Codex, Cursor, Antigravity) behind one backbone.
 - **`.keel/project.yaml`** per project (base branch, build/lint/test commands, CI names, file globs) + pluggable "Lego" extension gates.
 - **Merge invariants**: timezone-aware merge *window* ("night no-merge"), `mkdir`-based merge *lock* (mutual exclusion), risk-tiered reviewer counts, fix-loop with capped budget.
 - **Pure-core + thin-IO, deterministic, stdlib-only ethos** (sibling `ai-jury` is the multi-agent review engine).
@@ -385,7 +385,7 @@ or a learning reader. The one real gap the category exposed — iterating s4 at 
 - Every *individual* capability exists somewhere: issue→PR (Sweep, SWE-agent), AI review (Qodo, CodeRabbit), merge gating + **timezone-aware scheduled freeze** (Mergify — the one tool that genuinely has merge windows), policy gates (OPA/Danger), model/agent-agnosticism (OpenHands).
 - **No tool combines all of them**, and three pieces in particular are rare-to-absent in shipped products:
   1. **An end-to-end fixed backbone** from *issue selection* through *merge + close* — agents stop at "opened a PR"; merge queues start at "PR exists." keel owns the whole arc.
-  2. **Agent-agnostic adapters** over that backbone (run Claude Code *or* Codex *or* Gemini *or* Antigravity through the identical pipeline). OpenHands is *model*-agnostic; keel is *agent/CLI*-agnostic, which is a different and underserved axis.
+  2. **Agent-agnostic adapters** over that backbone (run Claude Code *or* Codex *or* Cursor *or* Antigravity through the identical pipeline). OpenHands is *model*-agnostic; keel is *agent/CLI*-agnostic, which is a different and underserved axis.
   3. **Multi-agent debate→verify→synthesize review as a production gate** — this is research/skill-level elsewhere, not packaged.
 - The **merge window + `mkdir` lock as deterministic, stdlib invariants** are not conceptually novel (Mergify schedules; GitHub punts to self-failing Actions), but keel's framing — *native, deterministic, dependency-free, inside the agent pipeline* — is distinctive. The market evidence (GitHub's most-requested-but-absent scheduled-merge feature) confirms the need is real.
 
