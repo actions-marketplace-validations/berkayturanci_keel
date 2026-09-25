@@ -13,14 +13,16 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from keel.cli import main
+from keel.cli import build_parser, main
 from keel.runner import CommandResult
 from keel.swarm import (
+    CHILD_OUTPUT_TAIL_CHARS,
     IssueScope,
     SwarmPlan,
     SwarmRunState,
     SwarmWorkerStatus,
     build_swarm_plan,
+    load_swarm_state,
     rebalance_swarm_plan,
     render_swarm_run_result,
     update_worker_state,
@@ -153,7 +155,42 @@ class TestSwarmRuntimeHelpers(unittest.TestCase):
                 runner=mock_runner,
             )
 
-            self.assertEqual(calls[0][-1], "--json")
+            self.assertEqual(calls[0][-2:], ["--json", "--live"])
+
+    def _argv(self, *, dry_run: bool) -> list[str]:
+        calls: list[list[str]] = []
+
+        def mock_runner(cmd: list[str], cwd: Path) -> CommandResult:
+            calls.append(cmd)
+            return CommandResult(ok=True, code=0, output="{}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            execute_cluster_worker(
+                ".keel/project.yaml",
+                7,
+                Path(tmpdir),
+                Path(tmpdir) / "wt",
+                dry_run=dry_run,
+                runner=mock_runner,
+            )
+        return calls[0]
+
+    def test_a_live_worker_runs_a_live_child(self):
+        """#1269: leaving out `--dry-run` never meant `--live`; every live-only path in
+        `keel ship` is gated on `args.live`, so a live swarm ran dry assessments."""
+        argv = self._argv(dry_run=False)
+        self.assertIn("--live", argv)
+        self.assertNotIn("--dry-run", argv)
+        self.assertTrue(build_parser().parse_args(argv[3:]).live)
+
+    def test_a_dry_worker_stays_dry(self):
+        """The counterweight: a dry swarm never hands a child `--live`."""
+        argv = self._argv(dry_run=True)
+        self.assertIn("--dry-run", argv)
+        self.assertNotIn("--live", argv)
+        parsed = build_parser().parse_args(argv[3:])
+        self.assertFalse(parsed.live)
+        self.assertTrue(parsed.dry_run)
 
 
 class TestSwarmOrchestration(unittest.TestCase):
@@ -177,6 +214,7 @@ class TestSwarmOrchestration(unittest.TestCase):
                 max_workers=2,
                 runner=mock_runner,
                 create_worktrees=False,
+                base_branch="main",
             )
 
             self.assertEqual(result.swarm_id, "swarm-orch-test")
@@ -188,6 +226,53 @@ class TestSwarmOrchestration(unittest.TestCase):
             rendered = render_swarm_run_result(result)
             self.assertIn("keel swarm run — swarm-orch-test", rendered)
             self.assertIn("partial_failure", rendered)
+
+    def test_a_worker_that_raises_is_a_failed_cluster_not_a_failed_run(self):
+        """#1271: `future.result()` re-raised a worker's exception unguarded, so one bad
+        cluster ended the run, discarded the others' results and left them `running`
+        in the state file, with no way for swarm-status to tell they were dead."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            s1 = IssueScope(issue=301, title="Fine", predicted_files=("src/a.py",))
+            s2 = IssueScope(issue=302, title="Raises", predicted_files=("src/b.py",))
+            plan = build_swarm_plan([s1, s2], swarm_id="swarm-raises")
+            removed: list[str] = []
+
+            def mock_runner(cmd: list[str], cwd: Path) -> CommandResult:
+                if "worktree" in cmd and "add" in cmd:
+                    Path(cmd[5]).mkdir(parents=True, exist_ok=True)
+                if "worktree" in cmd and "remove" in cmd:
+                    removed.append(cmd[-1])
+                if "ship" in cmd and "302" in cmd:
+                    raise RuntimeError("boom in 302")
+                return CommandResult(ok=True, code=0, output="passed")
+
+            err = io.StringIO()
+            try:
+                with redirect_stderr(err):
+                    result = run_swarm_orchestration(
+                        plan,
+                        ".keel/project.yaml",
+                        root=tmpdir,
+                        dry_run=False,
+                        max_workers=2,
+                        runner=mock_runner,
+                        create_worktrees=True,
+                        base_branch="main",
+                    )
+            except RuntimeError as exc:
+                raise AssertionError(f"a worker's exception ended the run: {exc}") from exc
+            # The traceback is kept: the failure may be keel's own bug.
+            self.assertIn("Traceback", err.getvalue())
+            self.assertIn("RuntimeError: boom in 302", err.getvalue())
+
+            self.assertEqual((result.passed_count, result.failed_count), (1, 1))
+            self.assertEqual(result.status, "partial_failure")
+            outputs = [r["output"] for r in result.wave_results[0]["cluster_results"].values()]
+            self.assertTrue(any("worker raised RuntimeError: boom in 302" in o for o in outputs))
+            state = load_swarm_state("swarm-raises", root=tmpdir)
+            assert state is not None
+            self.assertNotIn("running", {w.status for w in state.workers})
+            self.assertEqual(len(removed), 2, "the raising worker's worktree must be removed too")
 
     def test_orchestration_all_passed_live_worktrees(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -208,6 +293,7 @@ class TestSwarmOrchestration(unittest.TestCase):
                 max_workers=1,
                 runner=mock_runner,
                 create_worktrees=True,
+                base_branch="main",
             )
 
             self.assertEqual(result.status, "success")
@@ -232,6 +318,7 @@ class TestSwarmOrchestration(unittest.TestCase):
                 max_workers=1,
                 runner=mock_runner,
                 create_worktrees=True,
+                base_branch="main",
             )
 
             self.assertEqual(result.status, "failed")
@@ -261,6 +348,7 @@ class TestSwarmOrchestration(unittest.TestCase):
                 ".keel/project.yaml",
                 root=tmpdir,
                 dry_run=True,
+                base_branch="main",
             )
             self.assertEqual(result.status, "success")
             self.assertEqual(result.total_workers, 0)
@@ -296,6 +384,7 @@ class TestSwarmOrchestration(unittest.TestCase):
                     ".keel/project.yaml",
                     root=tmpdir,
                     dry_run=True,
+                    base_branch="main",
                 )
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.failed_count, 1)
@@ -303,7 +392,118 @@ class TestSwarmOrchestration(unittest.TestCase):
             self.assertEqual(len(result.wave_results), 1)
 
 
+class TheStoredChildOutputIsBounded(unittest.TestCase):
+    """#1280: every cluster's whole child stdout went into `wave_results` (re-emitted by
+    `swarm-run --json`), and a failing cluster's went into the state file too."""
+
+    def test_passing_and_failing_outputs_keep_only_the_tail(self):
+        big = "noise\n" * 2000  # 12 000 chars, well over the cap
+        with tempfile.TemporaryDirectory() as tmpdir:
+            s1 = IssueScope(issue=401, title="Passes", predicted_files=("src/a.py",))
+            s2 = IssueScope(issue=402, title="Fails", predicted_files=("src/b.py",))
+            plan = build_swarm_plan([s1, s2], swarm_id="swarm-big")
+
+            def mock_runner(cmd: list[str], cwd: Path) -> CommandResult:
+                if "401" in cmd:
+                    return CommandResult(ok=True, code=0, output=big + "ALL GREEN")
+                return CommandResult(ok=False, code=1, output=big + "FATAL: gate failed")
+
+            result = run_swarm_orchestration(
+                plan,
+                ".keel/project.yaml",
+                root=tmpdir,
+                dry_run=True,
+                max_workers=2,
+                runner=mock_runner,
+                create_worktrees=False,
+                base_branch="main",
+            )
+            outputs = {
+                r["issue"]: r["output"]
+                for w in result.wave_results
+                for r in w["cluster_results"].values()
+            }
+            for issue, tail in ((401, "ALL GREEN"), (402, "FATAL: gate failed")):
+                with self.subTest(issue=issue):
+                    self.assertLess(len(outputs[issue]), CHILD_OUTPUT_TAIL_CHARS + 200)
+                    self.assertTrue(outputs[issue].endswith(tail))
+                    self.assertIn("earlier chars of child output dropped", outputs[issue])
+
+            state = load_swarm_state("swarm-big", root=tmpdir)
+            assert state is not None
+            failed = next(w for w in state.workers if w.issue == 402)
+            self.assertLess(len(failed.details), CHILD_OUTPUT_TAIL_CHARS + 200)
+            self.assertTrue(failed.details.endswith("FATAL: gate failed"))
+            self.assertIn("earlier chars of child output dropped", failed.details)
+
+
+class AFailedWaveDoesNotSkipTheNext(unittest.TestCase):
+    """#1268: the loop walked waves by position, and rebalancing after a failure drops
+    that wave from the plan — so the position counter then stepped past the next,
+    unrelated wave, which never ran and stayed `queued`. A distinct issue per wave:
+    reusing one issue in two waves hides the skip."""
+
+    def test_every_later_wave_still_runs(self):
+        scopes = [
+            IssueScope(issue=n, title=f"T{n}", predicted_files=("src/a.py",)) for n in (1, 2, 3)
+        ]
+        plan = build_swarm_plan(scopes, swarm_id="swarm-skip")
+        self.assertEqual([len(w.clusters) for w in plan.waves], [1, 1, 1], "fixture: one wave each")
+        ran: list[int] = []
+
+        def runner(cmd: list[str], cwd: Path) -> CommandResult:
+            issue = int(cmd[cmd.index("--issue") + 1])
+            ran.append(issue)
+            return CommandResult(ok=issue != 1, code=0 if issue != 1 else 1, output="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_swarm_orchestration(
+                plan,
+                ".keel/project.yaml",
+                root=tmpdir,
+                dry_run=True,
+                runner=runner,
+                create_worktrees=False,
+                base_branch="main",
+            )
+            state = load_swarm_state("swarm-skip", root=tmpdir)
+
+        self.assertEqual(ran, [1, 2, 3], "a wave was skipped after the failure")
+        self.assertEqual((result.passed_count, result.failed_count), (2, 1))
+        assert state is not None
+        self.assertNotIn("queued", {w.status for w in state.workers})
+
+
 class TestSwarmPureStateHelpers(unittest.TestCase):
+    def test_a_failed_issue_leaves_no_edge_behind(self):
+        """#1277: the dropped issue stayed in every survivor's depends_on_issues, in
+        conflict_map and in issue_scopes, so the plan asserted a dependency on work it
+        no longer held."""
+        scopes = [
+            IssueScope(issue=10, title="A", predicted_files=("src/a.py",)),
+            IssueScope(issue=11, title="B", predicted_files=("src/a.py",)),
+            IssueScope(issue=14, title="E", predicted_files=("src/a.py",)),
+            IssueScope(issue=12, title="C", predicted_files=("src/c.py",)),
+            IssueScope(issue=13, title="D", predicted_files=("src/c.py",)),
+        ]
+        plan = build_swarm_plan(scopes, swarm_id="swarm-edges")
+        deps = {c.issues[0]: c.depends_on_issues for w in plan.waves for c in w.clusters}
+        self.assertIn(10, deps[11], "fixture: 11 must depend on 10 to begin with")
+        self.assertIn(12, deps[13], "fixture: 13 must depend on 12")
+
+        after = rebalance_swarm_plan(plan, failed_issue=10)
+        deps = {c.issues[0]: c.depends_on_issues for w in after.waves for c in w.clusters}
+        self.assertNotIn(10, deps)
+        self.assertNotIn(10, deps[11])
+        self.assertIn(12, deps[13], "an unrelated edge must survive")
+        # 14 depended on both 10 and 11: only the failed edge goes, not the list.
+        self.assertIn(11, deps[14])
+        self.assertNotIn(10, deps[14])
+        self.assertNotIn(10, after.conflict_map)
+        self.assertFalse(any(10 in others for others in after.conflict_map.values()))
+        self.assertNotIn(10, after.issue_scopes)
+        self.assertIn(11, after.issue_scopes)
+
     def test_rebalance_and_update_worker_state(self):
         s1 = IssueScope(issue=1, title="A", predicted_files=("src/a.py",))
         s2 = IssueScope(issue=2, title="B", predicted_files=("src/a.py",))
@@ -322,6 +522,139 @@ class TestSwarmPureStateHelpers(unittest.TestCase):
         st_updated = update_worker_state(st, "c1", status="passed")
         self.assertEqual(st_updated.workers[0].status, "passed")
         self.assertEqual(st_updated.workers[1].status, "queued")
+
+
+class TheWorktreesBranchFromTheConfiguredBase(unittest.TestCase):
+    """#1262: the worktree was always branched from `main` while landing targets
+    `config.base_branch`, so a `develop` project's clusters grew on the wrong history."""
+
+    def test_the_worktree_is_branched_from_the_base_it_is_given(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan = build_swarm_plan(
+                [IssueScope(issue=401, title="A", predicted_files=("src/a.py",))],
+                swarm_id="swarm-develop",
+            )
+            adds: list[list[str]] = []
+
+            def runner(cmd: list[str], cwd: Path) -> CommandResult:
+                if "worktree" in cmd and "add" in cmd:
+                    adds.append(cmd)
+                    Path(cmd[5]).mkdir(parents=True, exist_ok=True)
+                return CommandResult(ok=True, code=0, output="ok")
+
+            run_swarm_orchestration(
+                plan,
+                ".keel/project.yaml",
+                root=tmpdir,
+                dry_run=False,
+                runner=runner,
+                create_worktrees=True,
+                base_branch="develop",
+            )
+            self.assertEqual(len(adds), 1)
+            self.assertEqual(adds[0][-1], "develop")
+
+    def test_there_is_no_silent_default(self):
+        """Required, as it is for `land_wave_clusters`: a default is how `main` crept in."""
+        plan = build_swarm_plan([], swarm_id="swarm-none")
+        with self.assertRaises(TypeError):
+            run_swarm_orchestration(plan, ".keel/project.yaml", dry_run=True)  # type: ignore[call-arg]
+
+    def test_swarm_run_hands_the_configured_base_down(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            text = Path(".keel/project.yaml").read_text(encoding="utf-8")
+            self.assertIn("base_branch: main\n", text)
+            config = Path(tmpdir) / "project.yaml"
+            config.write_text(
+                text.replace("base_branch: main\n", "base_branch: develop\n"), encoding="utf-8"
+            )
+            with patch("keel.swarm_runtime.run_swarm_orchestration") as orchestrate:
+                orchestrate.return_value.status = "success"
+                orchestrate.return_value.to_dict.return_value = {}
+                with redirect_stdout(io.StringIO()):
+                    main(["swarm-run", str(config), "--root", tmpdir, "--issues", "7", "--json"])
+            self.assertEqual(orchestrate.call_args.kwargs.get("base_branch"), "develop")
+
+
+class ChildrenThatShareACheckoutRunOneAtATime(unittest.TestCase):
+    """#1288: a dry run creates no worktrees, so every child runs its gate suite in the
+    operator's own checkout — and they ran `--max-workers` at a time, four `.coverage`
+    writers in one tree. Children without a worktree now run one at a time."""
+
+    def _plan(self):
+        return build_swarm_plan(
+            [
+                IssueScope(issue=n, title=f"T{n}", predicted_files=(f"src/{n}.py",))
+                for n in (501, 502, 503)
+            ],
+            swarm_id="swarm-shared",
+        )
+
+    def test_a_dry_run_never_overlaps_two_children(self):
+        import threading
+        import time
+
+        lock, active, peak = threading.Lock(), [0], [0]
+
+        def runner(cmd: list[str], cwd: Path) -> CommandResult:
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.05)
+            with lock:
+                active[0] -= 1
+            return CommandResult(ok=True, code=0, output="ok")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_swarm_orchestration(
+                self._plan(),
+                ".keel/project.yaml",
+                root=tmpdir,
+                dry_run=True,
+                max_workers=4,
+                runner=runner,
+                base_branch="main",
+            )
+        self.assertEqual(peak[0], 1)
+
+    def test_isolated_workers_still_run_in_parallel(self):
+        """The counterweight: two workers with their own worktrees must be able to
+        meet — if they were serialised, the barrier would time out."""
+        import threading
+
+        barrier = threading.Barrier(2, timeout=5)
+
+        def runner(cmd: list[str], cwd: Path) -> CommandResult:
+            if "worktree" in cmd and "add" in cmd:
+                Path(cmd[5]).mkdir(parents=True, exist_ok=True)
+            elif "ship" in cmd:
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    # Serialised: the partner never arrived. Report it as a failed
+                    # cluster so the count below fails as an assertion.
+                    return CommandResult(ok=False, code=1, output="ran alone")
+            return CommandResult(ok=True, code=0, output="ok")
+
+        plan = build_swarm_plan(
+            [
+                IssueScope(issue=n, title=f"T{n}", predicted_files=(f"src/{n}.py",))
+                for n in (601, 602)
+            ],
+            swarm_id="swarm-isolated",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = run_swarm_orchestration(
+                plan,
+                ".keel/project.yaml",
+                root=tmpdir,
+                dry_run=False,
+                max_workers=2,
+                runner=runner,
+                create_worktrees=True,
+                base_branch="main",
+            )
+        self.assertEqual(result.passed_count, 2)
 
 
 class TestSwarmRunCLI(unittest.TestCase):
@@ -344,6 +677,28 @@ class TestSwarmRunCLI(unittest.TestCase):
         finally:
             if os.path.exists(path):
                 os.unlink(path)
+
+    def test_a_live_swarm_run_is_refused_before_anything_starts(self):
+        """#1304 lead: with `--live` forwarded, every worker stops at `keel ship
+        --live`'s operator-consent gate, which swarm-run cannot satisfy for a child —
+        so a live run is refused up front, with the reason, instead of failing every
+        cluster and leaving `swarm/<id>` branches behind."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("keel.swarm_runtime.run_swarm_orchestration") as orchestrate,
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = main(
+                    ["swarm-run", ".keel/project.yaml", "--root", tmpdir, "--issues", "7", "--live"]
+                )
+
+        self.assertEqual(code, 1)
+        self.assertIn("swarm-run --live is refused", err.getvalue())
+        self.assertIn("operator consent", err.getvalue())
+        self.assertIn("issues/1281", err.getvalue())
+        orchestrate.assert_not_called()
+        self.assertEqual(out.getvalue(), "")
 
     def test_swarm_run_cli_dry_run_success(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -15,6 +15,7 @@ from keel import team as team_module
 from keel.cli import main
 from keel.config import Knobs, ProjectConfig
 from keel.swarm import (
+    CHILD_OUTPUT_TAIL_CHARS,
     AssignmentOverrides,
     Difficulty,
     IssueScope,
@@ -38,6 +39,7 @@ from keel.swarm import (
     scopes_intersect,
     score_difficulty,
     ship_handoff_args,
+    tail_child_output,
     update_worker_state,
     worker_seed,
 )
@@ -52,6 +54,82 @@ class TestSwarmPathExtraction(unittest.TestCase):
         self.assertEqual(_normalize_path("`src/keel/cli.py`"), "src/keel/cli.py")
         self.assertEqual(_normalize_path(" 'website/index.html' "), "website/index.html")
         self.assertEqual(_normalize_path("src\\keel\\swarm.py"), "src/keel/swarm.py")
+
+    def test_normalizing_twice_changes_nothing(self):
+        """#1279: the plan normalises twice, and a second pass ate the `)` the first
+        exposed. Every spelling here must be a fixed point after one pass."""
+        import itertools
+
+        cores = [
+            "docs/(draft)/",
+            "(x)/y",
+            "src/a.py",
+            ".github/workflows/ci.yml",
+            "a/(b",
+            "((a/b))",
+        ]
+        wraps = [("", ""), ("(", ")"), ("`", "`"), ("'", "'."), ("", ","), ("", ");"), (" ", " ")]
+        for core, (head, tail) in itertools.product(cores, wraps):
+            once = _normalize_path(head + core + tail)
+            with self.subTest(raw=head + core + tail):
+                self.assertEqual(_normalize_path(once), once)
+
+    def test_brackets_that_belong_to_the_path_are_kept(self):
+        self.assertEqual(_normalize_path("docs/(draft)/"), "docs/(draft)")
+        self.assertEqual(_normalize_path("(x)/y"), "(x)/y")
+        self.assertEqual(_normalize_path("(docs/draft)/"), "(docs/draft)")
+        self.assertEqual(_normalize_path("(src/a.py"), "src/a.py")
+        self.assertEqual(_normalize_path("src/a.py);"), "src/a.py")
+
+    def test_a_dot_directory_keeps_its_dot(self):
+        """A leading dot was stripped as punctuation: `.github/…` became `github/…`."""
+        self.assertEqual(_normalize_path(".github/workflows/ci.yml"), ".github/workflows/ci.yml")
+        self.assertEqual(_normalize_path("`.keel/project.yaml`."), ".keel/project.yaml")
+        self.assertEqual(
+            extract_predicted_paths("Edit .github/workflows/ci.yml."), [".github/workflows/ci.yml"]
+        )
+
+    def test_a_bracketed_directory_overlaps_the_files_inside_it(self):
+        """The scenario: stored as `docs/(draft)` but matched as `docs/(draft`, so a
+        second issue under that directory was declared orthogonal to the first — and,
+        in the review of the first fix, the same through `(docs/draft)/`."""
+        for directory, inside in (
+            ("docs/(draft)/", "docs/(draft)/x.md"),
+            ("(docs/draft)/", "(docs/draft)/y.md"),
+            ("(docs\\draft)\\", "(docs\\draft)\\y.md"),
+        ):
+            with self.subTest(directory):
+                a = extract_issue_scope(1, title="", body="", labels=(), declared_files=[directory])
+                b = extract_issue_scope(2, title="", body="", labels=(), declared_files=[inside])
+                plan = build_swarm_plan([a, b], swarm_id="swarm-draft")
+                self.assertEqual(len(plan.waves), 2, "they share a directory and must serialise")
+
+    def test_normalizing_is_a_fixed_point_on_generated_spellings(self):
+        """#1311 review: a 200k fuzz found normpath exposing new end punctuation after
+        the strip (`(docs/draft)/` → `(docs/draft)` → `docs/draft`). Seeded, so a
+        failure names a reproducible spelling."""
+        import random
+
+        rng = random.Random(7)
+        alphabet = "()./\\ `'a,;:"
+        for _ in range(20000):
+            raw = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 9)))
+            once = _normalize_path(raw)
+            self.assertEqual(_normalize_path(once), once, f"not a fixed point: {raw!r}")
+
+    def test_a_long_run_of_exposed_punctuation_still_ends_canonical(self):
+        """Each round peels one exposed end; a fixed round cap returned a non-canonical
+        value for 64+ layers (#1311 review)."""
+        raw = "a" + ",/" * 200
+        once = _normalize_path(raw)
+        self.assertEqual(once, "a")
+        self.assertEqual(_normalize_path(once), once)
+
+    def test_a_final_dot_segment_is_a_path_step(self):
+        self.assertEqual(_normalize_path("src/a/.."), "src")
+        self.assertEqual(_normalize_path("src/a/."), "src/a")
+        self.assertEqual(_normalize_path("src\\a\\.."), "src")
+        self.assertEqual(_normalize_path("..."), "")
 
     def test_extract_predicted_paths_backticks_and_text(self):
         text = """
@@ -358,6 +436,24 @@ class TestSwarmStateAndDashboard(unittest.TestCase):
         self.assertIn("[MERGED 🚢]", rendered)
         self.assertIn("[QUEUED ⏳]", rendered)
 
+    def test_a_held_worker_has_its_own_badge(self):
+        """#1280: `held` — landing kept the cluster back for missing review evidence —
+        is in the status vocabulary but had no badge, so it fell through to the
+        generic upper-cased `[HELD]` the board draws for a status it does not know."""
+        held = SwarmWorkerStatus(
+            cluster_id="cluster-1-102", issue=102, role="core", step="s10", status="held"
+        )
+        state = SwarmRunState(swarm_id="swarm-held", total_workers=1, workers=(held,))
+        rendered = render_swarm_status_dashboard(state)
+        self.assertIn("[HELD ⏸️]", rendered)
+        self.assertNotIn("[HELD]", rendered)
+
+    def test_a_status_the_board_does_not_know_still_renders(self):
+        """The counterweight: the generic fallback stays for anything unnamed."""
+        odd = SwarmWorkerStatus(cluster_id="c", issue=1, role="core", status="paused")
+        state = SwarmRunState(swarm_id="swarm-odd", total_workers=1, workers=(odd,))
+        self.assertIn("[PAUSED]", render_swarm_status_dashboard(state))
+
     def test_save_and_load_swarm_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             resolve_swarm_state_dir(tmpdir)
@@ -393,6 +489,154 @@ class TestSwarmStateAndDashboard(unittest.TestCase):
             corrupt_file = Path(tmpdir) / ".keel" / "state" / "swarm" / "corrupt.json"
             corrupt_file.write_text("{bad json", encoding="utf-8")
             self.assertIsNone(load_swarm_state("corrupt", root=tmpdir))
+
+    def test_state_that_parses_but_has_the_wrong_shape_is_unreadable_not_fatal(self):
+        """#1273: only unparseable JSON was handled; JSON of the wrong shape raised
+        out of swarm-status, the recovery tool."""
+        shapes = {
+            "a worker that is not an object": '{"workers": ["not-a-dict"]}',
+            "null workers": '{"workers": null}',
+            "not an object": "[1, 2, 3]",
+            "a worker field of the wrong type": '{"workers": [{"issue": [1]}]}',
+            "a null count": '{"total_workers": null, "workers": []}',
+            "an infinite count": '{"total_workers": 1e999, "workers": []}',
+            "an infinite issue": '{"workers": [{"issue": 1e999}]}',
+        }
+        for label, text in shapes.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmpdir:
+                state_dir = Path(tmpdir) / ".keel" / "state" / "swarm"
+                state_dir.mkdir(parents=True)
+                (state_dir / "odd.json").write_text(text, encoding="utf-8")
+                out, err = io.StringIO(), io.StringIO()
+                try:
+                    loaded = load_swarm_state("odd", root=tmpdir)
+                    with redirect_stdout(out), redirect_stderr(err):
+                        code = main(["swarm-status", ".keel/project.yaml", "--root", tmpdir])
+                except Exception as exc:  # noqa: BLE001 - the defect is that it raises
+                    self.fail(f"{type(exc).__name__} escaped: {exc}")
+                self.assertIsNone(loaded)
+                # Unreadable is not "nothing in flight": it fails the gate (#1280) and
+                # does not print the empty board that says no run exists.
+                self.assertEqual(code, 1)
+                self.assertIn("odd.json is not the shape keel writes", err.getvalue())
+                self.assertNotIn("no active or recent swarm run found", out.getvalue())
+
+    def test_a_well_formed_state_draws_no_warning(self):
+        """The counterweight."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = SwarmRunState(swarm_id="fine", total_workers=0, active_wave=1, workers=())
+            save_swarm_state(state, root=tmpdir)
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                main(["swarm-status", ".keel/project.yaml", "--root", tmpdir])
+            self.assertEqual(err.getvalue(), "")
+
+
+class TheChildOutputIsBounded(unittest.TestCase):
+    """#1280: a swarm stored each child's whole `keel ship --json` output."""
+
+    def test_output_within_the_cap_is_kept_verbatim(self):
+        self.assertEqual(tail_child_output(""), "")
+        exact = "x" * CHILD_OUTPUT_TAIL_CHARS
+        self.assertEqual(tail_child_output(exact), exact)
+
+    def test_longer_output_keeps_the_tail_and_says_how_much_was_dropped(self):
+        # The head and the tail differ, so a helper that kept the head fails here.
+        text = "H" * 1000 + "x" * (CHILD_OUTPUT_TAIL_CHARS - 5) + "ERROR"
+        capped = tail_child_output(text)
+        marker, _, kept = capped.partition("\n")
+        self.assertEqual(kept, text[-CHILD_OUTPUT_TAIL_CHARS:])
+        self.assertTrue(kept.endswith("ERROR"))
+        self.assertNotIn("H", kept)
+        self.assertEqual(
+            marker,
+            f"[keel: 1000 earlier chars of child output dropped; last "
+            f"{CHILD_OUTPUT_TAIL_CHARS} kept]",
+        )
+
+
+class SwarmStatusIsAGate(unittest.TestCase):
+    """#1280: `swarm-status` exited 0 for every outcome and `--json` printed `{}` both for
+    "no run" and for "the run exists but cannot be read", so it could not gate anything."""
+
+    def _run(self, root: str, *extra: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["swarm-status", ".keel/project.yaml", "--root", root, *extra])
+        return code, out.getvalue(), err.getvalue()
+
+    def _unreadable(self, root: str, name: str = "torn") -> None:
+        state_dir = Path(root) / ".keel" / "state" / "swarm"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / f"{name}.json").write_text("{bad json", encoding="utf-8")
+
+    def test_nothing_in_flight_is_an_answer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertEqual(self._run(tmpdir, "--json")[:2], (0, "{}\n"))
+
+    def test_an_unreadable_newest_state_fails_and_json_does_not_say_no_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._unreadable(tmpdir)
+            code, out, err = self._run(tmpdir, "--json")
+            self.assertEqual(code, 1)
+            self.assertIn("torn.json is not the shape keel writes", err)
+            payload = json.loads(out)
+            self.assertNotEqual(payload, {})
+            self.assertEqual(
+                (payload.get("error_code"), payload.get("swarm_id")), ("unreadable-state", "torn")
+            )
+            self.assertIn("torn.json", payload.get("error", ""))
+
+    def test_a_state_file_that_cannot_be_opened_is_unreadable_not_a_crash(self):
+        # A directory named `<id>.json` exists but cannot be read — the portable stand-in
+        # for a file with no read permission (chmod does not bind root or Windows). The
+        # docs promise the unreadable-state object, not a traceback.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / ".keel" / "state" / "swarm" / "locked.json").mkdir(parents=True)
+            try:
+                loaded = load_swarm_state("locked", root=tmpdir)
+                code, out, err = self._run(tmpdir, "--json", "--swarm-id", "locked")
+            except OSError as exc:  # the defect is that it escapes
+                raise AssertionError(f"{type(exc).__name__} escaped: {exc}") from exc
+            self.assertIsNone(loaded)
+            self.assertEqual(code, 1)
+            self.assertIn("locked.json", err)
+            self.assertEqual(json.loads(out).get("error_code"), "unreadable-state")
+
+    def test_an_explicit_unreadable_state_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._unreadable(tmpdir)
+            code, out, _ = self._run(tmpdir, "--swarm-id", "torn")
+            self.assertEqual(code, 1)
+            self.assertEqual(out, "")
+
+    def test_an_explicit_swarm_id_with_no_state_fails_and_names_it(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Another, readable run exists: asking for a specific one that does not
+            # must not fall back to "nothing in flight" or to the other run.
+            save_swarm_state(
+                SwarmRunState(swarm_id="other", total_workers=0, workers=()), root=tmpdir
+            )
+            code, out, err = self._run(tmpdir, "--swarm-id", "swarm-gone")
+            self.assertEqual(code, 1)
+            self.assertIn("swarm-gone", err)
+            self.assertEqual(out, "")
+
+            code, out, err = self._run(tmpdir, "--swarm-id", "swarm-gone", "--json")
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertEqual(
+                (payload.get("error_code"), payload.get("swarm_id")),
+                ("unknown-swarm", "swarm-gone"),
+            )
+            self.assertIn("swarm-gone", err)
+
+    def test_the_help_states_the_exit_codes(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit):
+            main(["swarm-status", "--help"])
+        self.assertIn("exit codes", out.getvalue())
+        self.assertIn("--swarm-id names no run", out.getvalue())
 
 
 class TestSwarmCLI(unittest.TestCase):

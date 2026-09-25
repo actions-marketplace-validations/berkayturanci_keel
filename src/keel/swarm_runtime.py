@@ -12,6 +12,7 @@ import datetime
 import shutil
 import subprocess  # nosec B404
 import sys
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from .swarm import (
     rebalance_swarm_plan,
     save_swarm_state,
     ship_handoff_args,
+    tail_child_output,
     update_worker_state,
     worker_seed,
 )
@@ -145,8 +147,9 @@ def execute_cluster_worker(
         str(issue),
         "--json",
     ]
-    if dry_run:
-        cmd.append("--dry-run")
+    # `keel ship` gates every live-only path on `--live`; leaving out `--dry-run` does
+    # not turn it on, so a live swarm's children ran the dry assessment (#1269).
+    cmd.append("--dry-run" if dry_run else "--live")
     if extra_args:
         cmd.extend(extra_args)
 
@@ -171,8 +174,14 @@ def run_swarm_orchestration(
     max_workers: int = 4,
     runner: SubprocessRunner | None = None,
     create_worktrees: bool = True,
+    base_branch: str,
 ) -> SwarmRunResult:
-    """Execute the waves and clusters of a SwarmPlan with fail-soft isolation."""
+    """Execute the waves and clusters of a SwarmPlan with fail-soft isolation.
+
+    ``base_branch`` is required, as it is for ``land_wave_clusters``: the worktrees
+    are branched from it and the wave is later landed onto it, and a default of
+    ``main`` branched a ``develop`` project's clusters off the wrong history (#1262).
+    """
     root_path = Path(root).resolve()
     workers_list: list[SwarmWorkerStatus] = []
 
@@ -198,9 +207,16 @@ def run_swarm_orchestration(
     wave_results: list[dict[str, Any]] = []
     current_plan = plan
 
-    wave_idx = 0
-    while wave_idx < len(current_plan.waves):
-        wave = current_plan.waves[wave_idx]
+    # Waves are followed by their index, not by position: a failure makes
+    # rebalance_swarm_plan drop a wave, and a position counter over the shrunken
+    # plan then stepped past the next, unrelated wave without running it (#1268).
+    last_wave: int | None = None
+    while True:
+        remaining = [w for w in current_plan.waves if last_wave is None or w.wave_index > last_wave]
+        if not remaining:
+            break
+        wave = remaining[0]
+        last_wave = wave.wave_index
         state = SwarmRunState(
             swarm_id=state.swarm_id,
             total_workers=state.total_workers,
@@ -211,7 +227,6 @@ def run_swarm_orchestration(
 
         cluster_tasks = list(wave.clusters)
         if not cluster_tasks:
-            wave_idx += 1
             continue
 
         wave_record: dict[str, Any] = {
@@ -235,7 +250,9 @@ def run_swarm_orchestration(
 
             if create_worktrees and not dry_run:
                 branch_name = f"swarm/{plan.swarm_id}/{c_id}"
-                ok = create_swarm_worktree(root_path, wt_path, branch_name, runner=runner)
+                ok = create_swarm_worktree(
+                    root_path, wt_path, branch_name, base_branch=base_branch, runner=runner
+                )
                 if not ok or not wt_path.exists():
                     return c_id, {
                         "issue": issue_n,
@@ -266,13 +283,43 @@ def run_swarm_orchestration(
             return c_id, res
 
         # Run wave clusters in parallel thread pool
-        pool_workers = min(max_workers, len(cluster_tasks)) if len(cluster_tasks) > 0 else 1
+        # Without a worktree each child runs in the operator's own checkout (a dry run
+        # creates none), and its gate suite is not written to share a tree with a
+        # sibling's: `.coverage`, `.pytest_cache`, build output. Such children run one
+        # at a time; only isolated workers run in parallel (#1288).
+        isolated = create_worktrees and not dry_run
+        pool_workers = min(max_workers, len(cluster_tasks)) if isolated and cluster_tasks else 1
         with concurrent.futures.ThreadPoolExecutor(max_workers=pool_workers) as executor:
             future_to_cluster = {
                 executor.submit(_worker_fn, cluster): cluster for cluster in cluster_tasks
             }
             for future in concurrent.futures.as_completed(future_to_cluster):
-                c_id, worker_res = future.result()
+                try:
+                    c_id, worker_res = future.result()
+                except Exception as exc:  # noqa: BLE001 - one worker must not end the run
+                    # A worker that raised (a malformed assignment, an OSError making
+                    # its path) is a failed cluster, not a failed run. Left unguarded,
+                    # the raise discarded the other workers' results and froze them
+                    # as `running` in the state file (#1271).
+                    cluster = future_to_cluster[future]
+                    c_id = cluster.cluster_id
+                    # The traceback goes to stderr: the failure may be keel's own bug,
+                    # and the one-line reason alone would hide where it came from.
+                    sys.stderr.write(
+                        f"swarm worker {c_id} raised:\n" + "".join(traceback.format_exception(exc))
+                    )
+                    worker_res = {
+                        "issue": cluster.issues[0] if cluster.issues else 0,
+                        "role": cluster.role,
+                        "ok": False,
+                        "code": 1,
+                        "output": f"worker raised {type(exc).__name__}: {exc}",
+                    }
+                # Bounded once, here, where every origin of `output` — the child's
+                # stdout, a worktree failure, a raised worker — meets both places it is
+                # kept: this wave record and, on failure, the state file's `details`
+                # (#1280).
+                worker_res = {**worker_res, "output": tail_child_output(worker_res["output"])}
                 wave_record["cluster_results"][c_id] = worker_res
                 issue_val = worker_res.get("issue", 0)
 
@@ -296,7 +343,6 @@ def run_swarm_orchestration(
                 save_swarm_state(state, root=root_path)
 
         wave_results.append(wave_record)
-        wave_idx += 1
 
     # Finalize state
     overall_status = (

@@ -2775,7 +2775,7 @@ never one copy per agent (that would re-introduce file-copy drift):
 | target | installs into | who reads it |
 |---|---|---|
 | `claude` | `.claude/commands/keel/<cmd>.md` | Claude Code, as native `/keel:<cmd>` |
-| `skills` | `.agents/skills/keel-<cmd>/SKILL.md` | **every non-Claude agent** (Codex, Antigravity, Gemini, …) via its skill discovery / chat-command wrapper — **one shared copy** |
+| `skills` | `.agents/skills/keel-<cmd>/SKILL.md` | **non-Claude agents**, via their skill discovery / chat-command wrapper — **one shared copy** |
 | `all` | both of the above | |
 | `plugin` | `commands/<cmd>.md` (repo root) | the committed [agent plugin](plugin.md) — `/plugin install keel` exposes `/keel:<cmd>`. Installing it in each agent, with the update path: [install.md](install.md) |
 | `site` | `website/params.js` (repo root) | the static site's `window.KEEL_ARGS` — each command's description, `argument-hint` and flag chips |
@@ -2803,8 +2803,9 @@ byte-identical to the generator's output. Neither repo-level target is written b
 `install-adapter all`, which installs the per-project surfaces only.
 
 The `skills` surface is a **single** universal skill set (`keel-<cmd>`), not a dir per agent:
-non-Claude agents all read `.agents/skills/`, so one copy serves Codex, Antigravity and Gemini
-together. The skill body is the same project-neutral adapter, wrapped with skill frontmatter.
+it is written once under `.agents/skills/` for any non-Claude agent that discovers skills
+there, instead of one copy per agent. The skill body is the same project-neutral adapter,
+wrapped with skill frontmatter.
 Generated skill frontmatter intentionally contains only `name: keel-<cmd>` and `description`.
 Claude-only command metadata such as `argument-hint` and `allowed-tools` remains on the
 packaged command body / Claude command surface and is intentionally not copied into
@@ -2982,8 +2983,8 @@ wave tier partitioning, **difficulty scoring and per-cluster staffing** across a
 issues without mutating git or spawning workers.
 
 The issues are named by flag, not as positionals: `--issues` takes one comma-separated list and
-`--issue` is repeatable. Planning is pure — it reads no repository state — so `swarm-plan` has no
-`--root`.
+`--issue` is repeatable. Planning is pure — it reads no repository state — so `swarm-plan` accepts `--root` only for
+interface parity with the other swarm commands and does not use it.
 
 ```bash
 keel swarm-plan .keel/project.yaml --issues 714,715,716,717 --tree
@@ -2991,7 +2992,7 @@ keel swarm-plan .keel/project.yaml --issue 714 --issue 715 --json
 keel swarm-plan .keel/project.yaml --issues 714,715 --team night-shift --effort high --json
 ```
 
-Use `--tree` to render an interactive ASCII DAG execution diagram directly in your terminal.
+Use `--tree` to print the plan as an ASCII tree in your terminal.
 
 Every cluster in `--json` carries two extra records (#1017):
 
@@ -3011,22 +3012,43 @@ wave it lands in.
 
 ## `keel swarm-status <project.yaml> [--root DIR] [--swarm-id ID] [--json]`
 
-Inspect live worker progress, wave execution status, and cluster health across active or recent
-multi-agent swarm runs. Each row names the worker's **lead** and the difficulty **band** it was
-staffed from, so the board answers *who is running this, and why that provider*:
+Inspect each cluster's status (`running` / `passed` / `failed`) across
+active or recent multi-agent swarm runs. Each row names the worker's **lead** and the difficulty
+**band** it was staffed from, so the board answers *who is running this, and why that provider*:
 
 ```bash
 keel swarm-status .keel/project.yaml --root .
 keel swarm-status .keel/project.yaml --root . --swarm-id swarm-2026-08-15 --json
 ```
 
+Without `--swarm-id` it reads the most recently written run under `.keel/state/swarm/`. The exit
+code makes it usable as a gate ([#1280](https://github.com/berkayturanci/keel/issues/1280)):
+
+| Exit | When | `--json` prints |
+|---|---|---|
+| `0` | the run was read | the run's state |
+| `0` | no `--swarm-id` was given and no run exists — nothing is in flight | `{}` |
+| `1` | the run's state file exists but cannot be read — the wrong shape, or it cannot be opened (stderr names the file) | `{"swarm_id", "error_code": "unreadable-state", "error"}` |
+| `1` | `--swarm-id` names a run that has no state file (stderr names it) | `{"swarm_id", "error_code": "unknown-swarm", "error"}` |
+| `1` | the config does not load | nothing |
+
+`{}` therefore always means "no run", never "a run keel could not read"; the text board is not
+printed in either failure.
+
 ## `keel swarm-run <project.yaml> [--root DIR] [--issues N,N,…] [--issue N] [--swarm-id ID] [--max-workers N] [--live] [--tree] [--delegate PROVIDER] [--review-delegate PROVIDER] [--effort low|medium|high] [--team PROFILE] [--reviewers 1|2|3] [--json]`
 
-Launch parallel workers per cluster in dedicated git worktrees under `.keel/worktrees/swarm/`:
+> **Experimental — `--live` is refused.** Its workers are handed `--live`
+> ([#1269](https://github.com/berkayturanci/keel/issues/1269)), and `keel ship --live` stops at the
+> operator-consent gate, which swarm cannot satisfy for a child; `keel ship` also never commits or
+> opens a pull request in any mode. `swarm-run --live` exits 1 with that reason before anything
+> starts. Audit epic: [#1281](https://github.com/berkayturanci/keel/issues/1281).
+
+Launch parallel workers per cluster in dedicated git worktrees under
+`.keel/worktrees/<swarm_id>/<cluster_id>/`:
 
 ```bash
 keel swarm-run .keel/project.yaml --root . --issues 714,715,716,717
-keel swarm-run .keel/project.yaml --root . --issues 714,715,716,717 --live --max-workers 2
+keel swarm-run .keel/project.yaml --root . --issues 714,715,716,717 --max-workers 2
 ```
 
 Each worker runs the standard `keel ship` backbone machine in its isolated worktree, launched
@@ -3041,24 +3063,26 @@ dropped rather than passed — it would be read as a flag by the child — and t
 recorded in `assignment.warnings`.
 
 Issues are named by `--issues` / `--issue`, as for `swarm-plan`. Rebalancing across waves is
-decided by the plan, not by a flag: when runtime file-modification divergence is detected the
-conflicting worker is partitioned to a later wave.
+decided by the plan, not by a flag: when a cluster's issue fails, `rebalance_swarm_plan` drops the
+clusters carrying that issue from the remaining waves (there is no runtime file-divergence audit).
 
 ## `keel swarm-land <project.yaml> [--root DIR] [--wave N] [--issues N,N,…] [--issue N] [--swarm-id ID] [--live] [--delegate PROVIDER] [--review-delegate PROVIDER] [--effort low|medium|high] [--team PROFILE] [--reviewers 1|2|3] [--json]`
 
 Land passing cluster branches from completed execution waves into `main` under atomic `merge_lock`:
 
 ```bash
-keel swarm-land .keel/project.yaml --root . --wave 1
-keel swarm-land .keel/project.yaml --root . --wave 1 --live
+keel swarm-land .keel/project.yaml --root . --issues 714,715,716,717 --wave 1
+keel swarm-land .keel/project.yaml --root . --issues 714,715,716,717 --wave 1 --live
 ```
 
-The landing mode is **derived, not chosen**: `evaluate_wave_landing_mode` reads the wave's diff
-map and picks batch or funnel, so there is no `--mode` flag to get wrong. `--wave` selects the
+The landing mode is **derived, not chosen**: `evaluate_wave_landing_mode` reads the plan's
+predicted scopes for the wave and, for any planned wave, always resolves to direct batch — so there
+is no `--mode` flag to get wrong. `--wave` selects the
 wave (default `1`); without `--live` the command reports what it would land.
 
-- **Direct Batch Mode**: Orthogonal disjoint diff trees land concurrently.
-- **Adaptive Funnel Mode**: Overlapping trees land sequentially with automatic fail-soft rebase healing.
+- **Direct Batch Mode**: Orthogonal disjoint diff trees are merged one after another with
+  `git merge --no-ff`, sequentially under the atomic `merge_lock`.
+- **Adaptive Funnel Mode**: implemented in `swarm_landing.py` (rebase onto the moved base, marker-resolver healing, hold-and-rewind) but selected only when a caller supplies a PR diff map — **no `keel swarm-land` invocation reaches it today**, because a planned wave's clusters are always disjoint.
 - **Review evidence (#828)**: before a live landing, every cluster branch's open PR must pass
   the same pre-merge review-evidence verification `keel merge` enforces — armed gate label,
   tier-derived verdict count, verdicts pinned to the PR head. A cluster that does not verify is
@@ -3082,14 +3106,15 @@ wave (default `1`); without `--live` the command reports what it would land.
   held cluster exits non-zero, so automation cannot read "refused to land
   unreviewed code" as success. The gate also runs in **dry runs** — the checks
   are read-only — so a preview reports `would hold: <reason>` per cluster
-  instead of promising a landing that a live run would refuse; a dry run still
-  exits 0, because predicting correctly is not a failure. The explicit opt-out is `knobs.swarm_review_evidence:
+  instead of promising a landing that a live run would refuse. A dry run that
+  would hold any cluster exits non-zero, so a preview cannot be read as all-clear. The explicit opt-out is `knobs.swarm_review_evidence:
   false`, which `swarm-land` announces loudly — the exception lives in config, never in a
   driver's judgement call.
 
 ## `keel-visual swarm <project.yaml> [--root DIR] [--swarm-id ID] [--out FILE] [--serve] [--port PORT] [--json]`
 
-Render interactive 2D DAG cluster partition graphs and 3D multi-wave spatial topologies:
+Render an interactive 2D DAG cluster-partition graph and a pseudo-3D multi-wave topology, as a
+rendered snapshot (re-run to refresh):
 
 ```bash
 keel-visual swarm .keel/project.yaml --root . --out keel-swarm.html

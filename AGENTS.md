@@ -8,8 +8,9 @@
 **keel** is a project-neutral, multi-agent **workflow core**. A *fixed backbone* of
 ordered steps (`s0`–`s12`) drives a unit of work — a GitHub issue — from backlog to done.
 Projects never fork the backbone: they set per-project **values** in `project.yaml` and
-snap their own **Lego pieces** into named extension slots. Full design:
-[`docs/proposals/keel-architecture.md`](docs/proposals/keel-architecture.md).
+snap their own **Lego pieces** into named extension slots. Current behaviour is documented
+in [`docs/keel/`](docs/keel/); the original design proposal,
+[`docs/proposals/keel-architecture.md`](docs/proposals/keel-architecture.md), is historical.
 
 ## Quick Reference
 
@@ -26,6 +27,33 @@ The rules you will hit most often. Details follow below.
 - **Coverage bar is non-negotiable.** The pure core is held at **100 % line + branch**;
   the CI gate is `fail_under = 100` (`pyproject.toml`). New core code ships with tests
   that keep it at 100 %.
+- **Coverage is not fix evidence — a revert is.** Because `fail_under = 100` is enforced,
+  "Maintained 100% line + branch test coverage across the repository." is true of every merged
+  pull request before anyone writes it; it describes the repo, not the test. When you fix
+  something, state instead — **for each behaviour the fix changes**, meaning each arm of a
+  conditional and each call site, not each git hunk — a test that **fails as an assertion**
+  when that one change is reverted. Both distinctions were earned: #871's guarded and
+  unguarded arms sit in a *single* hunk, so a per-hunk claim passes while half the fix is
+  unpinned; and a solo revert that raises `NameError` or hangs is not a test failing. List any
+  behaviour you cannot pin, with the reason — that is a normal outcome and naming it is the
+  point.
+  `N/A — <docs | pure refactor | dependency bump | packaging>` is available, but **not** to a
+  PR whose title is `fix(`/`sec(` or that closes an issue labelled `type:bug`/`bug` **or
+  unlabelled** — #877 was closed by a genuine refactor, and #1268 carries no label today. Such a PR names a behaviour and a test, or says `Relates to #N` and leaves the issue
+  open.
+  A passing revert check is necessary, not sufficient: #873's fix passes one and still shipped
+  the regression now filed as #1268, because its fixture used the same issue in both waves, so
+  the fix and the bug agreed. The fixture has to be one where the fix changes the outcome.
+  A scope with no test surface (`fix(website)`, `fix(ci)`, `fix(release)`) answers with the
+  unpinned list and the reason — never with an invented test name.
+  **The reviewers ask both questions on every pull request**: they are in
+  `policy_pack.review.additions`, which reaches each review as
+  `review_merge_contract.reviewers.project_additions`. That is where the enforcement lives; a
+  rule only written down is the weakest of the three options a project has.
+  `CONTRIBUTING.md` states the same thing for human contributors and deliberately does **not**
+  gate on it: every closure the audit behind #1289 found wanting was agent-authored, and a
+  mandatory field nobody understands is what produced the coverage sentence in the first
+  place.
 - **Stdlib-first.** Exactly one runtime dependency on Linux/macOS: **PyYAML**. Do not add
   another runtime dep without an explicit, discussed reason — `jsonschema_min` is a
   hand-rolled validator precisely to avoid pulling `jsonschema`. The sole platform
@@ -218,4 +246,4 @@ website/             static site + live coverage report (make site)
 - [`docs/keel/command-contracts.md`](docs/keel/command-contracts.md) — structured command plan/result contracts
 - [`docs/keel/cli.md`](docs/keel/cli.md) — CLI reference
 - [`docs/keel/github-actions.md`](docs/keel/github-actions.md) — run keel on GitHub's runner
-- [`docs/proposals/keel-architecture.md`](docs/proposals/keel-architecture.md) — full design
+- [`docs/proposals/keel-architecture.md`](docs/proposals/keel-architecture.md) — the original design proposal (historical, not maintained)

@@ -1,7 +1,7 @@
 /* ============================================================
    keel — Interactive In-Browser Swarm DAG Simulator
    Real-time conflict DAG partitioning, isolated worktrees,
-   multi-model delegation, AI Jury consensus, and landing funnel.
+   multi-model delegation, cross-vendor review, and batch landing.
    Zero backend dependencies — runs 100% client-side.
    ============================================================ */
 
@@ -31,11 +31,11 @@
       ]
     },
     conflict: {
-      name: "Adjacent Conflict Self-Healing",
-      description: "2 workers touching overlapping routes healed automatically by AST-aware rebase funnel.",
+      name: "Overlapping Scopes → Sequenced Waves",
+      description: "2 workers predicted to touch the same file are never scheduled together — the planner sequences the second into a later wave.",
       issues: [
         { id: 760, title: "OAuth 2.0 PKCE Auth Provider", files: ["auth/routes.py"], model: "claude-opus-5", vendor: "Anthropic", wave: 1 },
-        { id: 761, title: "Passkey & WebAuthn Handler", files: ["auth/routes.py"], model: "gemini-3-pro", vendor: "Google", wave: 1, hasConflict: true },
+        { id: 761, title: "Passkey & WebAuthn Handler", files: ["auth/routes.py"], model: "gemini-3-pro", vendor: "Google", wave: 2, dependsOn: [760] },
         { id: 762, title: "Zero-Trust Session Audit Log", files: ["audit/session.py"], model: "codex", vendor: "OpenAI", wave: 2, dependsOn: [760] }
       ]
     }
@@ -128,7 +128,7 @@
         if (st.progress >= 100) {
           st.progress = 100;
           st.status = "jury";
-          st.log = "PR opened · AI Jury 3-vendor deliberation...";
+          st.log = "PR opened · cross-vendor review running...";
         } else {
           st.log = "Coding & running local test gates (" + st.progress + "%)...";
         }
@@ -142,15 +142,11 @@
         } else if (!st.juryVotes.google) {
           st.juryVotes.google = "PASS";
           st.status = "landing";
-          st.log = "AI Jury Consensus: UNANIMOUS PASS ✓";
+          st.log = "Review gate: PASS ✓";
         }
       } else if (st.status === "landing") {
         state.lock = "LOCKED (" + issue.id + ")";
-        if (issue.hasConflict) {
-          st.log = "Conflict detected in " + issue.files[0] + " · AST self-healing rebase applied ✓";
-        } else {
-          st.log = "Direct orthogonal batch landing into main...";
-        }
+        st.log = "Merging into the base branch with git merge --no-ff...";
         st.status = "merged";
       } else if (st.status === "merged") {
         state.lock = "UNLOCKED";
@@ -257,7 +253,7 @@
       '    </div>',
       '    <div class="sim-dag-arrow">➔</div>',
       '    <div class="sim-wave-col">',
-      '      <div class="sim-wave-title"><span class="wave-badge">WAVE 2</span> Dependent &amp; Funnel Landing</div>',
+      '      <div class="sim-wave-title"><span class="wave-badge">WAVE 2</span> Dependent Wave · Batch Landing</div>',
       '      <div class="sim-cluster-list">'
     );
 
@@ -271,8 +267,8 @@
       '  </div>',
       '  <div class="sim-footer">',
       '    <div class="sim-cli-cta">',
-      '      <span class="cta-label">Run in your repo:</span>',
-      '      <code>keel swarm-plan .keel/project.yaml --issues ' + issueList.map(function (i) { return i.id; }).join(',') + ' && keel swarm-run .keel/project.yaml</code>',
+      '      <span class="cta-label">Plan it in your repo (experimental — a live run lands nothing, see #1281):</span>',
+      '      <code>keel swarm-plan .keel/project.yaml --issues ' + issueList.map(function (i) { return i.id; }).join(',') + ' --tree' + '</code>',
       '      <button type="button" class="sim-copy-btn" id="sim-copy-cli" title="Copy CLI Command" aria-label="Copy CLI command">Copy</button>',
       '    </div>',
       '  </div>',
@@ -380,7 +376,7 @@
       var copyResetTimer = null;
       copyBtn.onclick = function () {
         var preset = getActivePreset();
-        var cmd = "keel swarm-plan .keel/project.yaml --issues " + preset.issues.map(function (i) { return i.id; }).join(',') + " && keel swarm-run .keel/project.yaml";
+        var cmd = "keel swarm-plan .keel/project.yaml --issues " + preset.issues.map(function (i) { return i.id; }).join(',') + " --tree";
         if (navigator.clipboard && navigator.clipboard.writeText) {
           navigator.clipboard.writeText(cmd).then(function () {
             copyBtn.textContent = "Copied! ✓";

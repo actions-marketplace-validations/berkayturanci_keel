@@ -2046,6 +2046,9 @@ keel install-legacy-wrappers all --force
 
 ## `keel swarm-land`
 
+> **Experimental subsystem** — the evidence contract below is real and enforced, but nothing
+> reaches it from a live swarm run yet. See [#1281](https://github.com/berkayturanci/keel/issues/1281).
+
 Land the passing cluster branches of a completed execution wave into the project's base
 branch under the atomic `merge_lock`. Documented here — ahead of the other `swarm-*`
 commands — because it is the surface that carries the `knobs.swarm_review_evidence`
@@ -2062,13 +2065,13 @@ keel swarm-land <project.yaml> [--root DIR] [--wave N] [--issues N,N,…] [--iss
 | `path` | file path | required | Project config. |
 | `--root DIR` | path | `.` | Repo root for git, the swarm state and the merge lock. |
 | `--wave N` | int | `1` | Which execution wave to land. |
-| `--issues N,N` / `--issue N` | comma list / repeatable int | plan's own set | Issue set the wave was planned from. |
-| `--swarm-id ID` | string | derived | Reuse an existing swarm's plan/state. |
+| `--issues N,N` / `--issue N` | comma list / repeatable int | none (required) | Issue set the wave is re-planned from; no plan is persisted, so omitting both leaves nothing to land. |
+| `--swarm-id ID` | string | derived | Reuse an existing swarm's state and branch names; the plan itself is always rebuilt from the issue flags. |
 | `--live` | flag | off | Actually merge. Without it the command reports what it would land, including `would hold: <reason>` per cluster. |
 | `--json` | flag | off | Structured landing result. |
 
-There is **no `--mode` flag**: `evaluate_wave_landing_mode` derives batch or funnel from
-the wave's diff map, so the mode cannot be asserted against what the diffs actually are.
+There is **no `--mode` flag**: `evaluate_wave_landing_mode` derives the mode from the plan's
+predicted scopes for the wave, and for any planned wave that is always direct batch.
 
 ### Details — `knobs.swarm_review_evidence`
 
@@ -2092,8 +2095,8 @@ in committed config rather than in a driver's judgement call. Full field documen
 ### Examples
 
 ```bash
-keel swarm-land .keel/project.yaml --root . --wave 1
-keel swarm-land .keel/project.yaml --root . --wave 1 --live --json
+keel swarm-land .keel/project.yaml --root . --issues 714,715 --wave 1
+keel swarm-land .keel/project.yaml --root . --issues 714,715 --wave 1 --live --json
 ```
 
 ## `/keel:ship` adapter arguments

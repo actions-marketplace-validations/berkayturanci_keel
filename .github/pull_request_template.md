@@ -19,13 +19,21 @@ Closes #
 - [ ] Release / packaging
 - [ ] Other
 
+## What breaks without this fix? (optional)
+
+<!-- Only if this PR fixes a bug, and only if you know. One sentence:
+       "Removing /worktrees/ from the ignore tuple in workspace.py makes
+        test_git_ignores_a_swarm_worktree_at_the_path_swarm_writes_to fail."
+     Not sure which test covers it? Leave this out and say so in the summary — we will work it
+     out in review. This is not a gate.
+     (Note for agents: AGENTS.md has a stricter version of this — per behaviour, not per PR.) -->
+
 ## Verification
 
 - [ ] `make test`
 - [ ] `make lint`
 - [ ] `make validate`
 - [ ] `make coverage` (pure core stays at 100% line + branch)
-- [ ] coverage 100% (pure core)
 - [ ] `CHANGELOG` updated
 - [ ] #63 parity matrix row updated (if a command changed)
 - [ ] Docs / `CHANGELOG.md` updated if behaviour changed

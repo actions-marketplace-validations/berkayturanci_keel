@@ -45,8 +45,9 @@
       name: "Gemini CLI",
       category: "assistants",
       badge: "AI Assistant",
-      desc: "Shared skill commands in .agents/skills/keel-* with native Gemini multimodal & code reasoning.",
-      cmd: "keel ship .keel/project.yaml --host-agent gemini",
+      desc: "Not an install host \u2014 keel documents no Gemini CLI plugin path. It can be wrapped as a generic CLI delegate profile, which keel does not test; Gemini models are also reachable through google-api: or Antigravity.",
+      cmd: "keel implement .keel/project.yaml 101 --delegate gemini",
+      note: "Needs a <code>knobs.delegate_profiles.gemini</code> entry naming the <code>gemini</code> binary \u2014 keel ships no profile for it. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
       logo: "logos/gemini-cli.svg"
     },
     {
@@ -72,7 +73,8 @@
       name: "Devin / External Agents",
       category: "assistants",
       badge: "Autonomous Agent",
-      desc: "Autonomous coding agent runs gated by Keel merge lock, review cycles, and 3-vendor jury.",
+      desc: "A pull request an autonomous agent opens goes through the same merge lock, review cycles and review-evidence gate as any other.",
+      note: "keel ships no Devin profile or integration: it gates the pull request, whoever wrote it.",
       cmd: "keel ship .keel/project.yaml --issue 101 --live",
       logo: "logos/devin.png"
     },
@@ -111,7 +113,8 @@
       name: "GitHub Copilot",
       category: "assistants",
       badge: "AI Assistant",
-      desc: "Copilot workspace and coding actions verified against deterministic Keel pre-merge evidence gates.",
+      desc: "A pull request Copilot authored is verified against the same deterministic pre-merge evidence gates as any other.",
+      note: "keel does not integrate with Copilot itself; <code>keel evidence-verify</code> checks any pull request.",
       cmd: "keel evidence-verify .keel/project.yaml --pr 101 --phase pre-merge",
       logo: "logos/githubcopilot.svg"
     },
@@ -130,9 +133,9 @@
       name: "Hermes Agent",
       category: "assistants",
       badge: "Autonomous Agent",
-      desc: "Lightweight autonomous agent runner dispatched across parallel Swarm isolated worktrees.",
-      cmd: "keel swarm-run .keel/project.yaml --delegate hermes",
-      note: "Needs a <code>knobs.delegate_profiles.hermes</code> entry naming the agent's binary — keel ships no profile for it. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
+      desc: "Lightweight autonomous agent runner. Usable as a delegate on any keel command; the swarm fan-out it was written for is experimental.",
+      cmd: "keel ship .keel/project.yaml --issue 12 --delegate hermes",
+      note: "Needs a <code>knobs.delegate_profiles.hermes</code> entry naming the agent's binary — keel ships no profile for it. The swarm variant of this command (<code>keel swarm-run … --delegate hermes</code>) is <b>experimental</b> and lands nothing yet — see <a href='https://github.com/berkayturanci/keel/issues/1281' target='_blank' rel='noopener'>#1281</a>. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/models.md#5-generic-cli-profiles' target='_blank' rel='noopener'>Generic CLI Profiles</a>.",
       logo: "logos/hermes.png"
     },
 
@@ -208,8 +211,9 @@
       name: "Model Context Protocol",
       category: "skills",
       badge: "Open Standard",
-      desc: "Expose Keel's deterministic backbone tools and GitHub transport via native MCP protocol.",
-      cmd: "keel ship .keel/project.yaml --transport mcp",
+      desc: "Reach GitHub through a GitHub MCP server instead of the gh CLI: keel selects the mcp transport when github-mcp is available and an authenticated gh is not.",
+      note: "keel consumes MCP for its GitHub access; it does not expose an MCP server of its own. See <a href='https://github.com/berkayturanci/keel/blob/main/docs/keel/github-transport.md' target='_blank' rel='noopener'>GitHub transport</a>.",
+      cmd: "keel capabilities --project .keel/project.yaml",
       logo: "logos/mcp.svg"
     },
     {
@@ -225,8 +229,8 @@
       id: "ai-jury",
       name: "Multi-Vendor AI Jury",
       category: "skills",
-      badge: "Consensus Engine",
-      desc: "Independent 3-vendor jury panel (Anthropic + OpenAI + Google) ensuring unanimous pre-merge verdicts.",
+      badge: "Cross-Vendor Review",
+      desc: "Cross-vendor review panel (e.g. Anthropic + OpenAI + Google); keel can dispatch it as the tier-3 review and gate the merge on its pinned ballots.",
       cmd: "keel ship .keel/project.yaml --jury",
       logo: "logos/jury.svg"
     },
@@ -234,9 +238,10 @@
       id: "git-worktrees",
       name: "Swarm Worktrees",
       category: "skills",
-      badge: "Concurrency Engine",
-      desc: "Zero dirty-checkout collisions: parallel multi-agent workers run in isolated git worktrees.",
-      cmd: "keel swarm-plan .keel/project.yaml --issues 101,102",
+      badge: "Experimental",
+      desc: "Parallel multi-agent workers in isolated git worktrees. Planning runs; a live run lands nothing yet.",
+      cmd: "keel swarm-plan .keel/project.yaml --issues 101,102 --tree",
+      note: "<b>Experimental.</b> The planning commands work; a live swarm produces no commits and no pull requests. See <a href='https://github.com/berkayturanci/keel/issues/1281' target='_blank' rel='noopener'>#1281</a>.",
       logo: "logos/swarm.svg"
     },
     {
@@ -255,8 +260,8 @@
       name: "Official GitHub Action",
       category: "platforms",
       badge: "CI/CD Automation",
-      desc: "Official composite action (berkayturanci/keel@v1.23.1) for gates, ship assessment, evidence verification and swarm planning.",
-      cmd: "uses: berkayturanci/keel@v1.23.1",
+      desc: "Official composite action (berkayturanci/keel@v1.24.2) for gates, ship assessment, evidence verification and swarm planning.",
+      cmd: "uses: berkayturanci/keel@v1.24.2",
       logo: "logos/githubactions.svg"
     },
     {

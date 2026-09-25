@@ -366,7 +366,7 @@ with `claude` and `codex` and no ai-jury installed is *not* staffable.
 The probe is a measurement of the *host* and one measurement can staff many benches, so the
 refusal is taken where the bench is resolved rather than where the panel was measured. For
 `keel ship`, `plan`, `review`, `step-verify`, `evidence-verify` and `merge` that is the same
-moment and nothing looks different. It matters for `keel swarm plan`, which scores every
+moment and nothing looks different. It matters for `keel swarm-plan`, which scores every
 cluster's tier *while* it partitions and so must measure before any cluster exists: a
 project with `by_tier."3": jury` and `on_unavailable: block` can plan and run a wave of
 tier-1 work on a host with no panel installed, and is refused the moment a cluster whose
@@ -1169,7 +1169,7 @@ The contract, which `/keel:ship` drives and `keel loop brief` decides:
   configured the contract has said the contract is the policy.
 
 Why this shape and not another: a host stop hook (the Ralph loop) exists in one host and
-leaves no record, while keel runs inside Claude Code, Codex, Gemini CLI and Antigravity
+leaves no record, while keel runs inside Claude Code, Codex, Cursor and Antigravity
 through one backbone; s9 is post-PR and post-review with a seat ladder, and folding a
 compile error into it would spend review budget on what `make test` already said; and a
 third `implement_mode` value would make `tdd` and the loop mutually exclusive, when the

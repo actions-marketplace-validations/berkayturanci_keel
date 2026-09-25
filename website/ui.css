@@ -287,6 +287,7 @@ pre.code .n { color: var(--brass-2); }
 .pill-open { font-family: var(--font-mono); font-size: .72rem; color: var(--green-2); border: 1px solid color-mix(in srgb, var(--green) 50%, transparent); border-radius: 999px; padding: .04rem .5rem; }
 .pill-tier { font-family: var(--font-mono); font-size: .72rem; color: var(--brass-2); border: 1px solid var(--brass-line); background: var(--brass-soft); border-radius: 999px; padding: .04rem .5rem; }
 .decision { display: flex; align-items: center; justify-content: center; gap: .6rem; padding: 1.2rem; border-radius: 14px; background: color-mix(in srgb, var(--green) 12%, var(--surface)); border: 1px solid color-mix(in srgb, var(--green) 45%, transparent); font-family: var(--font-display); font-weight: 700; font-size: clamp(1.1rem, 2.4vw, 1.5rem); color: var(--green-2); opacity: 0; transform: scale(.94); }
+.decision.block { background: color-mix(in srgb, var(--red) 12%, var(--surface)); border-color: color-mix(in srgb, var(--red) 45%, transparent); color: var(--red); }
 .decision.show { opacity: 1; transform: none; transition: opacity .5s cubic-bezier(.2,1.4,.4,1), transform .5s cubic-bezier(.2,1.4,.4,1); }
 .decision.show.pulse { animation: dpulse 2.4s ease-out infinite; }
 @keyframes dpulse { 0%,100% { box-shadow: 0 0 0 0 transparent; } 50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--green) 14%, transparent); } }
@@ -321,6 +322,12 @@ pre.code .n { color: var(--brass-2); }
 .cmd-card.flag .cc-ex { color: var(--brass-2); }
 .cmd-note { margin-top: 1.2rem; font-size: .82rem; color: var(--faint); font-style: italic; overflow-wrap: anywhere; }
 .cmp-note { margin: .9rem 0 0; font-size: .82rem; color: var(--faint); line-height: 1.55; overflow-wrap: anywhere; }
+/* An experimental/unsupported banner above a section that still describes the design. */
+.view-head .warn-note, .warn-note { margin: 0 0 1rem; padding: .8rem 1rem; font-size: .86rem; line-height: 1.65;
+  border-left: 3px solid #d97706; border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, #d97706 10%, transparent); color: var(--text); }
+.view-head .warn-note strong, .warn-note strong { color: var(--text); }
+.warn-note code { font-size: .92em; }
 
 /* grid helpers */
 .split { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 1rem; align-items: start; }

@@ -91,6 +91,26 @@ class TestSearchFacingFields(unittest.TestCase):
         missing = [term for term in SEARCH_TERMS if term.lower() not in text]
         self.assertEqual([], missing, "the homepage never uses these search terms")
 
+    def test_a_shared_link_previews_the_pitch_and_a_search_result_the_terms(self):
+        # Two readers, two titles (#1297). `<title>` is what a search result shows,
+        # so it keeps the words people type; og:/twitter:title is what a pasted
+        # link shows in Slack, LinkedIn or on X, so it leads with the README's pitch
+        # and still names the thing: a card is often read with no description.
+        head = _head("index.html")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").lower()
+        self.assertIn("turns coding agents into work owners", readme)
+        for field in ('property="og:title"', 'name="twitter:title"'):
+            with self.subTest(field=field):
+                # Exactly one: some scrapers take the last tag, so a stale duplicate
+                # further down <head> would be what a preview shows.
+                previews = re.findall(rf'<meta {field} content="([^"]+)"', head)
+                self.assertEqual(1, len(previews), f"the homepage needs one {field}")
+                self.assertIn("turn coding agents into work owners", previews[0].lower())
+                self.assertIn("merged pr", previews[0].lower())
+        titles = re.findall(r"<title>([^<]+)</title>", head)
+        self.assertEqual(1, len(titles))
+        self.assertIn("code review", titles[0].lower())
+
     def test_every_indexed_page_declares_a_canonical_url(self):
         for page in INDEXED_PAGES:
             with self.subTest(page=page):

@@ -238,6 +238,31 @@ class SwarmRunState:
         }
 
 
+#: How much of one child `keel ship`'s output a swarm keeps per cluster (#1280). The
+#: whole stdout used to go into `SwarmRunResult.wave_results` — which `swarm-run --json`
+#: re-emits — and a failing cluster's into the state file as its `details`, so a
+#: 20-cluster run wrote a multi-megabyte blob. The tail is what is kept: a failing
+#: child states why at the end.
+CHILD_OUTPUT_TAIL_CHARS = 4096
+
+
+def tail_child_output(text: str) -> str:
+    """Return ``text`` bounded to its last ``CHILD_OUTPUT_TAIL_CHARS`` characters.
+
+    Output within the cap comes back unchanged. Longer output keeps its tail behind a
+    one-line marker that says how many earlier characters were dropped, so a reader
+    never mistakes the kept part for the whole — or tries to parse it as the child's
+    JSON document, which it no longer is.
+    """
+    if len(text) <= CHILD_OUTPUT_TAIL_CHARS:
+        return text
+    dropped = len(text) - CHILD_OUTPUT_TAIL_CHARS
+    return (
+        f"[keel: {dropped} earlier chars of child output dropped; "
+        f"last {CHILD_OUTPUT_TAIL_CHARS} kept]\n{text[-CHILD_OUTPUT_TAIL_CHARS:]}"
+    )
+
+
 @dataclass(frozen=True)
 class SwarmRunResult:
     """Outcome summary for a complete or partial swarm execution."""
@@ -309,10 +334,58 @@ class SwarmLandingResult:
         }
 
 
+#: Punctuation prose puts around a path. A dot is not in it: a leading one is part of
+#: `.github/…` or `.keel/…` (stripping it made those `github/…`, #1279), and a trailing
+#: one is handled by :func:`_rstrip_path_punctuation`.
+_PATH_LEAD = "`'\" \t\r\n,;:"
+
+
+def _rstrip_path_punctuation(p: str) -> str:
+    """Trailing prose punctuation, dots included — except a final `.` or `..` segment,
+    which is a path step (`src/a/..` is `src`), not the end of a sentence."""
+    while True:
+        before = p
+        p = p.rstrip(_PATH_LEAD)
+        # `\\` counts as a separator here: this runs before it becomes `/`.
+        steps = p.replace("\\", "/")
+        if p.endswith(".") and not ("/" in steps and steps.rsplit("/", 1)[-1] in (".", "..")):
+            p = p[:-1]
+        if p == before:
+            return p
+
+
+def _strip_path_punctuation(p: str) -> str:
+    """Prose punctuation off both ends. A bracket goes only when it is unbalanced — the
+    leftover of prose like `(see src/a.py)` — and balanced ones are the path's own:
+    `docs/(draft)/` and `(docs/draft)/` keep theirs. Removing a pair that *looks* like
+    it wraps the path cannot be both idempotent and consistent (`(docs/draft)/` wraps
+    only once `normpath` drops the `/`), and the path-extraction patterns never
+    capture brackets, so only a `--declared-file` value, which is literal, has any."""
+    while True:
+        before = p
+        p = _rstrip_path_punctuation(p.lstrip(_PATH_LEAD))
+        if p.startswith("(") and p.count("(") > p.count(")"):
+            p = p[1:]
+        elif p.endswith(")") and p.count(")") > p.count("("):
+            p = p[:-1]
+        if p == before:
+            return p
+
+
 def _normalize_path(p: str) -> str:
-    cleaned = p.strip("`'\" \t\r\n.,;:()")
-    cleaned = cleaned.replace("\\", "/").removeprefix("./").removeprefix("/")
-    return posixpath.normpath(cleaned) if cleaned else ""
+    """One canonical spelling of a path, the same however often it is applied: the
+    plan normalises twice, and a second pass used to eat the `)` the first exposed
+    (`docs/(draft)/` → `docs/(draft)` → `docs/(draft`, #1279). The whole pass is
+    repeated to a fixed point, since `normpath` can itself expose new end
+    punctuation (`(docs/draft)/` → `(docs/draft)`). It ends: after the first round
+    no `\\` is left, and every later change only shortens the string."""
+    while True:
+        cleaned = _strip_path_punctuation(p)
+        cleaned = cleaned.replace("\\", "/").removeprefix("./").removeprefix("/")
+        cleaned = posixpath.normpath(cleaned) if cleaned else ""
+        if cleaned == p:
+            return cleaned
+        p = cleaned
 
 
 def extract_predicted_paths(text: str) -> list[str]:
@@ -986,6 +1059,9 @@ def render_swarm_status_dashboard(state: SwarmRunState | None) -> str:
         "passed": "[PASSED ✓]",
         "failed": "[FAILED ✗]",
         "merged": "[MERGED 🚢]",
+        # Landing kept the cluster back — its review evidence did not verify — so it
+        # is neither failed nor merged (#1280).
+        "held": "[HELD ⏸️]",
     }
 
     start_str = state.started_at[:19] if state.started_at else "pending"
@@ -1035,9 +1111,12 @@ def save_swarm_state(state: SwarmRunState, root: str | Path = ".") -> Path:
     state_dir = resolve_swarm_state_dir(root)
     file_path = state_dir / f"{state.swarm_id}.json"
     # Atomic + durable, like the checkpoint and activity records. This was a bare
-    # `write_text`: the same torn-file-on-interruption bug #872 fixed in its two
-    # named files and never reached here, because each writer carried its own
-    # copy of the dance instead of sharing one (#932).
+    # `write_text`: the same torn-file-on-interruption bug #869 fixed in its two
+    # named files — `checkpoint.py` and `activity.py` — and never reached here,
+    # because each writer carried its own copy of the dance instead of sharing
+    # one. The shared `write_text_atomic` arrived with #932. (This comment said
+    # #872 until #1290; that issue is an unrelated `gh api` fix, and a reader
+    # sent there finds nothing about torn files.)
     workspace.write_text_atomic(file_path, json.dumps(state.to_dict(), indent=2))
     return file_path
 
@@ -1050,6 +1129,14 @@ def load_swarm_state(swarm_id: str, root: str | Path = ".") -> SwarmRunState | N
         return None
     try:
         data = json.loads(file_path.read_text(encoding="utf-8"))
+        # JSON that parses but has the wrong shape — a hand edit, a torn write — is
+        # as unreadable as JSON that does not parse; it must not kill swarm-status,
+        # the recovery tool (#1273).
+        if not isinstance(data, dict):
+            return None
+        raw_workers = data.get("workers", [])
+        if not isinstance(raw_workers, list) or not all(isinstance(w, dict) for w in raw_workers):
+            return None
         workers = tuple(
             SwarmWorkerStatus(
                 cluster_id=str(w.get("cluster_id", "")),
@@ -1064,7 +1151,7 @@ def load_swarm_state(swarm_id: str, root: str | Path = ".") -> SwarmRunState | N
                 lead=str(w.get("lead", "")),
                 difficulty=str(w.get("difficulty", "")),
             )
-            for w in data.get("workers", [])
+            for w in raw_workers
         )
         return SwarmRunState(
             swarm_id=str(data.get("swarm_id", swarm_id)),
@@ -1074,7 +1161,10 @@ def load_swarm_state(swarm_id: str, root: str | Path = ".") -> SwarmRunState | N
             started_at=str(data.get("started_at", "")),
             completed_at=data.get("completed_at"),
         )
-    except (json.JSONDecodeError, ValueError, KeyError):
+    # OverflowError: `1e999` is valid JSON, parses to infinity, and `int()` refuses it.
+    # OSError: a file that exists but cannot be opened — no read permission, or a
+    # directory named `<id>.json` — is unreadable in the same sense (#1280).
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError, OverflowError, OSError):
         return None
 
 
@@ -1118,7 +1208,10 @@ def rebalance_swarm_plan(plan: SwarmPlan, failed_issue: int) -> SwarmPlan:
 
     Any subsequent wave clusters that depended on ``failed_issue`` will have
     the failed dependency omitted, while independent disjoint clusters
-    proceed without interruption.
+    proceed without interruption. The edge is inferred from file overlap, and
+    work that will not land no longer overlaps anything, so the edge goes; it
+    used to stay, and the plan asserted a dependency on an issue it no longer
+    held — in ``depends_on_issues``, ``conflict_map`` and ``issue_scopes`` (#1277).
     """
     new_waves = []
     for w in plan.waves:
@@ -1126,6 +1219,10 @@ def rebalance_swarm_plan(plan: SwarmPlan, failed_issue: int) -> SwarmPlan:
         for c in w.clusters:
             if failed_issue in c.issues:
                 continue
+            if failed_issue in c.depends_on_issues:
+                c = replace(
+                    c, depends_on_issues=tuple(i for i in c.depends_on_issues if i != failed_issue)
+                )
             new_clusters.append(c)
         if new_clusters:
             new_waves.append(
@@ -1141,8 +1238,12 @@ def rebalance_swarm_plan(plan: SwarmPlan, failed_issue: int) -> SwarmPlan:
         swarm_id=plan.swarm_id,
         total_issues=sum(len(c.issues) for w in new_waves for c in w.clusters),
         waves=tuple(new_waves),
-        conflict_map=plan.conflict_map,
-        issue_scopes=plan.issue_scopes,
+        conflict_map={
+            issue: tuple(other for other in others if other != failed_issue)
+            for issue, others in plan.conflict_map.items()
+            if issue != failed_issue
+        },
+        issue_scopes={i: scope for i, scope in plan.issue_scopes.items() if i != failed_issue},
     )
 
 

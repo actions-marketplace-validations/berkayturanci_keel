@@ -8,11 +8,11 @@ keel is an **agent-agnostic, project-agnostic work-ownership backbone** that dri
 single GitHub issue end-to-end through a fixed lifecycle: issue intake/readiness →
 branch/worktree → implement (coding agent) → push → CI wait → multi-agent code review
 (review→debate→verify→synthesize) → project test/build/lint gates → risk classification
-(TIER 1/2/3 → reviewer count) → safe merge → close → capture hooks. v1 includes the
+(TIER 1/2/3 → reviewer count) → safe merge → capture → close. v1 includes the
 capture marker/verifier contract, redaction-before-durability guardrails, capture-health
 surfacing, and optional learning-quality decisions in the run ledger. Distinctive elements:
 
-- **Agent adapters** (Claude Code, Codex, Gemini, Antigravity) behind one backbone.
+- **Agent adapters** (Claude Code, Codex, Cursor, Antigravity) behind one backbone.
 - **`.keel/project.yaml`** per project (base branch, build/lint/test commands, CI names, file globs) + pluggable "Lego" extension gates.
 - **Merge invariants**: timezone-aware merge *window* ("night no-merge"), `mkdir`-based merge *lock* (mutual exclusion), risk-tiered reviewer counts, fix-loop with capped budget.
 - **Pure-core + thin-IO, deterministic, stdlib-only ethos** (sibling `ai-jury` is the multi-agent review engine).
@@ -43,7 +43,7 @@ Keel does not compete with a single category. The closest tools each own one sli
   [Mergify pause docs](https://docs.mergify.com/merge-queue/pause/)
 
 Keel's product claim is narrower and more integrated: it turns a coding agent into a
-work owner. It starts before the PR exists and ends after merge, closure, capture markers,
+work owner. It starts before the PR exists and ends after merge, capture markers, closure,
 and optional project-owned learning decisions.
 
 | capability | Keel | Coding agents | PR reviewers | Merge queues | Multi-Agent Swarms (CrewAI/AutoGen/Swarm) |
@@ -57,8 +57,8 @@ and optional project-owned learning decisions.
 | Owns merge window + lock | yes | no | no | partial queue controls | ❌ |
 | Closes the issue / PR loop | yes | partial | no | partial | no |
 | Supports multi-issue work blocks | yes | partial | no | queue-only | yes (unconstrained) |
-| Conflict-free DAG clustering | yes (Keel Swarm) | no | no | no | ❌ |
-| Direct batch landing & self-healing | yes (Keel Swarm) | no | no | partial | ❌ |
+| Conflict-free DAG clustering | experimental (Keel Swarm, [#1281](https://github.com/berkayturanci/keel/issues/1281)) | no | no | no | ❌ |
+| Single-writer batch landing | experimental (Keel Swarm, [#1281](https://github.com/berkayturanci/keel/issues/1281)) | no | no | partial | ❌ |
 | Supports resume/checkpoint/reconcile | yes | partial | no | partial queue state | partial |
 | Captures post-merge learning | yes, policy-gated | no | partial repo memory | no | no |
 | Project policy extensibility | yes | partial | partial | yes | partial |
@@ -221,7 +221,7 @@ job is to connect those proven pieces into one deterministic, project-neutral li
 | **AutoGen / Magentic-One** | conversational group chat | OSS | GroupChat / Lead orchestrator | ❌ None | ❌ None |
 | **OpenAI Swarm** | lightweight client-side handoffs | MIT | Stateless agent routines + handoffs | ❌ None | ❌ None |
 | **MetaGPT / ChatDev** | simulated software company | MIT | SOP-driven conversational roles | ❌ None | ❌ None |
-| **Keel Swarm** | **deterministic backbone swarm** | Apache-2.0 | **DAG conflict clustering + git worktree fan-out** | ✅ **Physical worktree isolation** | ✅ **100% test gates + dual-mode batch landing** |
+| **Keel Swarm** (experimental — [#1281](https://github.com/berkayturanci/keel/issues/1281)) | **deterministic backbone swarm** | Apache-2.0 | **DAG conflict clustering + git worktree fan-out** | ✅ **Physical worktree isolation** | ✅ **100% test gates + single-writer batch landing** |
 
 Sources: [gurusup.com/blog/best-multi-agent-frameworks-2026](https://gurusup.com/blog/best-multi-agent-frameworks-2026), [medium.com/.../magentic-one-autogen-langgraph-crewai-or-openai-swarm](https://medium.com/data-science-in-your-pocket/magentic-one-autogen-langgraph-crewai-or-openai-swarm-which-multi-ai-agent-framework-is-best-6629d8bd9509)
 
@@ -234,10 +234,10 @@ General swarm frameworks operate on unstructured conversational abstractions wit
 **How Keel Swarm Solves This**:
 Keel Swarm anchors multi-agent parallelism inside deterministic engineering invariants:
 - **Static DAG Dependency Clustering**: Pre-analyzes issue blast radiuses to schedule orthogonal tasks in parallel waves while serializing dependent tasks.
-- **Physical Git Worktree Isolation**: Workers develop inside dedicated `.keel/workspaces/swarm-<id>/` sandboxes.
-- **Dual-Mode Landing Engine**: Merges 100% disjoint trees via Direct Orthogonal Batch Landing while routing overlapping trees through the atomic `merge_lock` with automated rebase and `s9 fixloop` conflict self-healing.
-- **Commit-Bound Evidence & Multi-Vendor Jury**: Every PR carries an immutable, commit-SHA-locked evidence record and cross-vendor panel verdict.
-- **Full-Spectrum Observability**: Live terminal ASCII DAG diagrams (`keel swarm-plan --tree`, `keel swarm-status`) paired with `keel-visual` 2D/3D WebGL swarm galaxy scenes.
+- **Physical Git Worktree Isolation**: Workers develop inside dedicated `.keel/worktrees/<swarm_id>/<cluster_id>/` sandboxes.
+- **Single-Writer Batch Landing**: Merges each cluster branch into the base with `git merge --no-ff`, sequentially under the atomic `merge_lock`; a conflicting merge is aborted and the cluster reported failed. (An adaptive rebase funnel with a marker-based resolver exists in the library but is not selected by the CLI.)
+- **Commit-Bound Evidence & Multi-Vendor Jury**: Every PR carries an immutable, commit-SHA-locked evidence record — including the cross-vendor panel's verdict when the project configures the panel.
+- **Full-Spectrum Observability**: A terminal ASCII plan tree (`keel swarm-plan --tree`) and a status table (`keel swarm-status`), paired with `keel-visual`'s 2D / pseudo-3D swarm scenes (rendered snapshots).
 
 ---
 
@@ -279,7 +279,7 @@ name for.
   The per-host ports are separate projects under their own terms.
   [cursor/plugins ralph-loop](https://github.com/cursor/plugins/tree/main/ralph-loop)
 - **What keel does that it does not**: everything from s5 on — classification, CI,
-  independent review, gates, merge window and lock, closeout, capture — and a record. A
+  independent review, gates, merge window and lock, capture, closeout — and a record. A
   Ralph run leaves no ledger of how many iterations ran, what each changed, or what the
   tests said between them: the stop hook deletes its state file when the promise is
   detected or the iteration limit is reached, and the only other write bumps the iteration
@@ -385,7 +385,7 @@ or a learning reader. The one real gap the category exposed — iterating s4 at 
 - Every *individual* capability exists somewhere: issue→PR (Sweep, SWE-agent), AI review (Qodo, CodeRabbit), merge gating + **timezone-aware scheduled freeze** (Mergify — the one tool that genuinely has merge windows), policy gates (OPA/Danger), model/agent-agnosticism (OpenHands).
 - **No tool combines all of them**, and three pieces in particular are rare-to-absent in shipped products:
   1. **An end-to-end fixed backbone** from *issue selection* through *merge + close* — agents stop at "opened a PR"; merge queues start at "PR exists." keel owns the whole arc.
-  2. **Agent-agnostic adapters** over that backbone (run Claude Code *or* Codex *or* Gemini *or* Antigravity through the identical pipeline). OpenHands is *model*-agnostic; keel is *agent/CLI*-agnostic, which is a different and underserved axis.
+  2. **Agent-agnostic adapters** over that backbone (run Claude Code *or* Codex *or* Cursor *or* Antigravity through the identical pipeline). OpenHands is *model*-agnostic; keel is *agent/CLI*-agnostic, which is a different and underserved axis.
   3. **Multi-agent debate→verify→synthesize review as a production gate** — this is research/skill-level elsewhere, not packaged.
 - The **merge window + `mkdir` lock as deterministic, stdlib invariants** are not conceptually novel (Mergify schedules; GitHub punts to self-failing Actions), but keel's framing — *native, deterministic, dependency-free, inside the agent pipeline* — is distinctive. The market evidence (GitHub's most-requested-but-absent scheduled-merge feature) confirms the need is real.
 
@@ -427,7 +427,7 @@ Legend: ✅ yes · ◑ partial/limited · ❌ no · `OSS`/`Prop.`
 | Tool | Agent-agnostic | Merge queue | Merge window/freeze | AI review | Multi-agent debate | Policy/gate aggregation | Project config | Open source |
 |---|---|---|---|---|---|---|---|---|
 | **keel** | ✅ (CLI adapters) | ❌ (one-at-a-time + lock) | ✅ (native, TZ-aware) | ✅ (via ai-jury) | ✅ (review→debate→verify→synth) | ✅ (Lego gates) | ✅ (`.keel/project.yaml`) | OSS (Apache-2.0) |
-| **keel-swarm** | ✅ (CLI adapters) | ✅ (Orthogonal Batch + Funnel) | ✅ (native, TZ-aware) | ✅ (via ai-jury) | ✅ (multi-wave consensus) | ✅ (Lego gates) | ✅ (`.keel/project.yaml`) | OSS (Apache-2.0) |
+| **keel-swarm** (experimental — [#1281](https://github.com/berkayturanci/keel/issues/1281)) | ✅ (CLI adapters) | ✅ (sequential batch under one lock) | ❌ (`swarm-land` never consults the window; `keel merge` is what enforces it) | ✅ (via ai-jury) | ✅ (per cluster, via ai-jury) | ✅ (Lego gates) | ✅ (`.keel/project.yaml`) | OSS (Apache-2.0) |
 | **Mergify** | ❌ | ✅ | ✅ (schedule + pause/freeze) | ❌ | ❌ | ◑ (conditions) | ◑ (config.yml) | Prop. (OSS repo exists) |
 | **GitHub merge queue** | ❌ | ✅ | ❌ (workarounds only) | ❌ | ❌ | ◑ (required checks) | ◑ | Prop. |
 | **bors-ng** | ❌ | ✅ (batch+bisect) | ❌ | ❌ | ❌ | ◑ | ◑ | OSS (Apache-2.0, deprecated) |

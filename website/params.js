@@ -22,10 +22,11 @@ window.KEEL_ARGS = {
  },
  "deps-audit": {
   "desc": "On-demand dependency security + licence audit across the project's ecosystems; classify security vs. routine, append findings to today's tracking issue, and route fixes to keel:ship.",
-  "hint": "[<ecosystem>|all] [--severity low|moderate|high|critical] [--open-issues] [--dry-run]",
+  "hint": "[<ecosystem>|all] [--severity low|moderate|high|critical] [--security-only] [--open-issues] [--dry-run]",
   "flags": [
    "<ecosystem>|all",
    "--severity low|moderate|high|critical",
+   "--security-only",
    "--open-issues",
    "--dry-run"
   ]
@@ -108,8 +109,8 @@ window.KEEL_ARGS = {
   ]
  },
  "ship": {
-  "desc": "Drive a GitHub issue end-to-end through the keel backbone (select → branch → implement → CI → review → test → merge → close → capture), reading every project value from .keel/project.yaml via the keel CLI.",
-  "hint": "[issue numbers...] [--compound|--profile <standard|compound>] [--delegate <claude|codex|agy|ollama:MODEL|anthropic-api:MODEL|openai-api:MODEL|google-api:MODEL|PROFILE>] [--review-delegate <...> (repeatable, one per reviewer slot)] [--review-comments <inline|summary>] [--reviewers <1|2|3>] [--effort <low|medium|high>] [--team <profile>] [--jury|--no-jury|--jury-advisory] [--tdd] [--loop] [--hotfix] [--dry-run] [--wizard]",
+  "desc": "Drive a GitHub issue end-to-end through the keel backbone (select → branch → implement → CI → review → test → merge → capture → close), reading every project value from .keel/project.yaml via the keel CLI.",
+  "hint": "[issue numbers...] [--compound|--profile <standard|compound>] [--delegate <claude|codex|agy|ollama:MODEL|anthropic-api:MODEL|openai-api:MODEL|google-api:MODEL|PROFILE>] [--review-delegate <...> (repeatable, one per reviewer slot)] [--review-comments <inline|summary>] [--reviewers <1|2|3>] [--role <label>] [--effort <low|medium|high>] [--team <profile>] [--jury|--no-jury|--jury-advisory] [--tdd] [--loop] [--hotfix] [--dry-run] [--wizard]",
   "flags": [
    "issue numbers...",
    "--compound|--profile <standard|compound>",
@@ -117,6 +118,7 @@ window.KEEL_ARGS = {
    "--review-delegate <...> (repeatable, one per reviewer slot)",
    "--review-comments <inline|summary>",
    "--reviewers <1|2|3>",
+   "--role <label>",
    "--effort <low|medium|high>",
    "--team <profile>",
    "--jury|--no-jury|--jury-advisory",
@@ -137,7 +139,7 @@ window.KEEL_ARGS = {
   ]
  },
  "swarm": {
-  "desc": "Multi-agent swarm coordinator — cluster backlog issues, execute parallel waves in isolated worktrees, and land orthogonal batches with self-healing rebase.",
+  "desc": "EXPERIMENTAL — a multi-agent swarm coordinator that clusters backlog issues, executes parallel waves in isolated worktrees, and lands them under a single-writer merge lock. Planning runs; a live run lands nothing yet (#1281). Use /keel:ship for work that must merge.",
   "hint": "[issue numbers...] [--plan-only] [--tree] [--visual] [--delegate <provider>] [--review-delegate <provider>] [--effort <low|medium|high>] [--team <profile>]",
   "flags": [
    "issue numbers...",
