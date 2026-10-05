@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,7 +28,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "PyYAML>=6",
+    "PyYAML>=6.0.3",
     # Windows ships no system zoneinfo database; the stdlib `zoneinfo` used by the
     # merge-window logic needs the IANA data from this pure-data package there. It is
     # never installed on Linux/macOS, so the "one runtime dependency" rule still holds
